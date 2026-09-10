@@ -28,11 +28,17 @@ typedef int (*ar8030_chunk_send_fn)(void *ctx, const uint8_t *buf, uint32_t len)
  * A zero-length data still produces exactly one (header-only) chunk, so
  * a frame is never silently dropped just for being empty.
  *
+ * out_chunk_count, if non-NULL, is set to the total number of chunks
+ * this frame was split into -- comparing it against the return value
+ * is how a caller tells a fully-sent frame from one that failed partway
+ * (see tx/main.c's -v stats). Left unset if data_len needs more than
+ * 65535 chunks (see below).
+ *
  * Returns the number of chunks successfully sent (send() returned 0 for
  * each), or -1 if data_len would need more than 65535 chunks (chunk_idx/
  * chunk_count are uint16_t) -- in which case nothing is sent. */
 int ar8030_chunk_frame(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t frame_pts,
                         const uint8_t *data, uint32_t data_len, uint32_t chunk_payload,
-                        ar8030_chunk_send_fn send, void *send_ctx);
+                        ar8030_chunk_send_fn send, void *send_ctx, uint32_t *out_chunk_count);
 
 #endif /* AR8030_TRANSPORT_CHUNKER_H */

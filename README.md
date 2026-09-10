@@ -39,20 +39,38 @@ bandwidth-constrained.
 
 See `common/ar8030_chunk.h` for the authoritative struct. Summary: each
 encoded frame becomes one or more `bb_socket_write()` calls, each
-prefixed with an 18-byte header (magic, frame sequence, chunk index/count,
-IDR/GDR/enhance flags, codec, capture pts). No ACK, no NACK, no FEC in
-this version — a chunk lost on the radio makes its frame incomplete, and
+prefixed with a 22-byte header (magic, frame sequence, chunk index/count,
+this chunk's payload length, IDR/GDR/enhance flags, codec, capture pts, a
+CRC16 over the payload). No ACK, no NACK, no FEC in this version — a
+chunk lost on the radio makes its frame incomplete, and
 `ar8030-transport-rx` drops the whole frame and moves on to the next one
 rather than waiting (see "Phase 2" below for where FEC would slot in).
 
-**Reassembly ordering.** `bb_socket` (in `BB_SOCK_FLAG_DATAGRAM` mode,
-which both apps use) is a queued point-to-point channel, not a
-packet-switched network — there is no equivalent of IP routing/multipath
-that could reorder two writes from the same sender. `rx/main.c`'s
-reassembly therefore assumes chunks arrive in the order they were sent
-and treats any violation of that (an out-of-order `chunk_idx`, or a new
-`frame_seq` starting before the previous one finished) as data loss:
-drop what was collected and wait for the next frame's first chunk.
+**Payload checksum.** Added after bench testing showed zero write
+failures, zero resyncs and zero dropped frames, yet still visibly
+corrupted video ("green blocks", recovering at the next IDR) — the
+classic signature of a decoder fed corrupted-but-present data, not
+missing data. The chunk header's magic only ever validated *framing*
+(where one chunk ends and the next begins); it said nothing about
+whether the payload bytes themselves survived the radio intact. Every
+chunk now carries a CRC16 (`common/crc16.c`) over its payload, checked in
+`common/chunk_stream.c`; a chunk whose checksum doesn't match is silently
+skipped (not handed to the reassembler at all), which then surfaces as an
+ordinary gap — the frame it belonged to gets dropped the same way a
+lost chunk always was, rather than being reassembled with corrupt bytes
+inside. See `-v`'s `checksum_fails` counter below.
+
+**Reassembly ordering.** `bb_socket` is a queued point-to-point channel,
+not a packet-switched network — there is no equivalent of IP
+routing/multipath that could reorder two writes from the same sender.
+`rx/main.c`'s frame reassembly therefore assumes chunks arrive in the
+order they were sent and treats any violation of that (an out-of-order
+`chunk_idx`, or a new `frame_seq` starting before the previous one
+finished) as data loss: drop what was collected and wait for the next
+frame's first chunk. (This is a different guarantee from `payload_len`
+below: ordering is about which *chunk* comes next, `payload_len` is about
+where one chunk's *bytes* end within a stream that no longer marks that
+boundary for us.)
 
 **Chunk size vs. RTP MTU.** These are two independent numbers:
 `ar8030-transport-tx -c` controls how a whole encoded frame is split for
@@ -62,23 +80,50 @@ PixelPilot. There's no reason they need to match, and in practice they
 won't — `-c` is sized for AR8030 throughput, `-M` for a conventional
 Ethernet/Wi-Fi-range UDP MTU.
 
-## Required AR8030 SDK fix: datagram-mode symmetry
+## Stream mode, not datagram
 
-Both apps open their `bb_socket` with `BB_SOCK_FLAG_DATAGRAM` so that one
-`bb_socket_write()` reliably becomes one `bb_socket_read()` on the other
-end, preserving this project's chunk framing. The upstream
-`app/ar8030/session_socket.c` in `yz_host_drv` has a bug where the
-socket-open RPC always strips that flag before telling the local chip,
-regardless of what the caller asked for — see
-`sbc-groundstations/package/ar8030/0008-session_socket-preserve-datagram-flag-on-open.patch`
-(already applied there) and the equivalent
-`builder/package/ar8030/0008-session_socket-preserve-datagram-flag-on-open.patch`
-(ported to the air side as part of this project, since it previously only
-existed on the ground side). **Both patches need to be applied** — one
-end honoring datagram mode while the other silently downgrades to a
-non-datagram socket reproduces the exact "symmetric zero rx_bytes despite
-a healthy physical link" failure the ground-side patch's commit message
-documents, and caps any single write at ~690 bytes on the unpatched end.
+Both apps open their `bb_socket` **without** `BB_SOCK_FLAG_DATAGRAM` —
+matching the stock vendor streamer's own `bb_socket_open()` calls,
+reverse-engineered from `ar_ldyhs_sky` (the Ascent air unit's real
+production video/audio streamer): `bb_socket_open(dev, slot=0, port=3,
+flags=0x27, &opt)` for video, `port=2` for audio, neither with the
+datagram bit set. This replaced an earlier datagram-mode version of this
+transport, for two reasons:
+
+- **Datagram mode's failure mode is worse under real congestion.**
+  `bb_socket_write()` in datagram mode waits once for the daemon's
+  write-completion ack and aborts the *entire* call the instant that
+  single wait times out (`app/ar8030/session_socket.c`). On a real,
+  contended RF link under a bursty source (an IDR frame's chunks
+  arriving back to back), that produced sustained `bb_socket_write
+  failed` storms on bench hardware (see "Bench findings" below — that's
+  what those numbers were tuning around). In stream mode, the same
+  internal wait can return a **partial** byte count without that being
+  an error at all — the vendor's own send loop
+  (`fpv_bb_video_stream_send`) just resubmits the remainder and keeps
+  going, only treating a write that makes *zero* progress as a real
+  failure. `tx/main.c`'s `chunk_send_to_socket()` does the same, with the
+  same 1500ms per-attempt timeout the vendor uses.
+- **It sidesteps the datagram-mode symmetry bug entirely.** Upstream
+  `app/ar8030/session_socket.c` has (had) a bug where the socket-open RPC
+  always strips `BB_SOCK_FLAG_DATAGRAM` before telling the local chip,
+  regardless of what the caller asked for —
+  `sbc-groundstations/package/ar8030/0008-session_socket-preserve-datagram-flag-on-open.patch`
+  and its air-side counterpart (`builder/package/ar8030/0008-...patch`,
+  ported as part of this project) fix that, but neither patch is a
+  dependency of this transport anymore now that it never asks for
+  datagram mode at all. (They may still matter for other things — e.g.
+  `net_dev`/`ar_net0` — this project just no longer needs them.)
+
+The cost: stream mode has no message-boundary framing at the transport
+level — a `bb_socket_read()` can return less than one chunk, several
+concatenated, or a chunk split arbitrarily across reads, none of which
+was possible in datagram mode. `ar8030_chunk_hdr.payload_len` (see
+"Protocol" above) and `common/chunk_stream.c` exist specifically to
+reassemble the raw byte stream back into discrete chunks, resyncing
+byte-at-a-time on a bad magic if alignment is ever lost — which should
+only happen right after a corrupted read or a sender restart mid-stream,
+not in steady state.
 
 ## Bitrate control
 
@@ -203,25 +248,69 @@ and never started). Run `ar8030-status` first on a new deployment and
 check its `BB_GET_SOCK_INFO` output — any port it lists is already
 claimed by something — before assuming port 2 is free there too.
 
+## Diagnosing "nothing is getting through"
+
+Both binaries take a `-v` flag that prints one stats line to stderr per
+second, so you can see *where* in the pipeline things stop moving rather
+than only knowing that they did:
+
+- **`ar8030-transport-tx -v`**: frames in/complete/incomplete per second,
+  chunks sent/failed per second, the resulting Mbit/s, and the frame-shm
+  ring's own health (`producer_writes`/`our_reads`/`full_drops`/
+  `other_drops`). `producer_writes` is `ring->hdr->write_idx` read
+  directly — **not** `venc_frame_ring_get_fill()`'s own `writes` field,
+  which is a per-attached-instance counter only a *producer* increments
+  and therefore always reads 0 for this tool (it only ever consumes);
+  using that field here would make "waybeam isn't producing anything"
+  indistinguishable from "everything is fine", so `producer_writes` reads
+  the real shared counter instead. Read the line in order:
+  `producer_writes=0` and not climbing means waybeam itself isn't
+  producing frames (not an `ar8030-transport-tx` or radio problem at
+  all); `frames in` > 0 but `chunks failed` climbing means the radio link
+  is the bottleneck, not waybeam or the ring.
+- **`ar8030-transport-rx -v`**: chunks in per second (with their Mbit/s),
+  **resync drops** — bytes discarded while scanning for the next valid
+  chunk header, which should sit at (or very near) zero; anything else
+  means the byte stream lost alignment (every chunk in between was
+  lost) — and **checksum fails** — chunks whose header was fine but
+  whose payload's CRC16 didn't match, silently skipped rather than
+  forwarded (see "Protocol" above). Unlike resync drops, a nonzero
+  checksum-fail rate means framing is intact but the radio is delivering
+  corrupted bytes inside otherwise-valid chunks — exactly the failure
+  mode that produced visible video corruption with zero write failures
+  and zero resyncs on bench hardware before this counter existed. Also
+  frames complete/dropped per second (`dropped` is deduplicated per
+  `frame_seq` — see `common/reassembly.c`'s `note_dropped()` — so it
+  counts distinct lost frames, not every stray chunk that belonged to
+  one), and RTP packets/Mbit/s actually sent toward PixelPilot. Zero
+  chunks in at all here, with `tx -v` showing chunks being sent, points
+  at the radio link itself or a port/role mismatch between the two ends
+  (see "Runtime deployment" above); chunks arriving but frames never
+  completing (`dropped` or `checksum_fails` climbing while `complete`
+  stays near zero) points at loss/corruption severe enough that some
+  chunk of nearly every frame is unusable.
+
 ## Bench findings (Caddx Ascent Hi3516CV610 air unit)
 
-- **`bb_socket_write()` aborts the whole call on its first internal
-  timeout.** In the vendor SDK (`app/ar8030/session_socket.c`), a
-  datagram-mode write blocks waiting for the daemon's write-completion
-  ack and returns `-1` immediately if that single wait times out — it
-  does not retry or partially succeed. Under a real, loaded RF link the
-  ack can lag past a couple hundred ms during a burst (an IDR frame's
-  worth of chunks arriving back to back), so a too-short `-t` turns
-  ordinary link jitter into "everything fails" (visible on-device as
-  repeated `bb_socket_write failed` lines interleaved with `recv bad
-  socket pack` — that second line is the *late* ack for a write this
-  tool had already given up on, arriving with nothing left registered to
-  receive it; it is evidence the daemon *did* eventually finish the
-  write, just too slowly). `-c` (chunk size) and `-t` (ack-wait timeout)
-  are the two knobs to tune against a specific link; `-m` (bitrate
-  margin) is the knob that controls how much data enters the pipe in the
-  first place, and is the one to lower first if hiccups persist even
-  after tuning `-c`/`-t`.
+- **What led to the datagram → stream mode switch above.** The first,
+  datagram-mode version of this transport hit sustained
+  `bb_socket_write failed` storms under real load: `bb_socket_write()`
+  in datagram mode aborts the *entire* call the instant its one
+  internal wait times out (no partial success), and on a real, loaded
+  RF link the daemon's write-completion ack can lag past a couple
+  hundred ms during a burst (an IDR frame's worth of chunks arriving
+  back to back) — visible on-device as repeated `bb_socket_write
+  failed` lines interleaved with `recv bad socket pack` (that second
+  line is the *late* ack for a write this tool had already given up on;
+  it's evidence the daemon *did* eventually finish the write, just too
+  slowly). Raising the timeout and shrinking the chunk size helped but
+  didn't remove the underlying issue; switching to stream mode
+  (matching the vendor's own approach — see "Stream mode, not datagram")
+  did, since a partial write there just continues rather than failing.
+  `-c` (chunk size) and `-t` (per-attempt write timeout) are still the
+  two knobs to tune against a specific link if hiccups persist; `-m`
+  (bitrate margin) controls how much data enters the pipe in the first
+  place and is the one to lower first.
 - **This particular air unit has very little RAM headroom** (Mem-Info
   showed `managed:58272kB` — under 60 MB total). `waybeam` was OOM-killed
   twice while bench-testing `ar8030-transport-tx` alongside it; the OOM
@@ -239,6 +328,14 @@ claimed by something — before assuming port 2 is free there too.
 - **Cross-link telemetry-based bitrate.** The current loop only uses
   each side's own local `BB_GET_MCS` reading; no RTT/loss feedback from
   the peer.
+- **Per-MCS-level bitrate margin table.** `bitrate_ctl.c` applies one
+  flat `-m` margin to whatever `BB_GET_MCS` reports. The vendor's own
+  `fpv_bb_get_cur_tgt_videobitrate` (reverse-engineered from
+  `ar_ldyhs_sky`) instead looks up a different percentage per MCS level
+  from a config table (30/40/60/70% in its hardcoded fallback), which is
+  presumably tuned because headroom needed at a marginal MCS isn't the
+  same as at a comfortable one. Worth adopting if a flat margin proves
+  too conservative at some MCS levels and not enough at others.
 - **Per-device Buildroot defconfig wiring.** The packages build; turning
   them on for a specific device is a follow-up.
 - **PixelPilot's IDR-request-burst mechanism** (UDP port 11223,

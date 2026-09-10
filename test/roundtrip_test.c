@@ -6,6 +6,15 @@
  *     -> common/chunker.c            (same code tx/main.c uses)
  *     -> common/reassembly.c         (same code rx/main.c uses)
  *     -> assert byte-identical to the original frame
+ *     -> common/chunk_stream.c       (same code rx/main.c uses)
+ *        fed from a fake byte stream that dribbles bytes out a handful
+ *        at a time (splitting every chunk header/payload across many
+ *        reads) and starts with garbage bytes to force a resync -- the
+ *        two behaviors bb_socket's stream mode actually exhibits that
+ *        the old datagram-mode transport never had to handle
+ *     -> assert every chunk extracted from that fake stream matches
+ *        what the chunker produced, and that reassembling them still
+ *        reproduces the original frame byte-identically
  *     -> rx/rtp_h265.c               (same code rx/main.c uses)
  *     -> a connected AF_UNIX SOCK_DGRAM socketpair standing in for the
  *        UDP socket to PixelPilot
@@ -19,6 +28,7 @@
  */
 
 #include "ar8030_chunk.h"
+#include "chunk_stream.h"
 #include "chunker.h"
 #include "reassembly.h"
 #include "rtp_h265.h"
@@ -99,6 +109,32 @@ struct chunk_capture {
     uint32_t lens[256];
     int count;
 };
+
+/* ---- fake byte stream for chunk_stream.c: dribbles out at most
+ * max_per_call bytes per read, so a chunk header/payload of any size
+ * gets split across several calls -- exactly what a real bb_socket in
+ * stream mode does under no obligation to preserve write() boundaries. */
+struct fake_wire {
+    const uint8_t *data;
+    uint32_t len;
+    uint32_t pos;
+    uint32_t max_per_call;
+};
+
+static int fake_wire_read(void *ctx, uint8_t *buf, uint32_t cap, int timeout_ms)
+{
+    (void)timeout_ms;
+    struct fake_wire *w = (struct fake_wire *)ctx;
+    if (w->pos >= w->len)
+        return 0; /* exhausted -- same as a real timeout to the caller */
+    uint32_t avail = w->len - w->pos;
+    uint32_t n = avail < cap ? avail : cap;
+    if (n > w->max_per_call)
+        n = w->max_per_call;
+    memcpy(buf, w->data + w->pos, n);
+    w->pos += n;
+    return (int)n;
+}
 
 static int capture_chunk(void *ctx, const uint8_t *buf, uint32_t len)
 {
@@ -238,8 +274,11 @@ int main(void)
     uint16_t frame_seq = 42;
     uint8_t flags = AR8030_CHUNK_FLAG_IDR;
     uint32_t frame_pts = 1234567;
+    uint32_t expected_chunk_count = 0;
     int sent = ar8030_chunk_frame(frame_seq, flags, AR8030_CHUNK_CODEC_H265, frame_pts, annexb,
-                                   annexb_len, chunk_payload, capture_chunk, &cap);
+                                   annexb_len, chunk_payload, capture_chunk, &cap, &expected_chunk_count);
+    if ((uint32_t)sent != expected_chunk_count)
+        FAIL("ar8030_chunk_frame sent %d chunks but claimed %u total", sent, expected_chunk_count);
     if (sent != cap.count)
         FAIL("ar8030_chunk_frame returned %d but callback saw %d chunks", sent, cap.count);
     fprintf(stderr, "chunked into %d chunks of <= %u bytes payload\n", cap.count, chunk_payload);
@@ -273,6 +312,137 @@ int main(void)
     if (memcmp(reasm.buf, annexb, annexb_len) != 0)
         FAIL("reassembled bytes differ from the original frame");
     fprintf(stderr, "chunker+reassembly round trip: byte-identical (%u bytes)\n", annexb_len);
+
+    /* 2b. Same chunks, but now over a simulated stream-mode bb_socket:
+     * concatenate them (with a garbage lead-in to force a resync) into
+     * one linear buffer, and read them back through common/chunk_stream.c
+     * fed a handful of bytes at a time -- this is the logic that changed
+     * when tx/rx switched off BB_SOCK_FLAG_DATAGRAM, and the old
+     * datagram-mode transport had nothing equivalent to test. */
+    static uint8_t wire[65536];
+    uint32_t wire_len = 0;
+    static const uint8_t junk[7] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02 };
+    memcpy(wire, junk, sizeof(junk));
+    wire_len += sizeof(junk);
+    for (int i = 0; i < cap.count; i++) {
+        memcpy(wire + wire_len, cap.bufs[i], cap.lens[i]);
+        wire_len += cap.lens[i];
+    }
+
+    struct fake_wire fw = { .data = wire, .len = wire_len, .pos = 0, .max_per_call = 7 };
+    static uint8_t stream_buf[8 * (AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD)];
+    ar8030_chunk_stream_t stream;
+    ar8030_chunk_stream_init(&stream, fake_wire_read, &fw, stream_buf, sizeof(stream_buf), 0, NULL);
+
+    static uint8_t reasm2_buf[65536];
+    ar8030_reassembly_t reasm2;
+    ar8030_reassembly_init(&reasm2, reasm2_buf, sizeof(reasm2_buf));
+
+    int extracted = 0;
+    int completed2 = 0;
+    static uint8_t payload_buf[AR8030_CHUNK_MAX_PAYLOAD];
+    for (int guard = 0; extracted < cap.count && guard < 1000000; guard++) {
+        struct ar8030_chunk_hdr hdr;
+        uint32_t payload_len = 0;
+        int ret = ar8030_chunk_stream_read(&stream, &hdr, payload_buf, sizeof(payload_buf), &payload_len);
+        if (ret < 0)
+            FAIL("chunk_stream_read hard error on chunk %d", extracted);
+        if (ret == 0) {
+            if (fw.pos >= fw.len)
+                FAIL("fake wire exhausted after only %d/%d chunks", extracted, cap.count);
+            continue;
+        }
+
+        struct ar8030_chunk_hdr want_hdr;
+        memcpy(&want_hdr, cap.bufs[extracted], AR8030_CHUNK_HDR_SIZE);
+        if (memcmp(&hdr, &want_hdr, AR8030_CHUNK_HDR_SIZE) != 0)
+            FAIL("chunk_stream chunk %d header mismatch", extracted);
+        uint32_t want_payload_len = cap.lens[extracted] - AR8030_CHUNK_HDR_SIZE;
+        if (payload_len != want_payload_len)
+            FAIL("chunk_stream chunk %d payload_len mismatch: got %u want %u", extracted, payload_len,
+                 want_payload_len);
+        if (memcmp(payload_buf, cap.bufs[extracted] + AR8030_CHUNK_HDR_SIZE, payload_len) != 0)
+            FAIL("chunk_stream chunk %d payload mismatch", extracted);
+
+        if (ar8030_reassembly_feed(&reasm2, &hdr, payload_buf, payload_len))
+            completed2 = 1;
+        extracted++;
+    }
+    if (extracted != cap.count)
+        FAIL("chunk_stream extracted %d chunks, expected %d", extracted, cap.count);
+    if (!completed2)
+        FAIL("stream-mode reassembly never completed");
+    if (reasm2.write_off != annexb_len || memcmp(reasm2.buf, annexb, annexb_len) != 0)
+        FAIL("stream-mode reassembled bytes differ from the original frame");
+    fprintf(stderr,
+            "chunk_stream round trip: %d/%d chunks byte-identical after resync + "
+            "%u-byte fragmented reads, reassembled frame byte-identical (%u bytes)\n",
+            extracted, cap.count, fw.max_per_call, annexb_len);
+
+    /* 2c. Same chunks again, but this time flip one payload byte in a
+     * middle chunk before feeding it through -- proves the checksum
+     * added after real hardware showed zero write failures / zero
+     * resyncs / zero dropped frames yet still-visible video corruption
+     * (a decoder being fed corrupted-but-present data) actually catches
+     * that case: the corrupted chunk must be silently skipped (not
+     * handed to the caller), which then shows up as exactly one missing
+     * chunk_idx to the reassembler -- i.e. the frame is correctly
+     * dropped, never accepted as "complete" with corrupt bytes inside. */
+    static uint8_t corrupt_wire[65536];
+    memcpy(corrupt_wire, wire, wire_len);
+    int corrupt_chunk_idx = cap.count / 2;
+    /* Locate that chunk's payload within corrupt_wire by re-deriving its
+     * offset the same way it was concatenated above (junk lead-in, then
+     * chunks 0..cap.count-1 back to back). */
+    uint32_t off = sizeof(junk);
+    for (int i = 0; i < corrupt_chunk_idx; i++)
+        off += cap.lens[i];
+    off += AR8030_CHUNK_HDR_SIZE; /* skip into this chunk's payload */
+    corrupt_wire[off] ^= 0xFF;
+
+    struct fake_wire fw2 = { .data = corrupt_wire, .len = wire_len, .pos = 0, .max_per_call = 64 };
+    static uint8_t stream_buf2[8 * (AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD)];
+    ar8030_chunk_stream_t stream2;
+    ar8030_chunk_stream_init(&stream2, fake_wire_read, &fw2, stream_buf2, sizeof(stream_buf2), 0, NULL);
+
+    static uint8_t reasm3_buf[65536];
+    ar8030_reassembly_t reasm3;
+    ar8030_reassembly_init(&reasm3, reasm3_buf, sizeof(reasm3_buf));
+
+    int extracted2 = 0;
+    int completed3 = 0;
+    for (int guard = 0; guard < 1000000; guard++) {
+        struct ar8030_chunk_hdr hdr2;
+        uint32_t plen2 = 0;
+        int ret2 = ar8030_chunk_stream_read(&stream2, &hdr2, payload_buf, sizeof(payload_buf), &plen2);
+        if (ret2 < 0)
+            FAIL("chunk_stream_read hard error in corruption test");
+        if (ret2 == 0) {
+            if (fw2.pos >= fw2.len)
+                break; /* wire exhausted -- expected once the good chunks run out */
+            continue;
+        }
+        if (ar8030_reassembly_feed(&reasm3, &hdr2, payload_buf, plen2))
+            completed3 = 1;
+        extracted2++;
+    }
+    if (extracted2 != cap.count - 1)
+        FAIL("corrupted stream yielded %d chunks, expected %d (one dropped for bad checksum)",
+             extracted2, cap.count - 1);
+    if (stream2.checksum_fails != 1)
+        FAIL("expected exactly 1 checksum failure, got %llu", (unsigned long long)stream2.checksum_fails);
+    if (completed3)
+        FAIL("reassembly completed despite a missing (checksum-failed) chunk -- corrupt frame was "
+             "accepted instead of dropped");
+    if (reasm3.dropped_frames != 1)
+        FAIL("expected the gap left by the corrupted chunk to register as exactly 1 dropped frame, "
+             "got %llu",
+             (unsigned long long)reasm3.dropped_frames);
+    fprintf(stderr,
+            "checksum corruption test: 1 corrupted chunk silently skipped (checksum_fails=%llu), "
+            "%d/%d good chunks still extracted, resulting frame correctly dropped (not falsely "
+            "completed)\n",
+            (unsigned long long)stream2.checksum_fails, extracted2, cap.count - 1);
 
     /* 3. RTP/H.265-packetize the reassembled frame over a connected
      * AF_UNIX SOCK_DGRAM pair (same send()-on-connected-socket path

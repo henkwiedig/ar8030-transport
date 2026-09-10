@@ -39,7 +39,9 @@ SRCS := \
 	main.c \
 	rtp_h265.c \
 	$(COMMON)/ar8030_link.c \
-	$(COMMON)/reassembly.c
+	$(COMMON)/reassembly.c \
+	$(COMMON)/chunk_stream.c \
+	$(COMMON)/crc16.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(SRCS:.c=.o)))
 
 TARGET := ar8030-transport-rx

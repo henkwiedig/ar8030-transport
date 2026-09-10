@@ -28,10 +28,25 @@ typedef struct {
     uint32_t frame_pts;
     uint8_t flags;
     int active;
+
+    /* Lifetime counters for -v stats reporting (rx/main.c) -- persist
+     * across ar8030_reassembly_reset() calls, unlike everything above.
+     * completed_frames is every feed() that returned 1; dropped_frames is
+     * every feed() that discarded an in-progress (or about-to-start)
+     * frame due to a gap, an out-of-order/inconsistent chunk, or a
+     * buffer overflow -- see the three call sites in reassembly.c. A
+     * dropped_frames rate much higher than expected packet loss for the
+     * link is a sign something upstream (chunk_stream resyncing, wrong
+     * chunk size on one end, etc.) is corrupting the chunk stream rather
+     * than just losing occasional chunks to the radio. */
+    uint64_t completed_frames;
+    uint64_t dropped_frames;
+    uint16_t last_bad_seq;     /* dedup for dropped_frames -- see reassembly.c's note_dropped() */
+    int have_last_bad_seq;
 } ar8030_reassembly_t;
 
-/* buf/cap must be set by the caller before first use; everything else is
- * zeroed by this call. */
+/* buf/cap must be set by the caller before first use; everything else
+ * (including the lifetime counters) is zeroed by this call. */
 void ar8030_reassembly_init(ar8030_reassembly_t *r, uint8_t *buf, uint32_t cap);
 
 /* Drops any in-progress frame without completing it. */

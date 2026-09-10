@@ -25,6 +25,8 @@ SRCS := \
 	roundtrip_test.c \
 	$(COMMON)/chunker.c \
 	$(COMMON)/reassembly.c \
+	$(COMMON)/chunk_stream.c \
+	$(COMMON)/crc16.c \
 	$(RX)/rtp_h265.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(SRCS:.c=.o)))
 

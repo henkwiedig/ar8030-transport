@@ -5,9 +5,11 @@
  * Reads whole encoded H.265 access units from waybeam's frame-shm ring
  * (see third_party/waybeam_frame_ring), splits each into fixed-size
  * chunks prefixed with an ar8030_chunk_hdr (common/ar8030_chunk.h), and
- * writes each chunk with bb_socket_write() on a datagram-mode bb_socket.
- * No FEC, no ACK: a lost chunk just makes its frame incomplete on the
- * ground side, which drops it and moves on (see rx/main.c).
+ * writes each chunk with bb_socket_write() on a stream-mode bb_socket
+ * (no BB_SOCK_FLAG_DATAGRAM -- see README.md "Stream mode, not
+ * datagram", matching the stock vendor streamer's own bb_socket_open()
+ * calls). No FEC, no ACK: a lost chunk just makes its frame incomplete
+ * on the ground side, which drops it and moves on (see rx/main.c).
  *
  * A second thread (tx/bitrate_ctl.c) watches the AR8030's own local TX
  * MCS/throughput and throttles waybeam's live bitrate over loopback HTTP
@@ -27,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_RING_NAME "venc_frames"
@@ -43,14 +46,15 @@
 #define DEFAULT_VIDEO_PORT 2
 #define DEFAULT_SLOT BB_SLOT_0
 #define RETRY_MS 2000
-/* Per-chunk bb_socket_write() ack-wait timeout. Bumped up from an
- * earlier 200ms default: on a real, contended RF link the daemon's own
- * write-completion ack can lag past 200ms under an IDR-frame burst
- * (confirmed on bench hardware -- see common/ar8030_chunk.h's default
- * payload comment), and bb_socket_write() aborts the whole call the
- * instant its single wait times out, so a short timeout was actively
- * making congestion worse rather than just tolerating it. */
-#define DEFAULT_WRITE_TIMEOUT_MS 800
+/* Per-write-attempt bb_socket_write() timeout. 1500ms matches the stock
+ * vendor streamer's own value (reverse-engineered from ar_ldyhs_sky's
+ * fpv_bb_video_stream_send), which -- unlike an earlier datagram-mode
+ * version of this tool -- does not need to be conservative about a
+ * single timeout aborting everything: in stream mode a write that only
+ * makes partial progress isn't a failure, it's just handed the
+ * remainder and retried (see chunk_send_to_socket()). Only a write that
+ * makes *zero* progress within this timeout counts as a real failure. */
+#define DEFAULT_WRITE_TIMEOUT_MS 1500
 /* After this many back-to-back frames where not even the first chunk
  * got written (the strongest available signal that the link is
  * currently saturated, not just this one frame's bad luck), pause
@@ -58,6 +62,7 @@
  * chunks -- see the backoff comment in main()'s send loop. */
 #define BACKOFF_AFTER_CONSECUTIVE_STALLS 5
 #define BACKOFF_MS 50
+#define STATS_INTERVAL_S 1.0
 
 static volatile int g_stop;
 
@@ -80,6 +85,7 @@ struct tx_args {
     double margin;
     uint32_t min_kbps;
     uint32_t max_kbps;
+    int verbose;
 };
 
 static void usage(const char *argv0)
@@ -97,6 +103,8 @@ static void usage(const char *argv0)
             "  -m <fraction>  bitrate margin applied to link throughput (default 0.70)\n"
             "  -n <kbps>      minimum bitrate floor (default 512)\n"
             "  -x <kbps>      maximum bitrate ceiling (default 20000)\n"
+            "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
+            "failures, ring health)\n"
             "  -h             this help\n",
             argv0, DEFAULT_RING_NAME, DEFAULT_DAEMON_IP, DEFAULT_SLOT, DEFAULT_VIDEO_PORT,
             AR8030_CHUNK_DEFAULT_PAYLOAD, DEFAULT_WRITE_TIMEOUT_MS, DEFAULT_WAYBEAM_HOST,
@@ -117,9 +125,10 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->margin = 0.70;
     a->min_kbps = 512;
     a->max_kbps = 20000;
+    a->verbose = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:h")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:vh")) != -1) {
         switch (opt) {
         case 'r':
             a->ring_name = optarg;
@@ -154,6 +163,9 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
         case 'x':
             a->max_kbps = (uint32_t)strtoul(optarg, NULL, 10);
             break;
+        case 'v':
+            a->verbose = 1;
+            break;
         case 'h':
         default:
             usage(argv[0]);
@@ -169,26 +181,111 @@ static void *bitrate_thread_main(void *arg)
     return NULL;
 }
 
+/* -v stats, updated inline on the single send-loop thread (no locking
+ * needed -- bitrate_ctl.c runs on its own thread but never touches
+ * these). frames_in is every frame handed to ar8030_chunk_frame();
+ * frames_complete/frames_incomplete classify what happened to it by
+ * comparing the chunks actually sent against the chunks it needed (see
+ * main()'s use of ar8030_chunk_frame()'s out_chunk_count). bytes_sent
+ * counts wire bytes (header + payload) of chunks that were actually
+ * written. */
+struct tx_stats {
+    uint64_t frames_in;
+    uint64_t frames_complete;
+    uint64_t frames_incomplete;
+    uint64_t chunks_sent;
+    uint64_t chunks_failed;
+    uint64_t bytes_sent;
+};
+
 struct tx_send_ctx {
     ar8030_link_t *link;
     int write_timeout_ms;
+    const volatile int *stop_flag;
+    struct tx_stats *stats;
 };
 
-/* ar8030_chunk_send_fn for ar8030_chunk_frame(): writes one chunk with a
- * bounded timeout. A half-sent frame is going to be dropped as incomplete
- * on the ground side either way, so ar8030_chunk_frame() stopping early
- * on a non-zero return (rather than this retrying) is the right call --
- * holding up the encode-thread-fed ring to fight a stalled radio link is
- * worse than just moving on to the next frame. */
+/* ar8030_chunk_send_fn for ar8030_chunk_frame(): writes one whole chunk,
+ * retrying on partial progress rather than treating it as failure.
+ *
+ * In stream mode, bb_socket_write() returning less than the requested
+ * length is not an error -- see session_socket.c's non-datagram path,
+ * which lets a write make whatever progress the link currently has room
+ * for and hands back that count. The stock vendor streamer's own send
+ * loop (fpv_bb_video_stream_send, reverse-engineered from ar_ldyhs_sky)
+ * does exactly this: keep calling bb_socket_write() with the remaining
+ * bytes until the whole chunk is sent, and only treat a call that made
+ * *zero* progress (ret <= 0) as a real failure. A half-sent frame is
+ * still going to be dropped as incomplete on the ground side either way
+ * once a chunk genuinely fails, so ar8030_chunk_frame() stopping early
+ * there (rather than retrying the whole frame) remains the right call --
+ * holding up the encode-thread-fed ring to fight a dead link is worse
+ * than just moving on to the next frame. */
 static int chunk_send_to_socket(void *ctx, const uint8_t *buf, uint32_t len)
 {
     struct tx_send_ctx *sc = (struct tx_send_ctx *)ctx;
-    int wr = bb_socket_write(sc->link->sockfd, buf, len, sc->write_timeout_ms);
-    if (wr < 0) {
-        fprintf(stderr, "tx: bb_socket_write failed (len=%u, ret=%d)\n", len, wr);
-        return -1;
+    uint32_t sent = 0;
+
+    while (sent < len) {
+        if (sc->stop_flag && *sc->stop_flag)
+            return -1;
+
+        int wr = bb_socket_write(sc->link->sockfd, buf + sent, len - sent, sc->write_timeout_ms);
+        if (wr <= 0) {
+            fprintf(stderr, "tx: bb_socket_write made no progress (len=%u, sent=%u, ret=%d)\n", len,
+                    sent, wr);
+            sc->stats->chunks_failed++;
+            return -1;
+        }
+        sent += (uint32_t)wr;
     }
+    sc->stats->chunks_sent++;
+    sc->stats->bytes_sent += len;
     return 0;
+}
+
+static void print_tx_stats(const struct tx_stats *cur, const struct tx_stats *prev, double dt_s,
+                            const venc_frame_ring_t *ring)
+{
+    uint64_t d_in = cur->frames_in - prev->frames_in;
+    uint64_t d_ok = cur->frames_complete - prev->frames_complete;
+    uint64_t d_bad = cur->frames_incomplete - prev->frames_incomplete;
+    uint64_t d_chunks = cur->chunks_sent - prev->chunks_sent;
+    uint64_t d_chunk_fail = cur->chunks_failed - prev->chunks_failed;
+    uint64_t d_bytes = cur->bytes_sent - prev->bytes_sent;
+
+    venc_frame_ring_fill_t fill;
+    memset(&fill, 0, sizeof(fill));
+    venc_frame_ring_get_fill(ring, &fill);
+    /* fill.writes is venc_frame_ring_get_fill()'s r->stats.writes, a
+     * per-attached-instance counter only a *producer* (venc_frame_ring_
+     * begin_write()/commit_write()) increments -- this process only ever
+     * calls venc_frame_ring_read_wait() as a consumer, so that field would
+     * always read 0 here regardless of whether waybeam is producing
+     * anything, which is actively misleading rather than merely useless.
+     * ring->hdr->write_idx is the real, shared, producer-updated counter
+     * (same field waybeam's own frame_shm_consumer_test.c reads for this
+     * exact purpose) -- read it directly instead. */
+    uint64_t producer_writes = __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE);
+
+    fprintf(stderr,
+            "tx stats: frames %.1f/s in, %.1f/s complete, %.1f/s incomplete | chunks %.1f/s sent, "
+            "%.1f/s failed | %.2f Mbit/s | ring %u%% full (producer_writes=%llu our_reads=%llu "
+            "full_drops=%llu other_drops=%llu) | totals: in=%llu complete=%llu incomplete=%llu "
+            "bytes=%llu\n",
+            d_in / dt_s, d_ok / dt_s, d_bad / dt_s, d_chunks / dt_s, d_chunk_fail / dt_s,
+            (d_bytes * 8.0) / (dt_s * 1e6), fill.fill_pct, (unsigned long long)producer_writes,
+            (unsigned long long)fill.reads, (unsigned long long)fill.full_drops,
+            (unsigned long long)fill.other_drops, (unsigned long long)cur->frames_in,
+            (unsigned long long)cur->frames_complete, (unsigned long long)cur->frames_incomplete,
+            (unsigned long long)cur->bytes_sent);
+}
+
+static double now_monotonic_s(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
 static uint8_t frame_flags_from_meta(const VencFrameMeta *meta)
@@ -234,8 +331,8 @@ int main(int argc, char **argv)
     bb_sock_opt_t sock_opt;
     sock_opt.tx_buf_size = 64 * 1024;
     sock_opt.rx_buf_size = 1024;
-    if (ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port,
-                                 BB_SOCK_FLAG_TX | BB_SOCK_FLAG_DATAGRAM, &sock_opt) != 0) {
+    if (ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port, BB_SOCK_FLAG_TX,
+                                 &sock_opt) != 0) {
         ar8030_link_close(&link);
         venc_frame_ring_destroy(ring);
         return 1;
@@ -268,7 +365,14 @@ int main(int argc, char **argv)
         g_stop = 1;
     }
 
-    struct tx_send_ctx send_ctx = { .link = &link, .write_timeout_ms = args.write_timeout_ms };
+    struct tx_stats stats;
+    memset(&stats, 0, sizeof(stats));
+    struct tx_stats stats_prev = stats;
+    double stats_last_print = now_monotonic_s();
+
+    struct tx_send_ctx send_ctx = {
+        .link = &link, .write_timeout_ms = args.write_timeout_ms, .stop_flag = &g_stop, .stats = &stats
+    };
     /* Consecutive frames where not even the first chunk got written --
      * see BACKOFF_AFTER_CONSECUTIVE_STALLS. A frame that sent *some*
      * chunks before failing resets this: that is ordinary loss, not
@@ -277,6 +381,15 @@ int main(int argc, char **argv)
 
     uint16_t frame_seq = 0;
     while (!g_stop) {
+        if (args.verbose) {
+            double now = now_monotonic_s();
+            if (now - stats_last_print >= STATS_INTERVAL_S) {
+                print_tx_stats(&stats, &stats_prev, now - stats_last_print, ring);
+                stats_prev = stats;
+                stats_last_print = now;
+            }
+        }
+
         uint32_t out_len = 0;
         int ret = venc_frame_ring_read_wait(ring, ring_buf, ring_buf_size, &out_len, 200);
         if (ret != 0)
@@ -289,9 +402,15 @@ int main(int argc, char **argv)
         const uint8_t *frame_data = ring_buf + VENC_FRAME_META_SIZE;
         uint32_t frame_len = out_len - VENC_FRAME_META_SIZE;
 
+        stats.frames_in++;
+        uint32_t expected_chunks = 0;
         int sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
                                        meta.pts, frame_data, frame_len, args.chunk_payload,
-                                       chunk_send_to_socket, &send_ctx);
+                                       chunk_send_to_socket, &send_ctx, &expected_chunks);
+        if (sent >= 0 && (uint32_t)sent == expected_chunks)
+            stats.frames_complete++;
+        else
+            stats.frames_incomplete++;
         frame_seq++;
 
         if (sent == 0) {

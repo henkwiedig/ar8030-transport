@@ -43,6 +43,7 @@ SRCS := \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/http_get.c \
 	$(COMMON)/chunker.c \
+	$(COMMON)/crc16.c \
 	$(FRAME_RING)/venc_frame_ring.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(SRCS:.c=.o)))
 
