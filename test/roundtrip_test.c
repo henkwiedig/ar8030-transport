@@ -269,14 +269,21 @@ int main(void)
      * chunks through reassembly in order, exactly as the wire carries
      * them. */
     const uint32_t chunk_payload = 300;
-    struct chunk_capture cap;
+    /* static: with AR8030_CHUNK_MAX_PAYLOAD now the wire format's full
+     * 65535-byte ceiling, struct chunk_capture (256 bufs of HDR_SIZE +
+     * MAX_PAYLOAD each) is ~16 MB -- far too big for a plain stack local,
+     * same reasoning as this file's other large buffers already being
+     * static. */
+    static struct chunk_capture cap;
     memset(&cap, 0, sizeof(cap));
     uint16_t frame_seq = 42;
     uint8_t flags = AR8030_CHUNK_FLAG_IDR;
     uint32_t frame_pts = 1234567;
     uint32_t expected_chunk_count = 0;
+    static uint8_t chunk_scratch[AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD];
     int sent = ar8030_chunk_frame(frame_seq, flags, AR8030_CHUNK_CODEC_H265, frame_pts, annexb,
-                                   annexb_len, chunk_payload, capture_chunk, &cap, &expected_chunk_count);
+                                   annexb_len, chunk_payload, capture_chunk, &cap, &expected_chunk_count,
+                                   chunk_scratch, sizeof(chunk_scratch));
     if ((uint32_t)sent != expected_chunk_count)
         FAIL("ar8030_chunk_frame sent %d chunks but claimed %u total", sent, expected_chunk_count);
     if (sent != cap.count)

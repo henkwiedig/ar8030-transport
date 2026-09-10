@@ -351,6 +351,9 @@ int main(int argc, char **argv)
     bc_cfg.hysteresis = 0.05;
     bc_cfg.min_interval_ms = 1500;
     bc_cfg.poll_interval_ms = 2000;
+    bc_cfg.ring = ring; /* already attached above; see bitrate_ctl.h's cfg->ring comment */
+    bc_cfg.ring_backlog_high_slots = 2; /* venc_frame_ring.h: >=2 is standing backlog */
+    bc_cfg.ring_backoff = 0.85;
     bc_cfg.stop_flag = &g_stop;
 
     pthread_t bc_thread;
@@ -362,6 +365,19 @@ int main(int argc, char **argv)
     uint8_t *ring_buf = malloc(ring_buf_size);
     if (!ring_buf) {
         fprintf(stderr, "tx: OOM allocating %u-byte ring read buffer\n", ring_buf_size);
+        g_stop = 1;
+    }
+
+    /* One-time scratch buffer for ar8030_chunk_frame()'s header+payload
+     * staging -- see chunker.h for why this moved out of an internal
+     * fixed-size array (AR8030_CHUNK_MAX_PAYLOAD is now the wire
+     * format's full 65535-byte ceiling, too big for a repeated on-stack
+     * buffer on this RAM-constrained target). Sized to args.chunk_payload,
+     * not the ceiling, so a smaller -c doesn't allocate more than it needs. */
+    uint32_t chunk_scratch_size = AR8030_CHUNK_HDR_SIZE + args.chunk_payload;
+    uint8_t *chunk_scratch = malloc(chunk_scratch_size);
+    if (!chunk_scratch) {
+        fprintf(stderr, "tx: OOM allocating %u-byte chunk scratch buffer\n", chunk_scratch_size);
         g_stop = 1;
     }
 
@@ -406,7 +422,8 @@ int main(int argc, char **argv)
         uint32_t expected_chunks = 0;
         int sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
                                        meta.pts, frame_data, frame_len, args.chunk_payload,
-                                       chunk_send_to_socket, &send_ctx, &expected_chunks);
+                                       chunk_send_to_socket, &send_ctx, &expected_chunks, chunk_scratch,
+                                       chunk_scratch_size);
         if (sent >= 0 && (uint32_t)sent == expected_chunks)
             stats.frames_complete++;
         else
@@ -434,6 +451,7 @@ int main(int argc, char **argv)
     if (bc_thread_ok)
         pthread_join(bc_thread, NULL);
 
+    free(chunk_scratch);
     free(ring_buf);
     ar8030_link_close(&link);
     venc_frame_ring_destroy(ring);

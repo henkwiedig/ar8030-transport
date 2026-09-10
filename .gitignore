@@ -5,3 +5,6 @@
 /rx/ar8030-transport-rx
 /test/build/
 /test/roundtrip_test
+linkctl/ar8030-linkctl
+linkctl/ar8030-linkctl-rx
+linkctl/ar8030-linkctl-tx

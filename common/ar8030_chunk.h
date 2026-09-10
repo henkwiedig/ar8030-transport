@@ -38,26 +38,33 @@
 
 #define AR8030_CHUNK_MAGIC 0x4D524641u /* "AFRM" little-endian on the wire */
 
-/* Default per-chunk payload cap. bw_update_demo's own H.26x file-streaming
- * mode (app/bw_update_demo, "-l 9216") sends single bb_socket_write()
- * payloads well above this size successfully as a synthetic bandwidth
- * test, but bb_socket_write() waits (per-call timeout) for the daemon's
- * write ack before returning, and on a real, contended RF link under a
- * bursty real-time source (an IDR frame's worth of chunks arriving back
- * to back) that ack can lag well behind a short timeout -- confirmed on
- * bench hardware: 4096 produced sustained "bb_socket_write failed"
- * bursts once the link was under load. 1024 keeps each write's ack-wait
- * shorter and each dropped chunk cheaper, at the cost of more chunks per
- * frame. Tune with -c; AR8030_CHUNK_MAX_PAYLOAD is the hard ceiling this
- * can be raised to, not the default. */
-#define AR8030_CHUNK_DEFAULT_PAYLOAD 1024u
+/* Default per-chunk payload cap. The stock vendor streamer (ar_ldyhs_sky,
+ * reverse-engineered) does not chunk at the application layer at all: it
+ * accumulates a whole encoded frame and hands it to bb_socket_write() in
+ * ONE call (looped only on partial-write progress, same as
+ * chunk_send_to_socket() in tx/main.c), relying on stream mode's
+ * partial-write tolerance rather than any fixed transport-level slice
+ * size -- see README.md "Chunk sizing" for the full writeup. Given our
+ * own reassembly is all-or-nothing per frame (no FEC, no NACK -- any one
+ * missing/corrupt chunk drops the whole frame regardless of which chunk),
+ * small fixed chunks buy nothing but cost more: every bb_socket_write()
+ * is an RPC round trip to ar8030d, and more, smaller chunks per frame
+ * means more RPC volume (which is what filled ar8030d's own debug log
+ * and caused an OOM -- see README's "Diagnosing 'nothing is getting
+ * through'") and more independent chances for one transfer glitch to
+ * drop an entire frame. So this defaults to the wire format's actual
+ * ceiling (see AR8030_CHUNK_MAX_PAYLOAD) rather than a conservative
+ * fraction of it: most frames go out as a single chunk, matching the
+ * vendor's own proven approach. -c can still lower it for experimentation
+ * on a particularly poor link. */
+#define AR8030_CHUNK_DEFAULT_PAYLOAD 65535u
 
-/* Hard ceiling chunker.c's fixed scratch buffer is sized for. Comfortably
- * above bw_update_demo's own proven single-write sizes (see the comment
- * above) and above BB_CONFIG_MAC_TX_BUF_SIZE-class buffer sizes this SDK
- * uses elsewhere; raise it (and the scratch buffer) together if a
- * deployment genuinely needs bigger chunks. */
-#define AR8030_CHUNK_MAX_PAYLOAD 8192u
+/* Hard ceiling: payload_len below is a uint16_t, so no chunk can ever
+ * carry more than 65535 bytes of payload regardless of how large
+ * chunk_payload is asked to be -- this is a wire-format limit, not a
+ * buffer-sizing choice. A frame bigger than this still needs more than
+ * one chunk no matter what -c is set to. */
+#define AR8030_CHUNK_MAX_PAYLOAD 65535u
 
 /* Mirrors VENC_FRAME_FLAG_* from waybeam's venc_frame_ring.h bit-for-bit,
  * so tx/main.c can copy VencFrameMeta.flags straight across without a

@@ -7,9 +7,12 @@
 
 int ar8030_chunk_frame(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t frame_pts,
                         const uint8_t *data, uint32_t data_len, uint32_t chunk_payload,
-                        ar8030_chunk_send_fn send, void *send_ctx, uint32_t *out_chunk_count)
+                        ar8030_chunk_send_fn send, void *send_ctx, uint32_t *out_chunk_count,
+                        uint8_t *scratch, uint32_t scratch_cap)
 {
     if (chunk_payload == 0 || chunk_payload > AR8030_CHUNK_MAX_PAYLOAD)
+        return -1;
+    if (scratch_cap < (uint32_t)AR8030_CHUNK_HDR_SIZE + chunk_payload)
         return -1;
 
     uint32_t chunk_count = (data_len + chunk_payload - 1) / chunk_payload;
@@ -20,7 +23,7 @@ int ar8030_chunk_frame(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_
     if (out_chunk_count)
         *out_chunk_count = chunk_count;
 
-    uint8_t sendbuf[AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD];
+    uint8_t *sendbuf = scratch;
     int sent = 0;
 
     for (uint32_t i = 0; i < chunk_count; i++) {

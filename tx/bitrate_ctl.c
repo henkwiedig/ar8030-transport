@@ -62,6 +62,16 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
     return v;
 }
 
+/* venc_frame_ring.h's low_water_slots is republished by the producer at
+ * most once per ~200ms window (VENC_RING_LOW_WATER_WINDOW_US) -- reading
+ * it more often than that just re-observes the same value, so a backlog
+ * apply is still rate-limited, just on a much shorter leash than the
+ * normal MCS path's min_interval_ms (that one is about not spamming
+ * waybeam's HTTP API on ordinary MCS jitter; this one is a "the pipe is
+ * backing up right now" alarm and should react close to as fast as the
+ * signal itself updates). */
+#define RING_BACKLOG_MIN_INTERVAL_MS 250
+
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 {
     bb_set_event_callback_t sub_mcs;
@@ -93,6 +103,40 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         usleep(100 * 1000);
 
         uint64_t now = now_ms();
+
+        /* Ring backlog check: a cheap, always-on shared-memory read (no
+         * RPC, unlike BB_GET_MCS), so this runs every ~100ms tick
+         * regardless of the MCS poll/event gating below -- a backlog can
+         * develop well inside one poll_interval_ms window and this is the
+         * only signal that would catch it in time. Bypasses hysteresis
+         * entirely (any standing backlog is by definition worth reacting
+         * to) but keeps its own short rate limit so a persistent backlog
+         * doesn't re-issue the same HTTP call every single tick. */
+        if (cfg->ring && have_applied && (now - last_apply_ms) >= (uint64_t)RING_BACKLOG_MIN_INTERVAL_MS) {
+            uint16_t backlog_slots = __atomic_load_n(&cfg->ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+            if (backlog_slots >= cfg->ring_backlog_high_slots) {
+                uint32_t backlog_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ring_backoff),
+                                                      cfg->min_kbps, cfg->max_kbps);
+                if (backlog_target < last_applied_kbps) {
+                    char path[128];
+                    snprintf(path, sizeof(path), "/api/v1/set?video0.bitrate=%u", backlog_target);
+                    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+                    if (status >= 200 && status < 300) {
+                        fprintf(stderr,
+                                "bitrate_ctl: URGENT ring backlog=%u slots -> video0.bitrate=%u kbps\n",
+                                backlog_slots, backlog_target);
+                        last_applied_kbps = backlog_target;
+                        last_apply_ms = now;
+                    } else {
+                        fprintf(stderr,
+                                "bitrate_ctl: waybeam %s returned status=%d (URGENT backlog=%u slots, "
+                                "target=%u kbps)\n",
+                                path, status, backlog_slots, backlog_target);
+                    }
+                }
+            }
+        }
+
         int poll_due = (now - last_apply_ms) >= (uint64_t)cfg->poll_interval_ms || !have_applied;
         int woken = g_wake != last_seen_wake;
         last_seen_wake = g_wake;

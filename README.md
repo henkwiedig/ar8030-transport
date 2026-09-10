@@ -125,6 +125,51 @@ byte-at-a-time on a bad magic if alignment is ever lost — which should
 only happen right after a corrupted read or a sender restart mid-stream,
 not in steady state.
 
+## Chunk sizing
+
+`ar8030-transport-tx -c` defaults to 65535 bytes — the wire format's
+actual ceiling, not a conservative fraction of it (see
+`AR8030_CHUNK_MAX_PAYLOAD` in `common/ar8030_chunk.h`; `payload_len` is a
+`uint16_t`, so no chunk can ever carry more than that regardless of `-c`).
+Most encoded frames go out as a single chunk; only the largest IDR frames
+need more than one.
+
+This changed from an earlier, much smaller default (1024–4096, tuned
+during the datagram-mode era — see "Bench findings" below) after
+reverse-engineering how the stock vendor streamer (`ar_ldyhs_sky`)
+actually handles this. It **doesn't chunk at the application layer at
+all**: `fpv_video_send_thread` accumulates a whole encoded frame (the
+encoder can emit it as several slices; the accumulation loop reassembles
+them into one buffer before ever touching the socket), then
+`fpv_bb_video_stream_send` hands the *entire* frame to `bb_socket_write()`
+in one call — the same partial-write retry loop this project's
+`chunk_send_to_socket()` uses, at the same 1500ms per-attempt timeout —
+relying on stream mode's partial-write tolerance rather than any
+fixed transport-level slice size. It even checksums the payload (XOR32,
+prepended header, magic trailer), independently validating this
+project's own CRC16 addition above.
+
+Given this project's reassembly is all-or-nothing per frame (no FEC, no
+NACK — any one missing or checksum-failed chunk drops the whole frame
+regardless of *which* chunk), small fixed chunks bought nothing but cost
+real overhead: every `bb_socket_write()` is an RPC round trip to
+`ar8030d`, and more, smaller chunks per frame means more RPC volume —
+which is exactly what was flooding `ar8030d`'s own debug log and filling
+a tiny tmpfs `/tmp` (see "Bench findings" below) — plus more independent
+chances for one transfer glitch to take out an entire frame for no
+benefit. Raising the default to match the vendor's one-chunk-per-frame
+approach cuts RPC/syscall volume roughly in proportion to the old
+chunk-per-frame count, with no loss of correctness (the CRC16 still
+covers whatever ends up in one chunk, however large). `-c` can still be
+lowered for experimentation on a particularly poor link.
+
+`common/chunker.c`'s per-chunk header+payload staging buffer is
+caller-provided (`ar8030_chunk_frame()`'s `scratch`/`scratch_cap`
+params) rather than an internal fixed-size array, specifically so a
+65535-byte ceiling doesn't mean a 65KB+ buffer on every call's stack on
+a RAM-constrained target — `tx/main.c` mallocs it once at startup, sized
+to the actual `-c` in use, not the ceiling.
+
 ## Bitrate control
 
 `ar8030-transport-tx` reads its own current AP-side TX throughput
@@ -141,6 +186,32 @@ boundary, and applied via `GET /api/v1/set?video0.bitrate=<kbps>` on
 waybeam's loopback HTTP API (`documentation/HTTP_API_CONTRACT.md` in
 waybeam_venc — `video0.bitrate` is `MUT_LIVE`, applied without a pipeline
 restart).
+
+**Second signal: ring backlog.** MCS says what the radio *should*
+currently be able to carry; it says nothing about whether this side's own
+`bb_socket_write()` pipeline is actually draining frames that fast — a
+local congestion signal MCS can't see. The stock vendor streamer has an
+equivalent second signal (`com_bb_video_buffer_query_left_frames()`,
+reverse-engineered from `fpv_video_buffer_cache_monitor` — cuts bitrate
+harder when its own outbound frame queue backs up, regardless of what MCS
+nominally allows). This project's analog reads waybeam's frame-shm ring's
+own `low_water_slots` field (`third_party/waybeam_frame_ring/venc_frame_ring.h`)
+— the lowest occupancy the *producer* (waybeam) saw in each ~200ms window,
+published specifically for a co-located rate controller to read. It's a
+low-water rather than a high-water check deliberately (see that header's
+own comment): a healthy ring routinely spikes its fill percentage on
+ordinary bursts, but low-water asks whether the ring ever failed to drain
+at all during the window, which is what actually distinguishes standing
+backlog (this side genuinely can't keep up) from a normal burst.
+`bitrate_ctl.c` checks this every ~100ms tick (a plain shared-memory
+read, no RPC, so unlike the MCS check it doesn't need to wait for
+`poll_interval_ms`) and, once `low_water_slots` reaches
+`ring_backlog_high_slots` (default 2 — `venc_frame_ring.h`'s own
+threshold for "standing backlog"), immediately cuts the last-applied
+bitrate by `ring_backoff` (default 0.85), bypassing hysteresis, rate
+limited to once per 250ms rather than the normal path's 1500ms. Logged
+with an `URGENT` tag in stderr / `-v` output to distinguish it from an
+ordinary MCS-driven change.
 
 ## Build
 
@@ -312,14 +383,31 @@ than only knowing that they did:
   (bitrate margin) controls how much data enters the pipe in the first
   place and is the one to lower first.
 - **This particular air unit has very little RAM headroom** (Mem-Info
-  showed `managed:58272kB` — under 60 MB total). `waybeam` was OOM-killed
-  twice while bench-testing `ar8030-transport-tx` alongside it; the OOM
-  dump's own per-process accounting showed `ar8030-transport-tx` using a
-  few hundred KB RSS at the time, not an obviously large contributor, so
-  this looks like a pre-existing tight-memory condition on this device
-  rather than a leak in this tool — but it means there is close to no
-  margin for a third long-running process on a box this small. Watch
-  `free -m` / `dmesg` for `oom-kill` while testing a new device.
+  showed `managed:58272kB` — under 60 MB total), and `waybeam` was
+  OOM-killed on real hardware after `ar8030-transport-tx` had been
+  running only a few minutes (it had previously run for hours over
+  waybeam's own direct UDP/RNDIS output with no issue). Neither
+  `ar8030-transport`'s own code nor waybeam's frame-shm producer path had
+  a leak (confirmed by manual audit plus an ASAN+LeakSanitizer stress
+  run, and a from-scratch trace of every frame-shm backend) — the actual
+  cause was `ar8030d` itself: `com_log_init()`
+  (`yz_host_drv/com/com_log.c`) opens a per-run debug/RPC trace log with
+  no size cap or rotation, and every `bb_socket_write()`/`BB_GET_MCS`
+  call this transport makes is itself an RPC logged at `INFO` level — far
+  more RPC volume than the plain IP/RNDIS path the daemon was previously
+  exercised against. That log filled the air unit's 28.5 MB tmpfs `/tmp`
+  in well under an hour; once full, the *system-wide* memory pressure
+  from tmpfs pages (invisible in any single process's own RSS, which is
+  why `ar8030-transport-tx` itself looked innocent in the OOM dump) got
+  an arbitrary process picked by the kernel's OOM killer — waybeam in the
+  observed case, unrelated to the actual leak. Fixed upstream in the SDK,
+  not in this repo: `builder/package/ar8030/0009-com_log-cap-daemon-log-file-size.patch`
+  and its ground-side counterpart
+  (`sbc-groundstations/package/ar8030/0010-...patch`) cap that log file at
+  2 MB, truncating it back to empty instead of growing forever. Still
+  worth watching `free -m` / `df -h /tmp` / `dmesg` for `oom-kill` on a
+  new device regardless — the tmpfs is small enough that anything else
+  writing to it steadily could reproduce the same failure mode.
 
 ## Phase 2 (explicitly out of scope here)
 

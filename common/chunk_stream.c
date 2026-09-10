@@ -50,10 +50,18 @@ int ar8030_chunk_stream_read(ar8030_chunk_stream_t *s, struct ar8030_chunk_hdr *
          * loop body never runs more than once (the previous call already
          * left a valid header at the front, or none at all) -- it only
          * does real work right after a corrupted read or a sender
-         * restart mid-stream. */
+         * restart mid-stream.
+         *
+         * magic is the only field this can validate: payload_len can no
+         * longer be range-checked against AR8030_CHUNK_MAX_PAYLOAD as a
+         * secondary filter now that the ceiling is a uint16_t's full
+         * range (65535) -- every value the field can hold is "in range"
+         * by construction, so that comparison would always be true. The
+         * actual bound that matters for memory safety (payload_len vs.
+         * payload_buf_cap) is still checked below, per chunk. */
         while (s->len >= AR8030_CHUNK_HDR_SIZE) {
             memcpy(hdr, s->buf, AR8030_CHUNK_HDR_SIZE);
-            if (hdr->magic == AR8030_CHUNK_MAGIC && hdr->payload_len <= AR8030_CHUNK_MAX_PAYLOAD)
+            if (hdr->magic == AR8030_CHUNK_MAGIC)
                 break;
             memmove(s->buf, s->buf + 1, --s->len);
             s->resync_dropped_bytes++;
