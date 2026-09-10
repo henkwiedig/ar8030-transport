@@ -1,0 +1,7 @@
+*.o
+/tx/build/
+/tx/ar8030-transport-tx
+/rx/build/
+/rx/ar8030-transport-rx
+/test/build/
+/test/roundtrip_test
