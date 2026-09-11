@@ -575,18 +575,265 @@ same fresh boot, works fine in DRV mode (`-i 3`) moments later. Not yet
 root-caused; testing was paused here to restore a working DRV-mode link
 rather than keep iterating live on a single dev unit.
 
+**Update: the "-i 1 first write always times out" failure above was a
+settle-time artifact, not a real bug.** Retesting against an
+already-settled chip (module loaded and running fine in DRV mode for
+several minutes first, then switching the daemon to `-i 1` without any
+module reload) registered the device cleanly and passed `BB_GET_STATUS`
+immediately — no timeout, no wedge. The failure only ever reproduced
+right after a *fresh* module/firmware reload, before the chip's own SDIO
+command-processing task was ready. Not yet fixed at the driver level
+(no code change makes this reliable from a cold boot); the practical
+workaround for now is simply not exercising `-i 1` immediately after a
+reload.
+
+**Then: real throughput was measured for the first time, and it was
+*worse* than DRV mode, not better** (~0.3 Mbit/s, vs. DRV mode's own
+much higher numbers once its bandwidth bug — see above — was also
+fixed). The daemon's own debug-pad log
+(`/var/log/ar8030/daemon_log/<mac>.log`, written by `ar8030d` itself —
+worth knowing about for any future debugging session) showed
+`dev_dat_so_write_proc`'s "send ok"/"send cpl" entries completing in a
+clean ~100-110ms cadence regardless of chunk size: the signature of a
+fixed per-write round-trip cost, not a real bandwidth ceiling.
+Root-caused by decompiling the vendor's own `artosyn_sdio.ko` (Ghidra,
+`ghidra-mcp`) for comparison: its own write function waits via a plain,
+effectively-unbounded `prepare_to_wait_event()`/`schedule()` loop — no
+short per-iteration timeout — while this driver's `artosyn_sdio_write()`
+only ever waited 5×10 jiffies (well under a second) before giving up and
+falling back to `WORKAROUND_FOR_INTERRUPT_LOST_ISSUE`'s own ~10ms-interval
+polling path, which was satisfying nearly every single write instead of
+the real TX-ready interrupt (which does fire correctly — confirmed
+`artosyn_sdio_irqhandler()` already calls `wake_up_interruptible_all()`
+on it). Fixed in **`0012-sdio-write-wait-for-real-interrupt-not-100ms-poll.patch`**
+(applied): one much longer (`SDIO_WRITE_WAIT_MS`, 2000ms) wait instead of
+the short retry loop, matching the vendor's patience. `artosyn_read()`
+was compared the same way but deliberately left alone — its own design
+already checks the condition directly before ever waiting, and the
+debug-pad log showed no equivalent read-side stall.
+
+Also worth knowing for next time: **DRV mode's own throughput turned out
+to fluctuate a lot even with the bandwidth bug fixed** (a real, ~18Mbps-
+capable session was reported as visibly unstable, vs. the user's own
+memory of the stock vendor SDIO driver+daemon being "rock solid") — since
+`oal_mdev.c` (DRV mode) calls into this exact same `artosyn_sdio_write()`,
+**`0012` fixes DRV-mode stability too, not just SDIO throughput —
+confirmed on real hardware**: the same session that fluctuated wildly
+before `0012` (swinging well below and above the true link capacity)
+settled to a steady ~17 Mbit/s (occasional dips to the low teens) at
+mcs=12/bw=20M afterward, through plain DRV mode with no other change.
+This makes `0012` valuable independent of whether the SDIO daemon path
+ever gets finished — it's a real, general fix to this driver's own
+write-wait design, not something specific to the raw chardev.
+
+**Retested `-i 1` with `0012` in place: a new, different, earlier-stage
+stall, not the throughput problem `0012` fixes.** The daemon's data
+socket never finished opening at all -- its own debug-pad log's last
+line was `rpc_socket_read_proc:socket try init slot 0 port 2`, then
+nothing further, ever (confirmed the log file's mtime itself had gone
+stale, not just a display lag). Crucially, `dmesg` showed **no**
+`"write wait timeout"` at all during this stall, even minutes in --
+with `0012`'s now-2-second timeout, a real low-level write attempt would
+have logged one by then. That means this particular stall happens
+*before* any `artosyn_sdio_write()`/`artosyn_read()` call is ever
+reached at all -- somewhere in the daemon's own session/socket
+establishment sequence (`rpc_socket_read_proc` and whatever it calls),
+not in the SDIO transport layer `0012` touches. Correct slot/port were
+confirmed targeted (this is not a repeat of the earlier hardcoded-slot
+bug) and the device itself was already registered and passing
+`BB_GET_STATUS` cleanly at the time.
+
+**Root-caused and fixed the socket-open stall.** Comparing `bus/sdio.c`'s
+own `sdio_chardev_poll()` against the working `tx_q`/`rx_q` split
+elsewhere in the file: `poll_wait()` only ever registered on `dev->tx_q`.
+The chip's `so_open` acknowledgment -- the very thing the daemon's
+socket state machine (`daemon/sock_node_rpc.c`, `daemon/sock_node.c`)
+was waiting on to leave `sock_wait_usb_cmd` -- arrives as an RX-ready
+mailbox event, and that branch's own `wake_up_interruptible_all(&dev->rx_q)`
+call had been left commented out (`oal_mdev.c`'s DRV-mode consumer never
+waits on `rx_q`, only via its own workqueue, so nothing needed it before
+this chardev existed). At the exact moment of a fresh socket open there
+is no TX traffic yet either, so nothing was coincidentally re-waking
+`poll()` the way ordinary bidirectional streaming might once data
+starts flowing -- confirming why this stall was 100% reproducible right
+at the start, not intermittent. Fixed in `0011`'s own **UPDATE 3**:
+uncommented the `rx_q` wakeup in both `artosyn_sdio_irqhandler()`'s and
+`artosyn_sdio_reg_check()`'s rx-ready branches, and `sdio_chardev_poll()`
+now waits on both `tx_q` and `rx_q`. Confirmed on real hardware: with
+this plus `0012`, the socket opened immediately and a burst of real
+video data flowed at a genuinely fast pace (`dev_dat_so_write_proc`
+completing in single-digit milliseconds, not the ~100ms-per-write
+pattern from before `0012` -- a real, large improvement).
+
+**Then: a *third*, still-unfixed bug -- video stalls again after a short
+burst under sustained load.** After maybe a second or two of fast,
+correct-looking traffic, the daemon's own ring buffer
+(`sock_dev_push_data`) starts logging `"warning loss rpc data ... push =
+0"` repeatedly, with `buf_wr_index`/`buf_head_index` frozen at the exact
+same values across many seconds -- the send side has stopped draining
+entirely, permanently, not just falling behind. Critically, `dmesg`
+showed **no** `"write wait timeout"` at any point during this stall,
+even minutes in, and neither `ar8030d` nor `ar8030-transport-tx` was
+burning CPU (both idle/sleeping in `top`) -- ruling out a busy-loop and
+suggesting the send thread is blocked somewhere that never reaches (or
+never returns from) `artosyn_sdio_write()` again, rather than that
+function itself timing out. Not yet root-caused. Recovering requires
+switching back to DRV mode (`-i 3`) -- no kernel module reload needed,
+the module itself keeps working fine, only the SDIO daemon's own session
+state gets stuck.
+
+**Narrowed the sustained-load stall considerably (still not fixed).**
+Compared the two most likely reply-handling paths in
+`daemon/sock_node.c`'s `dev_dat_so_write_proc()` (the normal `pack->sta
+>= 0` completion path, and the `-0x107`/"send pending" flow-control
+path) line-by-line against the vendor's real `daemon_sdiov12` (Ghidra,
+`ghidra-mcp`, same technique that found `0011`/`0012`) -- both are
+**logically equivalent** between our SDK source and the vendor's actual
+binary (the `-0x108` case is a no-op, just a log line, in *both*). So
+this is not a reply-handling logic bug. Retested live and looked at
+what's actually stuck: `ar8030-transport-tx`'s own process survives (not
+crashed, not spinning -- 0% CPU throughout), but `/proc/<pid>/task/*/wchan`
+showed its main thread blocked in `pthread_join()` waiting on the
+bitrate-control thread, which was itself blocked (almost certainly
+inside a `bb_ioctl()` call, e.g. `BB_GET_MCS`, waiting on an RPC reply
+that never arrives) -- i.e. **the control-plane RPC got stuck too, not
+just the data socket.** Critically, a *completely separate, freshly-
+started* client (`ar8030-linkctl status`, a brand new connection) worked
+instantly while this was happening -- so neither the daemon nor the
+SDIO channel/chip is globally wedged; this is specific to one
+long-lived client session getting into a stuck state once something
+goes wrong with its data socket. `dmesg` showed zero `"bytes for read
+lost"` events either time this was checked, ruling out the kernel-level
+mailbox-notification-drop mechanism as the direct cause too.
+
+Current best hypothesis (not yet confirmed): a response-matching/reqid
+desync in the client-side RPC library itself (`libar8030_client.so`,
+same SDK source on both sides of this project) -- something causes one
+in-flight RPC reply to be consumed by the wrong waiter, or dropped, such
+that whichever call is waiting for it blocks forever, but only for that
+one already-open session; a fresh session's own request/reply pairing
+is unaffected.
+
 **Next steps, for whoever picks this back up:**
-- Root-cause the "-i 1 first write always times out, device never
-  registers" failure above. Candidates not yet ruled out: a settle-time
-  race between the chip leaving ROM/firmware-download mode and the
-  daemon's `start_sdio_proc()` doing its first `open()`+write (`S60ar8030`
-  already sleeps 3s here for the DRV path; SDIO mode may need longer or a
-  different signal to wait on); some other init step DRV mode's
-  `oal_mdev.c` path does that the raw chardev path skips entirely.
-- Only once that's fixed: actually run `ar8030-transport-tx`/`-rx`
-  against `/dev/artosyn_sdio` under load and confirm the ~18 Mbit/s the
-  vendor's own binaries demonstrated actually reproduces through this
-  project's own code — never yet reached.
+- Trace the client library's own RPC request/reply matching (wherever
+  `bb_ioctl()`/`bb_socket_write()` correlate a reply to the call that's
+  waiting for it -- likely in this SDK's shared `com/` or client-side
+  RPC code, used identically by every tool including `ar8030-linkctl`,
+  so the same code that just proved fine for a fresh session needs to
+  be checked for what differs once a session has an active data socket
+  alongside other RPC traffic).
+**Implemented a workaround, not a fix: `S65ar8030-transport-tx` now
+watchdogs itself.** `start_tx()`/`watchdog()` in that script track `-v`'s
+own `"totals: ... bytes=N"` field (not just log mtime -- confirmed on
+real hardware that mtime alone misses a *second* failure mode, below)
+and force-restart the whole process (`kill -9` + respawn) if it goes
+unchanged for two consecutive 6s checks. Confirmed working on real
+hardware: it correctly detected a stall and recovered the socket cleanly
+without any manual intervention. But confirmed **not sufficient for
+production SDIO use as-is** -- the underlying stall recurs roughly every
+10-15 seconds under sustained load, so auto-recovery just produces
+frequent hiccups rather than smooth video. This is a real safety net
+(and cheap insurance for DRV mode too, where the same class of bug could
+in principle also occur, just apparently far more rarely) but the actual
+protocol-level bug above still needs fixing for SDIO mode to be usable.
+
+Also found, incidentally, a **second, different failure signature** on
+one retest: instead of a silent freeze, `bb_socket_write()` started
+returning immediately with zero progress, repeatedly (`"bb_socket_write
+made no progress (len=N, sent=0, ret=0)"`), while the main loop kept
+iterating and printing fresh stats every second -- an mtime-only
+watchdog would never notice this one, since the log file *is* still
+being written to; only the byte-progress check catches it. Whether
+this and the "blocked forever" signature from earlier are the same
+underlying bug manifesting two ways, or two separate bugs, is unknown.
+
+**Re-assurance test against the stock vendor SDIO stack -- and a
+methodology fix that matters for all future testing here.** Loaded the
+vendor's own real `artosyn_sdio.ko` + `daemon_sdiov12` (Ascent V18.21.10,
+`libstdc++.so.6`/`libgcc_s.so.1` alongside -- musl's own libc suffices,
+those two are the only extra libraries it needs) to compare directly
+against our own stack under identical conditions. First attempt (right
+after our own module had already been loaded once this same boot) found
+the vendor daemon *also* unresponsive -- initially read as a vendor-side
+problem, but retesting on a genuinely fresh reboot (nothing else having
+touched the chip first) showed it responding instantly and then running
+a real waybeam/PixelPilot session at a clean, stable ~14-18 Mbit/s for
+minutes with zero hiccups. **The cross-module-reload contamination this
+project has run into all night (our module wedging after the vendor's
+had run, and vice versa) is real and affects any stack, not a defect
+specific to either implementation** -- meaningful for how to test any
+future fix here: always from a fresh boot, never right after another
+module has already touched the chip. Confirmed practical recipe:
+rename `S60ar8030`/`S65ar8030-transport-tx` to keep them from
+auto-starting (`rcS` only checks `-f`, not `-x`, so `chmod -x` alone
+does *not* skip a script here), reboot, then bring the stack under test
+up by hand.
+
+**Redoing our own SDIO stack the exact same clean way surfaced the real
+remaining gap, cleanly isolated from that contamination confound for the
+first time.** Our own module + daemon (`-i 1`), brought up by hand on an
+equally fresh boot, still recurringly hit `"bb_socket_write made no
+progress"` -- capping real throughput around ~1-3 Mbit/s (`bitrate_ctl`
+correctly estimated the link at ~26 Mbit/s and asked for ~18 Mbit/s
+video; the shortfall is entirely in the transport, not the bitrate
+control loop) -- while the vendor's stack, tested identically, held
+~14-18 Mbit/s indefinitely. This is a real difference between the two
+implementations that fresh-boot testing did not explain away.
+
+Comparing `artosyn_sdio_irqhandler()`/`artosyn_sdio_reg_check()` against
+the vendor's real decompiled equivalent (Ghidra, same technique that
+found `0012`) turned up one more real design difference, not yet
+present in `0004`'s already-matching size-decode fix: **the vendor wakes
+a single shared waitqueue for every mailbox event** (either channel,
+rx-ready, and tx-ready alike), while this driver used separate `tx_q`/
+`rx_q` queues woken only by their own matching event type -- so a writer
+blocked on `tx_q` only got a chance to re-check when a genuine TX-ready
+event fired, never on unrelated RX or channel activity the vendor's
+design would have used as an extra chance to notice a state change.
+Matched (0011's own UPDATE 4) by having every wake site -- both mailbox
+channels, rx-ready, tx-ready, in both `artosyn_sdio_irqhandler()` and
+`artosyn_sdio_reg_check()` -- wake both `tx_q` and `rx_q`, rather than
+introducing one literal shared queue for the same practical effect.
+
+**Confirmed a real, partial improvement, but not a fix.** Retested the
+exact same clean-boot way: the failure mode changed from *permanent*
+stalls (recovery previously needed the watchdog's kill-and-restart) to
+brief, self-recovering blips roughly every 15-20 seconds -- a genuine
+resilience improvement from giving the blocked writer more chances to
+notice a real state change. But real throughput stayed capped around
+~1.2 Mbit/s; the periodic blips, though no longer permanent, still cost
+enough to bottleneck it far below the vendor's ~14-18 Mbit/s under
+identical conditions. The underlying root cause -- why the real TX-ready
+condition doesn't become true promptly and periodically, on both
+implementations' shared low-level state machine, only reliably on the
+vendor's -- is still not found.
+
+**Next steps, for whoever picks this back up:**
+- **Always test from a fresh reboot**, nothing else having touched the
+  chip first (see the contamination finding above) -- this invalidates
+  any test methodology that reloads modules back-to-back in one boot.
+- Root-cause why the vendor's stack never hits this stall at all while
+  ours still does periodically, even with the wake-propagation gap
+  closed. The client-side RPC library's own request/reply matching
+  (`libar8030_client.so`, shared by every tool including
+  `ar8030-linkctl`) remains a candidate, not yet directly investigated
+  -- a fresh client session was confirmed unaffected while an existing
+  one was stuck, in an earlier (contaminated) test tonight; worth
+  re-confirming under the clean-boot methodology.
+- The watchdog in `S65ar8030-transport-tx` (byte-progress based, see
+  above) remains valuable as a safety net regardless -- keep it even
+  once the root cause is found, as insurance against whatever residual
+  rate of stalls remains.
+- Once sustained throughput actually holds at something close to the
+  vendor's ~14-18+ Mbit/s: confirm picture quality/stability under a
+  full waybeam/PixelPilot session, not just a raw benchmark number.
+- Given DRV mode now performs close to vendor-parity levels on its own
+  (once both the bandwidth bug and this write-wait bug are fixed), the
+  SDIO daemon path may no longer be a hard requirement for production —
+  it remains a valid path to pursue for the last stretch of headroom
+  (and structurally simpler/lower-overhead than DRV mode's `oal_mdev.c`
+  multiplexing either way), but isn't blocking a usable release the way
+  it looked earlier in this investigation.
 - The historical "intermittent firmware-download failure on a freshly
   rebuilt module" mystery from earlier in this investigation did not
   recur once builds went through the real Buildroot pipeline
@@ -595,6 +842,15 @@ rather than keep iterating live on a single dev unit.
   invocations — but this was observed only incidentally, not
   deliberately re-isolated, so treat it as "not currently reproducing"
   rather than "fixed".
+- **Do not `cat` (or otherwise read) `/proc/ar_drv/dev0/dbg`** (or
+  presumably its sibling proc files under `/proc/ar_drv/dev0/`) on real
+  hardware — confirmed live to crash the kernel outright (`Unable to
+  handle kernel NULL pointer dereference`, `proc_write+0x32` called from
+  `proc_reg_read_iter`: this proc entry's read path is wired to the
+  write handler by mistake, a genuine pre-existing bug in this vendor
+  driver's own `ar_proc.c`). Setting `dbg_log_level` via the documented
+  `echo dbg_log_level=N > ...` write interface is presumably still fine
+  (untested since the crash) — just never read it back.
 
 ## Phase 2 (explicitly out of scope here)
 

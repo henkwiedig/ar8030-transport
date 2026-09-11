@@ -57,15 +57,29 @@
  */
 #define DEFAULT_SLOT (-1)
 #define RETRY_MS 2000
-/* Per-write-attempt bb_socket_write() timeout. 1500ms matches the stock
- * vendor streamer's own value (reverse-engineered from ar_ldyhs_sky's
- * fpv_bb_video_stream_send), which -- unlike an earlier datagram-mode
- * version of this tool -- does not need to be conservative about a
- * single timeout aborting everything: in stream mode a write that only
- * makes partial progress isn't a failure, it's just handed the
- * remainder and retried (see chunk_send_to_socket()). Only a write that
- * makes *zero* progress within this timeout counts as a real failure. */
-#define DEFAULT_WRITE_TIMEOUT_MS 1500
+/* Per-write-attempt bb_socket_write() timeout. Used to match the stock
+ * vendor streamer's own 1500ms value (reverse-engineered from
+ * ar_ldyhs_sky's fpv_bb_video_stream_send) -- appropriate when the
+ * vendor's own kernel-level write-wait gives up quickly too. Bumped past
+ * that once 0012-sdio-write-wait-for-real-interrupt-not-100ms-poll.patch
+ * made our own artosyn_sdio_write() wait far more patiently (up to
+ * SDIO_WRITE_WAIT_MS, 2000ms) than it used to: with a *shorter* client
+ * timeout than the kernel's own wait, this client gives up and moves on
+ * before a write the kernel was still legitimately completing ever
+ * finishes -- confirmed on real hardware via session_socket.c's own
+ * "recv bad socket pack" log (a daemon reply arriving after this
+ * client had already stopped waiting for it, opt=so_write, nobody left
+ * in the wake_up list to consume it). Diagnostic/mitigation, not
+ * necessarily the underlying fix: this doesn't explain *why*
+ * artosyn_sdio_write() sometimes needs close to 2s in the first place,
+ * just avoids this client giving up before it's done. Comfortably past
+ * SDIO_WRITE_WAIT_MS so a normal-but-slow write always gets to finish
+ * rather than getting orphaned this way; unlike an earlier datagram-mode
+ * version of this tool, a write that only makes partial progress isn't a
+ * failure either way -- it's just handed the remainder and retried (see
+ * chunk_send_to_socket()) -- only a write that makes *zero* progress
+ * within this timeout counts as a real failure. */
+#define DEFAULT_WRITE_TIMEOUT_MS 2500
 /* After this many back-to-back frames where not even the first chunk
  * got written (the strongest available signal that the link is
  * currently saturated, not just this one frame's bad luck), pause
