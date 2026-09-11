@@ -80,7 +80,9 @@ static void usage(const char *argv0)
             "      directly, bypassing the channel table.\n"
             "\n"
             "Common flags:\n"
-            "  -s slot     target slot, bb_slot_e (default 0)\n"
+            "  -s slot     target slot, bb_slot_e (default 0), or 'auto' (bandwidth\n"
+            "              only) to use whichever slot is actually CONNECTed --\n"
+            "              which slot a peer lands on isn't fixed across reboots\n"
             "  -d dir      tx, rx, or (freq only) both (default tx)\n"
             "  -u user     physical user index, bb_user_e (default 0)\n"
             "  -w seconds  wait up to this long for the link to reach CONNECT\n"
@@ -141,6 +143,37 @@ static int wait_for_connect(uint8_t slot, int timeout_s)
         }
         usleep(500 * 1000);
     }
+    return -1;
+}
+
+/* Scans every slot for BB_LINK_STATE_CONNECT instead of checking one fixed
+ * slot -- for '-s auto', since which slot a peer actually lands on isn't
+ * fixed across reboots (confirmed on real hardware: the same unit paired
+ * on slot 2 one boot, slot 0 another). Mirrors bb_pair's own
+ * wait_for_paired_peer() slot-scan. Polls at least once even if timeout_s
+ * is 0, so '-s auto' without -w still resolves against the current state
+ * instead of refusing outright. Returns the connected slot, or -1 if none
+ * is up within timeout_s. */
+static int resolve_connected_slot(int timeout_s)
+{
+    int waited_ms = 0;
+    do {
+        bb_get_status_in_t st_in = { .user_bmp = 0xffff };
+        bb_get_status_out_t st_out;
+        memset(&st_out, 0, sizeof(st_out));
+        if (bb_ioctl(g_hbb, BB_GET_STATUS, &st_in, &st_out) == 0) {
+            for (int s = 0; s < BB_SLOT_MAX; s++) {
+                if (st_out.link_status[s].state == BB_LINK_STATE_CONNECT) {
+                    return s;
+                }
+            }
+        }
+        if (waited_ms + 500 >= timeout_s * 1000) {
+            break;
+        }
+        usleep(500 * 1000);
+        waited_ms += 500;
+    } while (1);
     return -1;
 }
 
@@ -269,6 +302,7 @@ static int cmd_status(int argc, char **argv)
 static int cmd_bandwidth(int argc, char **argv)
 {
     int slot = 0, dir = BB_DIR_TX, wait_s = 0;
+    int slot_auto = 0;
     int opt;
     optind = 1;
     while ((opt = getopt(argc, argv, "d:s:w:")) != -1) {
@@ -277,7 +311,11 @@ static int cmd_bandwidth(int argc, char **argv)
             dir = parse_dir(optarg, 0);
             break;
         case 's':
-            slot = atoi(optarg);
+            if (!strcmp(optarg, "auto")) {
+                slot_auto = 1;
+            } else {
+                slot = atoi(optarg);
+            }
             break;
         case 'w':
             wait_s = atoi(optarg);
@@ -299,7 +337,17 @@ static int cmd_bandwidth(int argc, char **argv)
         fprintf(stderr, "linkctl: bad bandwidth '%s' (want 1.25/2.5/5/10/20/40 or 0-5)\n", argv[optind]);
         return 1;
     }
-    if (wait_s > 0 && wait_for_connect((uint8_t)slot, wait_s) != 0) {
+    if (slot_auto) {
+        /* Which slot a peer connects on isn't fixed across reboots
+         * (confirmed on real hardware), so a hardcoded slot -- as this
+         * used to be -- silently applies to the wrong slot and reports
+         * back a benign-looking error instead of ever taking effect. */
+        slot = resolve_connected_slot(wait_s);
+        if (slot < 0) {
+            fprintf(stderr, "linkctl: -s auto: no slot reached CONNECT within %ds\n", wait_s);
+            return 1;
+        }
+    } else if (wait_s > 0 && wait_for_connect((uint8_t)slot, wait_s) != 0) {
         fprintf(stderr, "linkctl: link not CONNECT after %ds, applying anyway\n", wait_s);
     }
 

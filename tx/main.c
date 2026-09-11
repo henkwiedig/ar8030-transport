@@ -44,7 +44,18 @@
  * `ar8030-status`'s BB_GET_SOCK_INFO output first: any port it lists is
  * already claimed by something). */
 #define DEFAULT_VIDEO_PORT 2
-#define DEFAULT_SLOT BB_SLOT_0
+/* -1, not BB_SLOT_0: air is AP role, and bb_socket_open()'s doc comment
+ * ("Target SLOT. If DEV, target SLOT is BB_SLOT_AP") makes clear that on
+ * the AP side the slot parameter targets a *specific connected DEV peer*,
+ * not a fixed self-reference the way BB_SLOT_AP is for DEV (see rx/main.c's
+ * own comment on that). A fixed default here silently opens the socket on
+ * whatever slot number was guessed, which the actual peer may not occupy --
+ * confirmed on real hardware pairing landing on slot 2 one boot and slot 0
+ * another. -1 means "resolve from BB_GET_STATUS at startup" (see
+ * resolve_connected_slot() in main()); -s still overrides it explicitly for
+ * bench use without a live peer.
+ */
+#define DEFAULT_SLOT (-1)
 #define RETRY_MS 2000
 /* Per-write-attempt bb_socket_write() timeout. 1500ms matches the stock
  * vendor streamer's own value (reverse-engineered from ar_ldyhs_sky's
@@ -94,7 +105,8 @@ static void usage(const char *argv0)
             "usage: %s [options]\n"
             "  -r <name>      frame-shm ring name (default %s)\n"
             "  -d <ip>        ar8030d daemon IP (default %s)\n"
-            "  -s <slot>      AR8030 slot (default %d)\n"
+            "  -s <slot>      AR8030 slot (default: auto-detect the connected DEV\n"
+            "                 peer's slot from BB_GET_STATUS at startup)\n"
             "  -o <port>      AR8030 bb_socket logical port, 0-3 (default %d)\n"
             "  -c <bytes>     max chunk payload (default %u)\n"
             "  -t <ms>        per-chunk bb_socket_write ack-wait timeout (default %d)\n"
@@ -106,7 +118,7 @@ static void usage(const char *argv0)
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
-            argv0, DEFAULT_RING_NAME, DEFAULT_DAEMON_IP, DEFAULT_SLOT, DEFAULT_VIDEO_PORT,
+            argv0, DEFAULT_RING_NAME, DEFAULT_DAEMON_IP, DEFAULT_VIDEO_PORT,
             AR8030_CHUNK_DEFAULT_PAYLOAD, DEFAULT_WRITE_TIMEOUT_MS, DEFAULT_WAYBEAM_HOST,
             DEFAULT_WAYBEAM_PORT);
 }
@@ -288,6 +300,43 @@ static double now_monotonic_s(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* Scans BB_GET_STATUS for whichever slot is actually BB_LINK_STATE_CONNECT,
+ * retrying every RETRY_MS until one is found or *stop_flag fires -- mirrors
+ * ar8030-linkctl's resolve_connected_slot() and bb_pair's own
+ * wait_for_paired_peer() slot-scan. Called before opening the data socket
+ * (see DEFAULT_SLOT's comment on why a hardcoded slot is wrong here): this
+ * tool otherwise starts writing within seconds of boot, often well before
+ * ar8030-pair's own retry loop finishes -- confirmed on real hardware that
+ * opening the socket on the wrong (or a not-yet-connected) slot leaves the
+ * chip with nowhere to drain that data, which backs up the low-level SDIO
+ * write queue until it times out permanently (needs a reboot to clear).
+ * Blocks like the ring-attach/daemon-connect retry loops above it in
+ * main() -- same reasoning: waybeam/ar8030d may come up before pairing
+ * finishes, so this has to wait rather than fail outright. Returns the
+ * connected slot, or -1 if *stop_flag fired first. */
+static int resolve_connected_slot(bb_dev_handle_t *dev, const volatile int *stop_flag)
+{
+    int logged = 0;
+    while (!*stop_flag) {
+        bb_get_status_in_t st_in = { .user_bmp = 0xffff };
+        bb_get_status_out_t st_out;
+        memset(&st_out, 0, sizeof(st_out));
+        if (bb_ioctl(dev, BB_GET_STATUS, &st_in, &st_out) == 0) {
+            for (int s = 0; s < BB_SLOT_MAX; s++) {
+                if (st_out.link_status[s].state == BB_LINK_STATE_CONNECT) {
+                    return s;
+                }
+            }
+        }
+        if (!logged) {
+            fprintf(stderr, "tx: waiting for a peer to reach CONNECT before opening the data socket...\n");
+            logged = 1;
+        }
+        usleep(RETRY_MS * 1000);
+    }
+    return -1;
+}
+
 static uint8_t frame_flags_from_meta(const VencFrameMeta *meta)
 {
     uint8_t flags = 0;
@@ -326,6 +375,16 @@ int main(int argc, char **argv)
     if (ar8030_link_connect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS, &g_stop) != 0) {
         venc_frame_ring_destroy(ring);
         return 0;
+    }
+
+    if (args.slot < 0) {
+        args.slot = resolve_connected_slot(link.dev, &g_stop);
+        if (args.slot < 0) {
+            ar8030_link_close(&link);
+            venc_frame_ring_destroy(ring);
+            return 0; /* stopped before any peer ever connected */
+        }
+        fprintf(stderr, "tx: resolved connected slot %d\n", args.slot);
     }
 
     bb_sock_opt_t sock_opt;

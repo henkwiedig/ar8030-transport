@@ -409,6 +409,193 @@ than only knowing that they did:
   new device regardless — the tmpfs is small enough that anything else
   writing to it steadily could reproduce the same failure mode.
 
+## Bandwidth: the real bottleneck
+
+On real hardware, `ar8030-transport-tx` plateaued around 4-7 Mbit/s no
+matter what MCS or bitrate margin was in play, while the *stock* vendor
+streamer reaches 20-25 Mbit/s on the same physical link. `BB_GET_MCS`
+was reporting an excellent MCS (matching the peer's own `rx_mcs` exactly)
+but a theoretical throughput far below what that MCS should give —
+because channel **bandwidth** (1.25/2.5/5/10/20/40 MHz gears, see
+`bb_bandwidth_e`) is a *separate* dimension from MCS in this chip, and
+the link was pinned at its narrowest gear (`BB_BW_5M`) indefinitely,
+even after several minutes of sustained, clean traffic that should have
+given any auto-widen mechanism every chance to act.
+
+The mechanism that would auto-widen it (`BB_CFG_SLOT_RX_MCS`'s
+`bw_auto` policy) turned out to be unimplemented in this SDK build's
+client library — the daemon rejects it outright (`"req 5 not found"`,
+from the ioctl dispatch table in `com/ioctl_tab.c` never having an entry
+for it). But `BB_SET_BANDWIDTH` — a direct manual override, "Manually
+change bandwidth in 1V1 mode" per its own doc comment — *is* registered
+and works immediately: forcing `BB_BW_20M` (matching
+`ar8030.json`'s own `subchan.main_bw: "20"`, so already permitted by
+config) took `BB_GET_MCS`'s reported throughput from 6483 → 25933 kbps
+with zero change in link quality (same MCS, same SNR, same zero LDPC
+errors) — and real, paced (not benchmark-hammered) throughput through
+this project's own transport followed, up to ~18 Mbit/s once the second
+bottleneck below was found.
+
+This isn't persistent at the chip level, so it has to be reapplied every
+time the link reaches CONNECT (fresh boot, or a reconnect after a drop)
+— wired into `S60ar8030`'s own `autoreconnect()` function, right after
+`ar8030-pair` succeeds.
+
+**`ar8030-transport/linkctl/`** is the tool this produced: a small,
+standalone `ar8030-linkctl` binary (built for both toolchains via the
+top-level Makefile and installed by both `ar8030-transport-tx`/`-rx`
+packages, since bandwidth/channel/MCS control is useful on either side)
+wrapping `status`, `bandwidth`, `channel`/`channel-mode`,
+`mcs`/`mcs-mode`, `freq`, and `force-close-socket`/`force-close-all`
+(recovers a `bb_socket` stuck reporting `"already opened"`/`"socket
+open error = 257"` after a client crashed without a clean
+`bb_socket_close()` — confirmed to happen on real hardware during this
+same investigation's own benchmarking). See `linkctl/main.c` for the
+full command reference (`-h`).
+
+## SDIO chardev: implemented, not yet proven
+
+Even with the bandwidth fix above, real (paced) throughput through this
+project's own `bb_socket_write()` calls capped hard around 5-7 Mbit/s —
+confirmed via a raw benchmark tool isolating the transport layer
+entirely from waybeam/chunking (`bb_socket_write()` itself blocking to
+match whatever the real drain rate was, regardless of write size,
+pacing, or `BB_SOCK_FLAG_SBUS`). The proximate cause: `ar8030d` here
+runs `-i 3` (`INTF_TYPE_DRV`, reaching the chip through
+`/dev/ar_mdev<N>`, this project's own out-of-tree kernel driver), while
+the *stock* streamer's own daemon (`daemon_sdiov12`, extracted from an
+official Ascent firmware release) runs `-i 1` (`INTF_TYPE_SDIO`,
+`/dev/artosyn_sdio`, a thin passthrough this SDK's `daemon/dev8030/
+sdio8030/sdio_dev.c` already has full source for — it was simply never
+built). Loading the vendor's own prebuilt `artosyn_sdio.ko` +
+`daemon_sdiov12` side by side with this project's *unmodified*
+`ar8030-transport-tx` confirmed ~18 Mbit/s — i.e. the DRV-mode kernel
+path itself is the bottleneck, not anything in this repo.
+
+**Decision: reimplement the SDIO backend ourselves** (option 2) rather
+than ship the vendor's closed `artosyn_sdio.ko`/`daemon_sdiov12`
+binaries (option 1 — fast, proven, but an unlicensed, unrebuildable
+binary pinned to one exact kernel build, in an otherwise-open project).
+`bus/sdio.c` (part of the `ar8030` SDK checkout, not this repo) already
+implements everything the daemon side needs — probe, firmware download,
+IRQ handling, and even `artosyn_sdio_write()`/`artosyn_read()` functions
+with the right signature — it just never exposed them as a character
+device; only `control/ar_chardev.c` does, built around the heavier
+`ar_mdev<N>`/`oal_mdev.c` message-multiplexing architecture DRV mode
+uses (a fresh `skb` allocation *per write*, queued through
+`oal_send_msg_req()`, built for multiplexing up to 8 `ar_mdev` instances
+over one physical channel — overhead a single physical device doesn't
+need, and the likely source of the DRV-mode ceiling).
+
+Three real, independent kernel bugs came out of chasing this, all
+patched in `builder/package/ar8030/` (mirrored in
+`sbc-groundstations/package/ar8030/` where applicable, though the ground
+unit is USB-connected and never uses the SDIO path itself):
+
+- **`0010-sdio-fix-double-free-when-probe-fails.patch`** (applied) —
+  `sdio_artosyn_probe()`'s failure path frees `dev` without clearing the
+  `sdio_set_drvdata()` pointer it published earlier, so a later
+  `sdio_artosyn_remove()` call (module unload, or `rmmod` during a
+  normal `reboot`'s shutdown) double-frees it. Unreachable before
+  `0005-dnld-retry-...patch_skip` existed (a failed firmware chunk used
+  to be silently treated as success, so probe never actually failed);
+  confirmed live as a full kernel panic (`kernel BUG at mm/slub.c`,
+  double free in `kfree()`) the first time a real failure hit this path.
+- **`0011-sdio-add-direct-artosyn_sdio-chardev.patch`** (applied) — the
+  `/dev/artosyn_sdio` character device itself, calling straight into
+  `bus/sdio.c`'s existing `artosyn_sdio_write()`/`artosyn_read()`,
+  bypassing `oal_mdev.c`'s multiplexing layer entirely. Builds and loads
+  cleanly, and the device node appears once the chip reaches RTOS mode.
+  Two more bugs surfaced only once this was actually exercised with
+  `ar8030d` built for `-i 1` (see below), both fixed in the same patch:
+  - The kernel's own RX workqueue (`ar_sdio_rx_func()`, feeding
+    `oal_mdev.c`'s DRV-mode queue) is wired unconditionally to every
+    SDIO RX-ready interrupt, regardless of which userspace interface is
+    actually selected at runtime (the kernel has no visibility into the
+    daemon's own `-i` choice). With the chardev in use, that workqueue
+    thread and a chardev reader both call `artosyn_read()` on the same
+    device concurrently — confirmed live as a continuous
+    `"artosyn_read: busy"` (`-EBUSY`) / `"read_valid_size ==
+    read_offset"` (`-EAGAIN`) flood, each caller starving the other.
+  - The first fix for that (skip the workqueue call whenever the
+    chardev is *registered*) was itself wrong: `sdio_chardev_registered`
+    is true unconditionally from `probe()` onward, regardless of whether
+    any daemon ever opens `/dev/artosyn_sdio` — so it permanently broke
+    plain DRV mode too (`total_rx_pkts` stuck at 0 forever, on every
+    single boot, confirmed live). Fixed for real with an atomic
+    open-count (`sdio_chardev_open_count`, tracked in
+    `sdio_chardev_open()`/`release()`) — the workqueue is now skipped
+    only while something actually has the chardev open.
+
+**Separately, and probably the bigger practical finding this round:**
+the "link is flaky after a reboot" symptom that had been deferred
+earlier turned out to be partly self-inflicted, not purely an RF-pairing
+issue:
+
+- **`ar8030-transport-tx` (air, AP role) opened its `bb_socket` on a
+  hardcoded slot 0** — but `bb_api.h`'s own doc comment for
+  `bb_socket_open()` says the slot parameter on the AP side targets the
+  *actual connected DEV peer's slot*, which varies across reboots
+  (observed landing on slot 2 one boot, slot 0 another). Writing into a
+  socket bound to a slot with no real peer left the chip's outbound
+  queue with nowhere to drain, and `artosyn_sdio_write()`'s own retry
+  budget (five ~10-jiffy waits, well under a second total) gives up
+  permanently on that write with no higher-level retry — explaining the
+  `"write wait timeout"` / frozen `total_tx_pkts` wedge seen repeatedly
+  during this investigation, independent of any kernel bug. Fixed: `tx/
+  main.c` now resolves the actually-connected slot from `BB_GET_STATUS`
+  before opening the socket (`-s auto`-style, `-s <slot>` still works as
+  an explicit override for bench use).
+- The same hardcoded-slot bug existed in `ar8030-linkctl bandwidth`
+  (used by `S60ar8030`'s post-pairing bandwidth widen) — fixed the same
+  way, `-s auto` resolves the connected slot from live status instead.
+- `S60ar8030`/`S97ar8030`'s `autoreconnect()` loop was one-shot: it only
+  retried `ar8030-pair` until the *first* success, then exited — a later
+  drop (confirmed to happen on real hardware) was never retried,
+  matching "needed to manually bring it up again". Fixed: it now keeps
+  polling link state after a successful pair and re-enters the retry
+  loop if the link ever leaves `CONNECT`.
+- A stopped `ar8030-transport-tx` doesn't always release its `bb_socket`
+  cleanly, leaving the port reporting `bb_socket_open() failed (ret=-1)`
+  on the next start — recovered with `ar8030-linkctl force-close-all`
+  (see its own section below); not yet root-caused why the close isn't
+  clean.
+
+**Status: SDIO daemon mode itself still not confirmed working
+end-to-end.** With both kernel bugs above fixed, `ar8030d` built with
+`USING_8030SDIO=ON` (now the case — alongside the existing
+`USING_8030DRV=ON` in `builder/package/ar8030/ar8030.mk`; both compile
+into one binary, `-i` selects at runtime) still hit a *different*
+failure on its first real attempt: every write into `/dev/artosyn_sdio`
+times out (`"artosyn_sdio_write: write wait timeout"`, `total_tx_pkts`
+frozen at 0) and the device never registers with `bb_dev_getlist()`
+(`ar8030-linkctl status` reports `"no AR8030 device known to the
+daemon"`) — even though the exact same physical chip, same firmware,
+same fresh boot, works fine in DRV mode (`-i 3`) moments later. Not yet
+root-caused; testing was paused here to restore a working DRV-mode link
+rather than keep iterating live on a single dev unit.
+
+**Next steps, for whoever picks this back up:**
+- Root-cause the "-i 1 first write always times out, device never
+  registers" failure above. Candidates not yet ruled out: a settle-time
+  race between the chip leaving ROM/firmware-download mode and the
+  daemon's `start_sdio_proc()` doing its first `open()`+write (`S60ar8030`
+  already sleeps 3s here for the DRV path; SDIO mode may need longer or a
+  different signal to wait on); some other init step DRV mode's
+  `oal_mdev.c` path does that the raw chardev path skips entirely.
+- Only once that's fixed: actually run `ar8030-transport-tx`/`-rx`
+  against `/dev/artosyn_sdio` under load and confirm the ~18 Mbit/s the
+  vendor's own binaries demonstrated actually reproduces through this
+  project's own code — never yet reached.
+- The historical "intermittent firmware-download failure on a freshly
+  rebuilt module" mystery from earlier in this investigation did not
+  recur once builds went through the real Buildroot pipeline
+  (`builder/package.sh ar8030`) against a properly-synced
+  `openipc/general/package/` tree, rather than ad-hoc manual `make`
+  invocations — but this was observed only incidentally, not
+  deliberately re-isolated, so treat it as "not currently reproducing"
+  rather than "fixed".
+
 ## Phase 2 (explicitly out of scope here)
 
 - **FEC.** `ar8030_chunk_hdr.reserved` is the only field reserved for
