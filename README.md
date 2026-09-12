@@ -453,7 +453,21 @@ open error = 257"` after a client crashed without a clean
 same investigation's own benchmarking). See `linkctl/main.c` for the
 full command reference (`-h`).
 
-## SDIO chardev: implemented, not yet proven
+## SDIO chardev: implemented, not yet proven (superseded -- see `kmod/`)
+
+**Update: this whole investigation's conclusion is a full clean-room
+rewrite, `kmod/artosyn_drv.c`, which resolved it.** Confirmed on real
+hardware: zero stalls, zero bad-socket-pack messages, sustained
+~18.5Mbit/s, over 439MB transferred across a ~190 second run -- the
+first time in this entire investigation SDIO mode has run completely
+clean, matching the vendor's own reference performance. See "Clean-room
+rewrite: `kmod/artosyn_drv.c`" below for the full story and what's left
+before this fully replaces the patched combined driver in normal use.
+Everything below this point is the investigation history that led
+there -- kept for the reasoning, not as current guidance; don't restart
+patching the old combined driver (`ascent/8030_sdk/yz_host_drv/driver/
+linux`) without first checking whether `kmod/artosyn_drv.c` already
+covers what you're trying to fix.
 
 Even with the bandwidth fix above, real (paced) throughput through this
 project's own `bb_socket_write()` calls capped hard around 5-7 Mbit/s —
@@ -834,14 +848,29 @@ vendor's -- is still not found.
   (and structurally simpler/lower-overhead than DRV mode's `oal_mdev.c`
   multiplexing either way), but isn't blocking a usable release the way
   it looked earlier in this investigation.
-- The historical "intermittent firmware-download failure on a freshly
-  rebuilt module" mystery from earlier in this investigation did not
-  recur once builds went through the real Buildroot pipeline
-  (`builder/package.sh ar8030`) against a properly-synced
-  `openipc/general/package/` tree, rather than ad-hoc manual `make`
-  invocations — but this was observed only incidentally, not
-  deliberately re-isolated, so treat it as "not currently reproducing"
-  rather than "fixed".
+- **Root-caused (see "Isolation test and the real root cause" below):**
+  the "intermittent firmware-download failure on a freshly rebuilt
+  module" mystery from earlier in this investigation was never a
+  Buildroot/toolchain issue at all — it was this project's own working
+  copy of `driver/linux/bus/sdio.c` (`ascent/8030_sdk/yz_host_drv/`,
+  hand-edited directly across many sessions instead of via the numbered
+  patch stack) having silently drifted out of sync with the patch
+  series not once but *twice* (patches `0004` and `0003`, found on two
+  separate occasions). **Before deploying any freshly rebuilt
+  `artosyn_drv.ko` to real hardware, verify it carries all three SDIO
+  device-ID aliases** (`grep -a alias= the.ko` or `modinfo`):
+  `sdio:c*v4152d8031*`, `sdio:c*v1D6Bd8030*`, `sdio:c*v4152d8030*` — a
+  missing `4152d8031` (patch `0003`'s fix) reproduces exactly this
+  failure: firmware uploads fine, the chip re-enumerates from its boot
+  identity (`4152:8030`) to its post-firmware-push identity
+  (`4152:8031`), and `sdio_artosyn_probe()` never gets invoked again
+  because there's no matching `sdio_device_id` entry for it — permanent
+  `/dev/artosyn_sdio` / `/dev/ar_mdev0` absence, every time, not
+  flaky hardware. The safe way to resync a drifted working copy: `git
+  checkout` it back to pristine and cleanly re-apply `0001`-`0013` in
+  order (skip `0005`, `.patch_skip`) — never hand-restore a patch from
+  memory into the working copy and treat that as equivalent to the
+  patch actually being applied.
 - **Do not `cat` (or otherwise read) `/proc/ar_drv/dev0/dbg`** (or
   presumably its sibling proc files under `/proc/ar_drv/dev0/`) on real
   hardware — confirmed live to crash the kernel outright (`Unable to
@@ -851,6 +880,403 @@ vendor's -- is still not found.
   driver's own `ar_proc.c`). Setting `dbg_log_level` via the documented
   `echo dbg_log_level=N > ...` write interface is presumably still fine
   (untested since the crash) — just never read it back.
+
+### Isolation test and the real root cause
+
+The remaining `"bb_socket_write made no progress"` stalls were finally
+isolated to a specific half of the stack by swapping components one at
+a time, always from a genuinely clean boot (auto-start scripts renamed
+out of `/etc/init.d/S??*`, never a live `rmmod`/`insmod` chain):
+
+| Kernel module | Daemon | Result |
+|---|---|---|
+| Ours | Ours | Frequent stalls, every ~15-20s, self-recovering blips |
+| Vendor's `artosyn_sdio.ko` | Vendor's `daemon_sdiov12` | Zero stalls at 18-19Mbit, sustained |
+| **Vendor's** | **Ours** | **Zero stalls across 22,000+ writes, including a 33KB chunk, even under forced bitrate overshoot** |
+
+Swapping *only* the kernel module (keeping our own daemon, including
+the fix below) eliminated the stalls. **The bug is in our kernel
+driver's `/dev/artosyn_sdio` chardev implementation (`0011`/`0012` on
+top of `bus/sdio.c`), not the daemon.**
+
+**A real (but minor) daemon-side fix, landed regardless
+(`0013-daemon-act-on-wanted_pos-hint-outside-idle-state-too.patch`):**
+`dev_dat_so_write_proc()`'s handling of the chip's `-0x108` "wanted_pos"
+idle-notify (telling the daemon what position to resend from if
+anything was dropped) only acted on it when `sock_sta ==
+sock_wait_usb_data` specifically. Live-captured evidence: the chip can
+report a dropped write within ~2ms via this message, well before the
+client's own timeout, but a race between `_sock_dev_pack_make()`
+(tx-side thread) and this reply handler (rx-side thread) over that same
+field meant the hint got silently discarded if it landed while
+`sock_sta` was still `sock_can_send_data` — the socket then just sat
+there until some unrelated later event happened to re-check the same
+stale hint, observed to take up to ~2.5s (exactly matching
+`bb_socket_write()`'s own client-side timeout). Fix: also act on the
+hint while `sock_can_send_data`. Confirmed via live daemon-log
+correlation to fire exactly as designed — but confirmed via the
+isolation test above to explain only a minority of stalls, not the
+dominant cause. Keep it; don't expect it alone to fix throughput.
+
+**A promising-looking kernel-side idea that turned out to be a dead
+end — don't retry this without solving the prerequisite first:**
+Ghidra-decompiling the vendor's `artosyn_sdio.ko` poll() fop
+(`FUN_00010220`) found it does something ours never did: when neither
+read nor write is currently ready, it calls its irqhandler equivalent
+*synchronously, right there*, with the SDIO host already claimed — an
+active, ~10Hz self-healing re-check against a lost interrupt, since the
+daemon's `sdio_ev_loop()` calls `poll()` on this fd continuously. Ours
+only had the narrower `WORKAROUND_FOR_INTERRUPT_LOST_ISSUE` fallback
+inside `artosyn_sdio_write()`, nothing on the read side. Porting this
+literally (`sdio_chardev_poll()` calling `artosyn_sdio_irqhandler()`
+when neither condition is true) made things dramatically *worse* — a
+hard, permanent wedge (throughput pinned to 0) instead of the
+intermittent stall it was meant to fix.
+
+**Root cause of the poll() regression is not fully confirmed — two
+candidate explanations, correcting an earlier over-confident guess in
+this same investigation:**
+- *Initially suspected:* the vendor's own poll() only calls its
+  irqhandler equivalent when **both of its two "msg_valid"-style flags
+  are also clear**, and this project's `dev->msg_valid[]` array is set
+  to 1 on a mailbox event but **never cleared anywhere in this entire
+  driver** (grepped the whole `driver/linux` tree — confirmed true).
+  Decompiling `artosyn_unlocked_ioctl` in the vendor's `.ko` found
+  exactly where the vendor's own userspace is expected to clear it: a
+  `READ_MESSAGE`-style ioctl (`_IOWR('v', 2, ...)`, same command number
+  this project's own `sdio.h` already defines) that queries a mailbox
+  channel's pending message and clears `msg_valid[channel]` as a side
+  effect. **But this project's own `sdio.c` has no `.unlocked_ioctl`
+  fop at all**, and the daemon's SDIO backend
+  (`daemon/dev8030/sdio8030/sdio_dev.c`) never calls `ioctl()` on this
+  chardev either — so `message[]`/`msg_valid[]`/`mailbox_q` are, as far
+  as could be confirmed, entirely dead/unused plumbing in this
+  project's actual data-plane usage pattern. That undercuts the
+  "corruption via the msg_valid gate" theory: the *unconditional*
+  version tested never consulted `msg_valid` at all, so its clearing
+  status shouldn't have mattered to that specific failure.
+- *More likely, not yet tested in isolation:* simple SDIO bus
+  contention. `artosyn_sdio_irqhandler()` does at least one
+  `sdio_readb()` MMIO transaction (a real bus round-trip, not free),
+  and `sdio_claim_host()` serializes the whole bus against the actual
+  `sdio_memcpy_toio()`/`_fromio()` data transfers. The daemon's
+  `sdio_ev_loop()` calls `poll()` far more often than its nominal
+  100ms timeout suggests once bytes are actually flowing (it loops
+  back immediately after any read/write completes) — plausibly
+  hundreds of times a second under the ~18Mbit load this was tested
+  at. Adding one extra bus transaction per poll(), right when the bus
+  is already busiest, could alone explain "throughput instantly
+  collapses to 0" without any logic corruption at all.
+- **Before retrying this idea**, isolate which of the two it actually
+  is (e.g. instrument a call counter on the added irqhandler call and
+  correlate its rate against the stall onset, independent of whether
+  `msg_valid` is wired up) rather than assuming either explanation.
+
+**Also checked and ruled out:** whether `artosyn_sdio_reg_check()` and
+`artosyn_sdio_irqhandler()` — this project's two hand-maintained copies
+of the same register-check logic (one for the real IRQ, one for the
+`WORKAROUND_FOR_INTERRUPT_LOST_ISSUE` workqueue fallback, which must be
+kept in sync by hand — see `0004`'s own commit message, which had to
+fix both) — had silently drifted apart from each other, the same way
+the working copy drifted from the patch stack. Diffed both functions
+line-by-line (comments and blank lines stripped): aside from expected
+`sdio_claim_host()`/`sdio_release_host()` ownership differences
+(irqhandler runs with the host already claimed by the real IRQ path;
+reg_check must claim it itself from workqueue context) and cosmetic
+log-level/stats-counter differences, they are functionally identical —
+both correctly carry `0004`'s single-byte decode fix and `0011`
+UPDATE 4's wake-both-queues fix. Not the bug.
+
+**A second real, confirmed improvement
+(`0014-sdio-read-wait-for-real-interrupt-not-100ms-poll.patch`):**
+Re-reading `artosyn_read()` with the isolation test's narrowed focus
+found it had never received `0012`'s own fix — it still ran the exact
+same `msleep(10)` × 10-retry, 100ms-capped anti-pattern `0012`'s own
+commit message diagnosed and replaced on the write side, right down to
+a commented-out `wait_event_interruptible_timeout()` call immediately
+above the loop, abandoned for reasons lost to history (the same shape
+of abandoned attempt `0012` found on the write side too). Fixed the
+same way: a real `wait_event_interruptible_timeout(dev->rx_q, ...,
+SDIO_READ_WAIT_MS)` (2000ms), with the same courtesy `reg_workqueue`
+kick beforehand. **Confirmed on real hardware, same clean-boot
+methodology, same 60s window at ~14Mbit:** stalls dropped from ~18 to
+**3** — roughly a 6x reduction — and every one of the 3 remaining
+stalls self-recovered smoothly (throughput bounced straight back,
+no hard wedge). This is real, measurable progress, not a full fix —
+the user's own assessment: "better but not fully there yet." The
+theoretical concern going in (that `sdio_ev_loop()` always gates
+`read()` behind a successful `poll()` first, so this fix "shouldn't"
+matter much) turned out to undersell it — there's evidently some real
+path under sustained load where the interrupt-driven wait actually gets
+exercised, not just the trivial single-poll-then-read case this
+project's own analysis was based on. Whatever residual mechanism still
+causes the remaining ~3 stalls per 60s is now the actual open
+question — likely something
+closer to the daemon-visible symptom (a completion ack not arriving
+promptly) than a missed-interrupt-at-the-driver-level issue, since the
+two known interrupt-loss workarounds (read and write side) are now
+both patched symmetrically with no more asymmetry between them left to
+find at that level.
+
+**A third real, confirmed fix for a genuine hard-lockup mechanism
+(`0015-daemon-clamp-force-update-write-address-to-buf-head.patch`):** a
+tight, sub-second-granularity live capture (poll the tx log every 0.2s,
+snapshot the daemon's own debug-pad log the instant a stall is seen)
+caught one of `0014`'s remaining stalls turning into a genuinely
+*permanent* lockup — throughput pinned at exactly 0.00 Mbit/s, every
+subsequent write timing out, no self-recovery at all (unlike the
+brief, self-healing hiccups `0014` left behind). The captured log
+showed `sock_dev_push_data()`'s own sanity-check warning firing
+repeatedly with **`buf_head_index` greater than `buf_wr_index`** — an
+inverted state that should be structurally impossible (confirmed
+received can never exceed dispatched-so-far). Once inverted,
+`sock_dev_need_write()`'s own `(uint32_t)(buf_wr_index -
+buf_head_index)` computation underflows to a huge bogus ring-buffer
+offset, permanently breaking its "is there anything to send" check for
+that socket regardless of how much genuinely new data piles up behind
+it (visible in the same capture: `add_new_wr_node()`'s own `cur`
+climbing normally the whole time, completely decoupled from the frozen
+`buf_wr_index`). Traced to the one unguarded write site: every other
+place that sets `buf_wr_index` (the normal ack path, the `-0x108`
+force-resend path `0013` already touches) explicitly keeps it `>=
+buf_head_index`; the `-0x107` "force update write address" handler
+accepted the chip-reported position completely unguarded, and the
+capture caught a burst of dozens of `-0x107` messages in a few
+milliseconds all reporting the same already-superseded (stale) position.
+Fixed by clamping. **Confirmed on real hardware: this specific
+inverted-pair lockup signature has not reproduced since.**
+
+**A second, distinct hard-lockup mechanism found in the same session —
+still open, not fixed by `0015` or anything else here:** a *different*
+capture (same tight methodology, a later test run) caught a hard
+lockup with the **opposite, valid-looking** state: `buf_wr_index`
+correctly *ahead* of `buf_head_index` by a large, stuck gap (~500KB in
+the observed case), with `sock_dev_push_data()` logging `"warning loss
+rpc data ... push=0"` on every new client write — the ring buffer was
+completely full and could accept nothing more, because nothing had
+confirmed-received (`buf_head_index`) any of that backlog in a long
+time. Tracing the daemon's own debug-pad log back to the last activity
+on this socket found only recurring `-0x108` "written pos / wanted
+pos" messages (the periodic idle-heartbeat, ~every 2.5s) with
+**`wanted_pos` frozen at the same stale value** across 12+ seconds,
+even while the chip's own `written pos` in that same message kept
+climbing normally. Since that frozen `wanted_pos` was already *behind*
+`buf_head_index`, the (correct, already-guarded) force-resend condition
+never fires — the daemon isn't wrongly declining to act, there's just
+nothing else in this codebase that flushes a newly-arrived backlog once
+the chip's own idle-heartbeat stops reporting anything actionable.
+Confirmed this session it's unrelated to thermal issues (chip
+temperature read a normal 63.8°C via `caddx-ascent-lite-temp` with the
+fan running during the capture). This may be a genuine chip-firmware
+behavior (its own `wanted_pos` tracking getting stuck) rather than
+something fixable purely in this daemon's own bookkeeping — or there
+may be a host-side trigger for it not yet identified. **This is the
+actual next thing to chase**, and unlike the `0015` bug, doesn't yet
+have a clear, single unguarded-write-site smoking gun — it needs either
+a way to reproduce it more reliably for further live capture, or
+Ghidra-decompiling more of the chip's own RTOS firmware (out of scope
+so far — this investigation has stayed on the host-side kernel driver
+and daemon) to understand what `wanted_pos` staleness actually means
+from the chip's side.
+
+**Tried and correctly reverted — do not retry this without new evidence:**
+Ghidra-decompiling the vendor's real `daemon_sdiov12`'s equivalent of
+`dev_dat_so_write_proc()` (`FUN_00013be4`) found its `-0x108` case body
+is *only* a log call — no force-resend, no `buf_wr_index` write, no
+state transition at all, unlike this project's own `-0x108` handler
+(the whole mechanism `0013` patched a race in). Combined with the
+isolation test's own proof that the vendor's real kernel+daemon combo
+runs completely stall-free with no such logic, this looked like strong
+evidence the whole force-resend mechanism was an unnecessary — and,
+given its role in the `0015` bug, possibly actively harmful — piece of
+this codebase that the vendor's own production build simply doesn't
+carry. Removed it (matching the vendor exactly: log only) and rebuilt.
+**Live-tested and found to be a real regression, not an improvement:**
+with the force-resend logic gone, a *routine* one-off data-gap right at
+the very start of a session (chip's own `wanted_pos` freezing at a
+small position near the start, exactly like the still-open mechanism
+above) became a **guaranteed, permanent, unrecoverable lockup every
+time** — the mechanism this patch removed turns out to be exactly what
+was recovering from that gap in the working `0013`+`0014`+`0015`
+baseline (rare, self-healing blips) the rest of the time. Reverted
+immediately; never landed as a numbered patch. Takeaway: the vendor's
+own build not needing this logic doesn't mean *this* codebase's version
+of the surrounding state machine doesn't rely on it — the two have
+diverged enough elsewhere (this whole investigation's history is full
+of examples) that "the vendor doesn't have this" isn't sufficient
+justification for removing something on its own; only build on this
+finding again with a fix that's *narrower* than a full removal (e.g.
+something that makes the still-open freeze detectable/recoverable
+without discarding the mechanism wholesale), and re-confirm on real
+hardware before trusting it.
+
+**Next steps, updated:** the isolation test firmly narrows the search
+to our own kernel driver's SDIO read/write/interrupt-handling logic
+(`bus/sdio.c`) specifically — the daemon, the size-decode registers
+(`0004`), and the device-ID re-enumeration handling (`0003`) are all
+now confirmed *not* the cause. The vendor's `artosyn_sdio.ko` has ~30
+non-thunk functions total (small enough to decompile exhaustively via
+Ghidra-mcp) — most of the ones relevant to sustained-throughput
+reliability (`artosyn_write`, `FUN_000106de` the write worker,
+`artosyn_read`, `artosyn_sdio_irqhandler`, `FUN_00010090`/`FUN_000100d0`
+the read/write conditions, `artosyn_poll`) have already been decompiled
+and compared line-by-line against ours with no further differences
+found beyond the poll() one above (which isn't safely portable yet).
+Not yet decompiled/compared: `sdio_artosyn_probe` (the biggest
+function, firmware download + initial setup — a good next candidate,
+since a *setup-time* difference could plausibly cause a
+runs-for-a-while-then-degrades symptom that a pure read/write logic
+diff wouldn't), `artosyn_unlocked_ioctl`, `FUN_00010a04` (called from
+between `artosyn_close` and `artosyn_read` in the address layout —
+likely a firmware-chunk-send helper worth checking against this
+project's own `sdio_rom_send()`), and the `proc_*`/`artosyn_root_proc_*`
+family (lower priority — debug-interface only).
+
+## Clean-room rewrite: `kmod/artosyn_drv.c`
+
+After the daemon-side fixes above (`0013`-`0015`) narrowed the SDIO
+stalls from severe (permanent wedges) to rare and self-healing, but not
+zero, the decision was made to stop bug-hunting the existing patched
+combined driver (`ascent/8030_sdk/yz_host_drv/driver/linux`, DRV+SDIO+
+USB in one module, incrementally patched across this whole
+investigation) and instead do a full clean-room rewrite of just the
+SDIO chardev, informed by everything learned so far. `kmod/` in this
+repo is that rewrite: a small (~700 line), standalone out-of-tree kernel
+module, built against the vendor SDK's own shared `bus/sdio.h` (ioctl
+commands, protocol structs/constants) via `kmod/Makefile`'s
+`AR8030_SDK_DRIVER_INC`.
+
+**Result, confirmed on real hardware:** zero `"bb_socket_write made no
+progress"` stalls, zero `"recv bad socket pack"` messages, sustained
+~18.5Mbit/s, 439MB+ transferred over a ~190 second run, `incomplete=0`
+the entire time. The first completely clean SDIO-mode run anywhere in
+this investigation, matching the vendor's own real `artosyn_sdio.ko`'s
+reference performance rather than just approaching it.
+
+### Design decisions that came out of the investigation history
+
+- **One register-drain routine, not two.** The old combined driver
+  carried two independent, hand-duplicated copies of the mailbox/rx-
+  ready/tx-ready register-reading logic (`artosyn_sdio_irqhandler()` for
+  the real IRQ, `artosyn_sdio_reg_check()` as a workqueue-based fallback
+  for `WORKAROUND_FOR_INTERRUPT_LOST_ISSUE`) that had to be kept in sync
+  by hand -- and didn't always stay in sync (`0004`'s decode bug existed
+  in both copies; `0011`'s shared-waitqueue fix had to touch both).
+  `kmod/artosyn_drv.c` has exactly one such routine
+  (`artosyn_check_events()`), called from both the real IRQ handler and
+  from `poll()` when idle -- matching the vendor's own actual
+  architecture (confirmed via Ghidra decompilation of their real
+  `artosyn_sdio.ko`), not an approximation of it grafted onto a
+  different structure.
+- **`poll()` self-heals, safely this time.** Porting "call the drain
+  routine from `poll()` when idle" onto the *old* combined driver's dual-
+  path architecture caused a severe regression (see the investigation
+  history above) -- most likely SDIO bus contention between the two
+  independent paths under saturated throughput. With only one path here,
+  that specific failure mode doesn't apply, and the self-heal is exactly
+  what gives this rewrite a real, low-latency recovery from a missed
+  hardware interrupt on *both* the read and write sides, not just the
+  narrower one-sided fallback the old driver had wired only into its own
+  write path.
+- **Patient, real interrupt-driven waits from the start** (matching
+  `0012`/`0014`'s already-validated `wait_event_interruptible_timeout`
+  approach), not the 100ms-capped `msleep`-and-repoll pattern the vendor
+  SDK's own upstream source still carries in both `artosyn_sdio_write()`
+  and `artosyn_read()`.
+- **`rom_mode` bypass, the one real bug this rewrite's own first live
+  test hit:** during boot-ROM firmware upload, the chip doesn't generate
+  the normal TX/RX-ready mailbox events at all, so waiting on them (as
+  the normal read/write path does) times out on literally the first
+  firmware chunk. Missed this initially (it's easy to, reading the
+  vendor's decompiled probe/write functions in isolation without
+  noticing this exact interaction); the existing combined driver's own
+  `dev->rom_mode` field (a real, working, previously-unremarked-upon
+  detail of the code this whole investigation had been reading past for
+  weeks) was the tell once the symptom (every firmware chunk send
+  failing with `-EIO`) pointed back at `artosyn_do_write()`'s own wait.
+- **Firmware download chunking logic reused nearly verbatim** from this
+  project's own already-proven `sdio_rom_send()`/`oal_init_fw()` (the
+  "SD"-magic 12-byte header, block-alignment/residue handling, the
+  `STRU_SPL_HEADER` firmware image format) rather than re-derived from
+  the vendor's own considerably denser decompiled equivalent
+  (`FUN_00010a04`) -- no reason to re-invent something already validated
+  by this same investigation's extensive real-hardware testing.
+- **Deliberately out of scope:** the OAL/DRV-mode multiplexed transport
+  (`/dev/ar_mdev<N>`) is untouched, separate, already-working code from
+  the existing combined driver -- this module doesn't coexist with it
+  (only one driver can own the physical SDIO function at a time); it's a
+  drop-in alternative for SDIO-mode use. The `proc_*`/debug-interface
+  family from the vendor's real driver was also left out (lower
+  priority, not needed for data-plane operation) -- `READ_MESSAGE`/
+  `WRITE_MESSAGE`/`READ_BYTE`/etc. ioctls *are* implemented (matching
+  `bus/sdio.h`'s existing command definitions) since those looked
+  possibly relevant to mailbox-channel messaging, though nothing in this
+  project's own daemon currently calls them either.
+
+### Build and test
+
+```
+cd kmod
+make print-config   # confirm KDIR/CROSS_COMPILE/AR8030_SDK_DRIVER_INC auto-detection
+make                # -> artosyn_drv.ko
+```
+
+Deploy exactly like any other kernel-module change tested in this
+investigation: **always from a genuinely clean boot** (auto-start
+scripts renamed out of `/etc/init.d/S??*` first, never a live module
+swap while the old combined driver's own `/dev/artosyn_sdio` is in use
+-- they can't coexist), then:
+
+```
+insmod artosyn_drv.ko fw_name=ar8030/ar8030.img cfg_name=ar8030/ar8030.json
+ar8030d -i 1 -l 2 &
+ar8030-pair --no-persist --skip-if-connected -c /lib/firmware/ar8030/ar8030.json
+ar8030-linkctl bandwidth 20 -d tx -s auto -w 20
+ar8030-transport-tx -v
+```
+
+### Not yet done, before this fully replaces the old combined driver
+
+- **Only one clean-boot test run so far.** Extraordinary result, but
+  one run -- re-confirm across multiple clean boots, different link
+  conditions (lower MCS, weaker signal), and a longer soak (this run was
+  ~190s; run it for the length of an actual flight) before fully
+  trusting it.
+- **Buildroot packaging is done.** `ar8030-transport-tx.mk` now builds
+  `kmod/artosyn_drv.c` via Buildroot's own `kernel-module` infra
+  (`AR8030_TRANSPORT_TX_MODULE_SUBDIRS = kmod`, `AR8030_SDK_DRIVER_INC`
+  pointed at `$(AR8030_DIR)/driver/linux/bus` -- the `ar8030` package's
+  own extracted+patched source tree, a standard Buildroot cross-package
+  reference), and its own `S65ar8030-transport-tx` init script now loads
+  it, starts `ar8030d -i 1`, and runs the pairing/autoreconnect loop --
+  absorbing what used to be `ar8030`'s own `S60ar8030`. The `ar8030`
+  package itself dropped kernel-module building entirely (`Config.in`'s
+  host-bus `choice` and `BR2_PACKAGE_AR8030_INIT` are gone, along with
+  the six patches that only ever fixed the old combined driver:
+  0003/0004/0010/0011/0012/0014). Confirmed on the actual build host:
+  `artosyn_drv.ko` compiles and installs cleanly through this package,
+  `USING_8030DRV=OFF` correctly reaches `ar8030`'s CMake configure (no
+  more `drv8030`/`oal_mdev` build target), and the installed module's
+  own alias table has all three device IDs
+  (`sdio:c*v4152d8031*`/`c*v1D6Bd8030*`/`c*v4152d8030*`). Not yet
+  confirmed: a full from-scratch image build + real-hardware flash test
+  of this wiring (blocked, at the time of writing, by an unrelated
+  pre-existing issue: the `waybeam` package's pinned git commit no
+  longer resolves against its upstream remote -- a separate package,
+  untouched by this change).
+- **DRV-mode is gone, not just deprioritized.** `artosyn_drv.c` never
+  implements `oal_mdev.c`'s multiplexing, and `ar8030`'s own `Config.in`
+  now says so plainly: only `-i 1` (SDIO) has a kernel-side counterpart
+  left to open. This was a deliberate choice (confirmed with the
+  project owner), not a temporary gap -- there is no "old driver" left
+  to fall back to any more, so there is no coexistence/switchover
+  question left to resolve.
+- **`READ_MESSAGE`/mailbox-channel ioctls are implemented but
+  untested** -- nothing in this project's own daemon calls them, so
+  they've only been checked to compile and match the vendor's protocol
+  shape on paper, not exercised on real hardware.
+- **No automated test/CI** for this module at all yet (the userspace
+  `test/roundtrip_test.c` in this repo doesn't cover kernel code).
 
 ## Phase 2 (explicitly out of scope here)
 
