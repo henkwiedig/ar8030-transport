@@ -200,18 +200,19 @@ preceding `memset`).
 controller is a per-user windowed state machine:
 
 - `win` is the window length; the controller also tracks `timeout` and an
-  `enable` flag. Its own status dump prints `enable : %u`,
-  `window : %u`, `timeout : %u` (format strings at `spl.bin` VA `0x2628dc`,
-  `0x2628ec`, `0x2628fc`; printer @ `0x24b85c`).
+  `enable` flag. Its own status dump prints `enable   : %u`,
+  `window   : %u`, `timeout  : %u` (format strings at `spl.bin` VA `0x2628dc`,
+  `0x2628ec`, `0x2628fc`; printed from the status dump @ `0x24b85c`).
 - `bb_link_retx_ctrl_feed` (`0x230cc6`) maintains per-user busy/idle bitmasks
   across that window. `busy`/`idle` are the per-window thresholds; the
   `conti_busy`/`conti_idle` names indicate "consecutive" thresholds before the
   controller declares the link in trouble (name-based inference; the state
   machine uses `1 << n` bitmask ops, consistent with windowed counting).
 - `bb_link_retx_evt_stat_cfg_reset` (`0x22f74c`) clears a per-user event/stat
-  block (`[0]=0xffffffff`, `[1]=0`, `[2]=0`).
-- `bb_link_node_retx_handle` and `bb_link_{ap,node}_retx_local_monitor` consume
-  that state to decide actual retransmissions.
+  block (`0xffffffff` at offset 0, word `0` at offset 4, byte `0` at offset 8).
+- `bb_link_node_retx_handle` and `bb_link_{ap,node}_retx_local_monitor` are the
+  retransmission decision/monitor paths that consume that state (name-based
+  inference).
 
 This is consistent with the status strings `retx count`, `retx max stat`,
 `peer slot ... retx(0x%02x)`, `retx req enabled/disabled locally`, and
@@ -279,8 +280,8 @@ SET:
 
 ### 3.4 Telemetry that already exists
 
-- **Firmware-side status strings** (`spl.bin`): `retx count : %u`,
-  `retx max stat : %u`, `window : %u`, `timeout : %u`, `LDPC(%u, %u)
+- **Firmware-side status strings** (`spl.bin`): `retx count      : %u`,
+  `retx max stat   : %u`, `window   : %u`, `timeout  : %u`, `LDPC(%u, %u)
   LDPC_CONTI(%d)`, per-peer `retx(0x%02x)` (an 8-bit value; "bitmap" is an
   inference), `RSSI(%u,%u)`.
 - **Host-side counters** (`ar_ldyhs_sky`): `retx,busy flag,[%d,%d,%d],check cnt
@@ -468,7 +469,8 @@ struct bb_retx_cfg st = {0};
 if (bb_ioctl(dev, 0x01000014, NULL, &st) == 0) {
     for (int i = 0; i < (int)sizeof(st); i += 16) {
         fprintf(stderr, "%04x:", i);
-        for (int j = 0; j < 16; j++) fprintf(stderr, " %02x", ((uint8_t *)&st)[i + j]);
+        for (int j = 0; j < 16 && i + j < (int)sizeof(st); j++)
+            fprintf(stderr, " %02x", ((uint8_t *)&st)[i + j]);
         fprintf(stderr, "\n");
     }
 }
@@ -496,6 +498,6 @@ Useful entry points if you want to keep decompiling in Ghidra (RISC-V):
 | `bb_link_retx_ctrl_cfg` (inlined; log @ `0x246ebe`) | `0x246e6c` |
 | `bb_link_retx_ctrl_feed` | `0x230cc6` |
 | `bb_link_retx_evt_stat_cfg_reset` | `0x22f74c` |
-| retx status printer (`enable`/`window`/`timeout`/`offset`) | `0x24b85c` |
+| retx status print block (`enable`/`window`/`timeout`/`offset`; inside a broader per-user dump) | `0x24b85c` |
 | RPC dispatcher (jump table via `sh2add` + `jr`) | `0x244c8c` |
 | descriptor table (`{op,in,out}`, 91 entries) | `0x254800` (file `0x50800`) |
