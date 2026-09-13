@@ -296,6 +296,96 @@ calls afterward: no crash, brief ring-fill spike immediately
 absorbed by the existing backlog throttle, streaming back to the
 pre-restart bitrate within a few seconds each time.
 
+## ar8030d connection: surviving a daemon restart
+
+Both `tx/main.c` and `rx/main.c` only ever called `ar8030_link_connect_retry()`
+once, before their main loop. Past that point neither noticed if `ar8030d`
+itself crashed or was restarted -- `link.dev`/`link.sockfd` just went
+stale, and every subsequent `bb_ioctl()`/`bb_socket_write()`/
+`bb_socket_read()` call on them would fail forever with no automatic
+recovery. The same shape of gap as the frame-shm ring above, one layer
+down.
+
+**Fix, shared by both sides via `common/ar8030_link.c`:** a periodic
+`ar8030_link_is_alive()` health check (`BB_GET_STATUS`, a few seconds
+apart) as a *separate* signal from data-path timeouts -- a
+`bb_socket_write()`/`read()` timeout looks identical whether the RF link
+is merely saturated (self-clearing) or the daemon itself is gone (never
+clears without a fresh reconnect), and conflating the two either
+reconnects too eagerly on ordinary congestion or too slowly on a real
+outage. On failure: `ar8030_link_reconnect_retry()` (close + retry
+connect, same semantics as the startup call), then the caller re-resolves
+whatever it needs (tx re-resolves its peer's connected slot if `-s auto`
+was requested -- not guaranteed to land on the same slot as before the
+restart; rx always targets the fixed `BB_SLOT_AP`) and reopens the data
+socket.
+
+**tx's `bitrate_ctl` thread reads the same `link`/`ring` concurrently --
+a real use-after-free, caught on the very first live test, not a
+hypothetical.** `ar8030_link_t.dev` is read by that thread's own
+`BB_GET_MCS` poll every tick. The first version of the daemon-reconnect
+fix closed and freed the old `dev` handle, then only atomically published
+the new one *after* a successful reconnect -- leaving a window where the
+bitrate thread could load the stale pointer and dereference already-freed
+memory. Fixed the same way as the ring fix above: every access to
+`ar8030_link_t.dev` (and `bitrate_ctl_cfg_t.slot`, which tx also updates
+post-reconnect) now goes through `__atomic_*()`, and `ar8030_link_close()`
+publishes `NULL` *before* freeing the handle, not after -- `NULL` is
+already a value that thread has to treat as "skip this tick" regardless,
+so publishing it first closes the window at zero extra cost.
+
+**A second real bug, also caught live: breaking out of tx's main loop on
+a fatal reconnect failure without setting `g_stop` first.**
+`pthread_join(bc_thread, ...)` runs right after the loop exits, but
+`bitrate_ctl_run()`'s own loop only exits once `*cfg->stop_flag` is true
+-- so the process hung forever (`bitrate_ctl` still ticking, `pthread_join`
+waiting on it, nothing progressing) instead of actually exiting the one
+time this path was live-tested. Fixed: `g_stop = 1` before every `break`
+that represents a real, unrecoverable failure (not one that already
+implies `g_stop` was set, like the daemon-wait/slot-wait loops returning
+early because the process is shutting down anyway).
+
+**A third real bug, also only visible under a real daemon kill: reopening
+the data socket right after a reconnect routinely failed, with a fix that
+took two attempts to actually work.** The daemon's own log showed the
+open succeeding, then being torn back down again about a millisecond
+later -- a daemon killed abruptly never runs its own `bb_socket_close()`
+teardown, so the fresh daemon instance's view of that slot/port can be
+left in a stuck "already opened" state. First attempt:
+`ar8030_link_force_close_socket()` (`BB_FORCE_CLS_SOCKET`, matching
+linkctl's own `force-close-socket`) called right before reopening --
+confirmed live this **did not** clear it (`BB_FORCE_CLS_SOCKET` itself
+returned `-2`). What actually worked: `ar8030_link_force_close_all_sockets()`
+(`BB_FORCE_CLS_SOCKET_ALL`, matching linkctl's `force-close-all`) in its
+place, plus a short retry loop around the open call itself (up to 5
+attempts, 500ms apart) -- matching every other step already in this same
+connect/reconnect sequence (`ar8030_link_connect_retry()`,
+`resolve_connected_slot()`), none of which assume their first attempt
+succeeds either. Applied to **both** the reconnect path and the original
+startup path -- confirmed live that a fresh startup can hit the exact
+same stuck state if a prior run crashed uncleanly and the device wasn't
+rebooted since.
+
+**Confirmed clean on real hardware, both sides, `ar8030d` killed and
+restarted with the exact same binary (the actual scenario this feature
+exists to handle):**
+- **tx** (air, SDIO): two consecutive kills, both recovered fully within
+  the same process (no crash, no restart) -- detect, reconnect, re-resolve
+  slot, reopen socket, resume streaming at the pre-outage bitrate. A
+  handful of frames go `incomplete` during each outage (expected: nothing
+  can be sent while genuinely disconnected) and the count stops growing
+  the moment it recovers.
+- **rx** (ground, USB): one kill, same result -- detect, reconnect, socket
+  reopened on the first attempt this time, RTP output resumed at the
+  pre-outage rate, `dropped=0` throughout.
+
+Both required **redeploying the whole daemon+lib+client triple together**,
+not just the client binary -- see "Redeploying `ar8030-linkctl`" below
+in Buildroot integration for why a locally-rebuilt client can silently
+stop matching whatever's actually flashed, and why mixing artifacts from
+different builds is exactly the failure mode this project's own
+non-reproducible daemon build makes easy to hit by accident.
+
 ## Build
 
 ### Everything, auto-detecting both cross toolchains
@@ -380,6 +470,64 @@ already uses, documented at the top of each package's `.mk`:
 device's defconfig yet — that's a deliberate per-device decision left to
 whoever enables it (`BR2_PACKAGE_AR8030_TRANSPORT_TX=y` /
 `BR2_PACKAGE_AR8030_TRANSPORT_RX=y`).
+
+### Redeploying `ar8030-linkctl`/`ar8030-transport-{tx,rx}`: the daemon+lib+client triple must match
+
+**The vendor `ar8030` SDK's build is not reproducible, even though its
+source is pinned to a fixed commit.** `AR8030_VERSION` in
+`package/ar8030/ar8030.mk` names one exact git SHA, and this project's
+own patches on top of it are version-controlled too — but the *toolchain*
+building it isn't: `builder/`'s own `OpenIPC/firmware` clone (and
+`sbc-groundstations`' own Buildroot tree) aren't pinned to a fixed commit,
+and rebuilding on a later day can pull a different upstream toolchain/
+Buildroot revision. Confirmed live: rebuilding the `ar8030` package twice
+in the same day, same machine, same pinned SDK commit, produced two
+different `libar8030_client.so` binaries (different md5sum) both times.
+
+**This means a locally-rebuilt `ar8030-linkctl` (or `ar8030-transport-tx`/
+`-rx`) can silently stop matching whatever `ar8030d`/`libar8030_client.so`
+is actually flashed on the device.** Confirmed live as a real, reproduced
+segfault: a client built against a newer/different SDK snapshot corrupted
+memory partway through a `bb_ioctl()` call whose reply size the two sides
+disagreed on. The struct that happened to differ (`bb_get_chan_info_out_t`)
+turned out to have an unrelated, genuine overflow bug of its own once
+investigated further (see `linkctl/main.c`'s own comment on why it never
+calls `BB_GET_CHAN_INFO`) — but the ABI-mismatch risk that made it hard to
+diagnose in the first place is real and general, not specific to that one
+struct.
+
+**Practical rule: always rebuild and redeploy the whole daemon+lib+client
+set together, verified by hash, never just the one binary you meant to
+change.** Concretely:
+
+- `builder/`'s tree has per-package isolation (`BR2_PER_PACKAGE_DIRECTORIES`)
+  — use `builder/package.sh ar8030` to force a truly clean rebuild of the
+  daemon+lib (wipes both its `per-package/` and `build/` caches, unlike a
+  manual `rm -rf build/ar8030-*` alone, which was confirmed live to leave
+  a stale `per-package/ar8030` untouched), then `builder/package.sh
+  ar8030-transport-tx` (with `AR8030_TRANSPORT_TX_OVERRIDE_SRCDIR` set) so
+  the client links against that exact same rebuild.
+- `sbc-groundstations/` has no per-package isolation and no `package.sh`
+  equivalent — its single global `staging/`/`target/` reflects whatever
+  was built into it most recently. `rm -rf output/<defconfig>/build/ar8030-*`
+  then `make -C output/<defconfig> ar8030-dirclean ar8030-rebuild
+  ar8030-transport-rx-dirclean ar8030-transport-rx-rebuild` (with
+  `AR8030_TRANSPORT_RX_OVERRIDE_SRCDIR` set) achieves the same thing.
+- Before deploying anything, `md5sum` the freshly-built
+  `libar8030_client.so` the client actually linked against (its build log
+  names the exact path) against what the client binary itself hashes to,
+  and treat a plan to deploy only the client while leaving a
+  differently-built daemon/lib in place as unsafe by default.
+- Expect to need a full `ar8030d` restart after swapping the daemon/lib,
+  not just the client — and expect that, on the SDIO (air) side
+  specifically, a plain process restart with the kernel module *not*
+  reloaded can leave the chip unable to re-handshake with a differently-
+  built daemon instance (confirmed live: `"no AR8030 device known to the
+  daemon"` persisting until a full device reboot). A full reboot after
+  swapping the daemon/lib is the reliably clean path there; the USB
+  (ground) side's own `artosyn_drv` kernel module re-enumerates the
+  device as part of a plain daemon restart already, so a reboot is not
+  needed there.
 
 ## Runtime deployment
 

@@ -57,6 +57,22 @@
  * chunk_stream.h's init() comment for the hard minimum (one chunk). */
 #define STREAM_BUF_CHUNKS 4
 #define STATS_INTERVAL_S 1.0
+/* How often the main loop asks the daemon directly whether it's still
+ * there (ar8030_link_is_alive(), a single BB_GET_STATUS round trip) --
+ * see that function's own comment (common/ar8030_link.h) for why this
+ * can't just be inferred from bb_socket_read() timeouts, which look
+ * identical whether the RF link is merely idle/saturated or the daemon
+ * itself crashed and restarted. */
+#define DAEMON_HEALTH_CHECK_INTERVAL_S 3.0
+/* See tx/main.c's own (much longer) comment on this pair of constants --
+ * confirmed live there that reopening the data socket immediately after
+ * a fresh reconnect can fail on the first attempt alone even though the
+ * daemon's own log shows the open succeeding then instantly unwinding
+ * again, well under any real timeout. Applying the same short retry
+ * loop here for the same reason: nothing else in this reconnect
+ * sequence assumes its first attempt succeeds either. */
+#define SOCKET_REOPEN_MAX_ATTEMPTS 5
+#define SOCKET_REOPEN_RETRY_MS 500
 
 static volatile int g_stop;
 
@@ -267,9 +283,25 @@ int main(int argc, char **argv)
      * the SDK for a DEV and always addresses its one AP peer -- see
      * bb_api.h's bb_socket_open doc comment ("If DEV, target SLOT is
      * BB_SLOT_AP"). Passing BB_SLOT_AP explicitly documents that rather
-     * than relying on the SDK's silent override. */
-    if (ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port, BB_SOCK_FLAG_RX,
-                                 &sock_opt) != 0) {
+     * than relying on the SDK's silent override.
+     *
+     * Force-close + retry: same as the reconnect path below (see
+     * SOCKET_REOPEN_MAX_ATTEMPTS's own, longer comment on tx/main.c's
+     * side) -- confirmed live on tx that this exact failure isn't
+     * specific to reconnecting; it also hit a genuinely fresh startup
+     * once a prior run had left the daemon in this state. */
+    ar8030_link_force_close_all_sockets(&link);
+    int startup_open_ret = -1;
+    int startup_open_attempt;
+    for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
+         startup_open_attempt++) {
+        startup_open_ret =
+            ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port, BB_SOCK_FLAG_RX, &sock_opt);
+        if (startup_open_ret == 0)
+            break;
+        usleep(SOCKET_REOPEN_RETRY_MS * 1000);
+    }
+    if (startup_open_ret != 0) {
         ar8030_link_close(&link);
         return 1;
     }
@@ -315,6 +347,7 @@ int main(int argc, char **argv)
     uint64_t rtp_bytes_sent = 0;
     struct rx_stats_snapshot stats_prev = rx_stats_snapshot_take(&stream, &reasm, 0, 0);
     double stats_last_print = now_monotonic_s();
+    double last_health_check_s = now_monotonic_s();
 
     while (!g_stop) {
         if (args.verbose) {
@@ -325,6 +358,61 @@ int main(int argc, char **argv)
                 print_rx_stats(&cur, &stats_prev, now - stats_last_print);
                 stats_prev = cur;
                 stats_last_print = now;
+            }
+        }
+
+        /* Periodic daemon-liveness probe, independent of whatever the
+         * data path below is doing -- see DAEMON_HEALTH_CHECK_INTERVAL_S's
+         * own comment. Simpler than tx's own version of this: no second
+         * thread sharing `link`, and the ground side always targets the
+         * fixed BB_SLOT_AP (no slot to re-resolve). Reopening the socket
+         * updates link.sockfd in place, which read_from_bb_socket() (see
+         * its own comment) already reads through a pointer on every call
+         * -- ar8030_chunk_stream_read() picks up the new fd with no
+         * further plumbing needed. */
+        double now_health = now_monotonic_s();
+        if (now_health - last_health_check_s >= DAEMON_HEALTH_CHECK_INTERVAL_S) {
+            last_health_check_s = now_health;
+            if (!ar8030_link_is_alive(&link)) {
+                fprintf(stderr, "rx: ar8030d connection lost, reconnecting...\n");
+                if (ar8030_link_reconnect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS,
+                                                 &g_stop) != 0)
+                    break; /* stopped while waiting for the daemon to come back */
+                fprintf(stderr, "rx: reconnected to ar8030d\n");
+
+                /* Confirmed live on the tx side: a daemon killed abruptly
+                 * never runs its own bb_socket_close() teardown, so the
+                 * fresh daemon instance's first open on this same
+                 * slot/port fails with ret=-1 ("already opened", stale
+                 * chip-side state) even though nothing is genuinely still
+                 * using it. The single-socket ar8030_link_force_close_
+                 * socket() was tried first on tx and confirmed live NOT
+                 * to clear it (returned -2); ar8030_link_force_close_
+                 * all_sockets() is the one that actually worked -- see
+                 * its own comment. Ignoring its return value is
+                 * deliberate: on the common path there is nothing to
+                 * force-close and this is a harmless no-op; the retry
+                 * loop below is the real, checked, fatal-on-failure
+                 * step. */
+                ar8030_link_force_close_all_sockets(&link);
+
+                int open_ret = -1;
+                int attempt;
+                for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
+                    open_ret = ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port,
+                                                        BB_SOCK_FLAG_RX, &sock_opt);
+                    if (open_ret == 0)
+                        break;
+                    usleep(SOCKET_REOPEN_RETRY_MS * 1000);
+                }
+                if (open_ret != 0) {
+                    fprintf(stderr, "rx: failed to reopen bb_socket after reconnect (%d attempts), stopping\n",
+                            attempt);
+                    g_stop = 1; /* no second thread to hang here (unlike tx's bitrate_ctl), but
+                                 * set for consistency and in case that ever changes. */
+                    break;
+                }
+                fprintf(stderr, "rx: bb_socket open (port=%d)\n", args.port);
             }
         }
 

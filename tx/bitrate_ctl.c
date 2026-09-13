@@ -36,6 +36,16 @@ static uint64_t now_ms(void)
  * compile. */
 static int read_tx_throughput_kbps(ar8030_link_t *link, bb_slot_e slot, uint32_t *out_kbps)
 {
+    /* Atomic load, not a plain link->dev -- tx/main.c's own read loop may
+     * be mid-reconnect (ar8030_link_reconnect_retry(), after detecting
+     * the daemon itself died) concurrently with this thread's tick. See
+     * ar8030_link_t's own header comment for why every access to this
+     * field goes through __atomic_*(). NULL is a normal, expected state
+     * here for the duration of a reconnect, not an error. */
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
+        return -1;
+
     bb_get_mcs_in_t in;
     bb_get_mcs_out_t out;
     memset(&in, 0, sizeof(in));
@@ -43,7 +53,7 @@ static int read_tx_throughput_kbps(ar8030_link_t *link, bb_slot_e slot, uint32_t
     in.dir = BB_DIR_TX;
     in.slot = (uint8_t)slot;
 
-    int ret = bb_ioctl(link->dev, BB_GET_MCS, &in, &out);
+    int ret = bb_ioctl(dev, BB_GET_MCS, &in, &out);
     if (ret) {
         fprintf(stderr, "bitrate_ctl: BB_GET_MCS failed (ret=%d)\n", ret);
         return -1;
@@ -74,12 +84,29 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 {
+    /* Loaded once here via the same atomic accessor the rest of this file
+     * uses (see ar8030_link_t's own header comment) even though nothing
+     * can be mid-reconnect this early in practice -- cheap, and removes
+     * any doubt about a pthread_create() race against an implausibly
+     * fast first daemon failure.
+     *
+     * Known, accepted gap: these two subscriptions are tied to *this*
+     * dev handle and are never re-established after a mid-session
+     * ar8030_link_reconnect_retry() (see tx/main.c) swaps it for a new
+     * one -- this thread silently falls back to poll-only cadence
+     * (bounded by poll_interval_ms, not a correctness issue) for the
+     * remainder of the process after the first daemon restart. Not worth
+     * the added coupling to fix given the fallback already exists and
+     * degrades gracefully; revisit if poll-only turns out to be too slow
+     * in practice post-reconnect. */
+    bb_dev_handle_t *dev = __atomic_load_n(&cfg->link->dev, __ATOMIC_ACQUIRE);
+
     bb_set_event_callback_t sub_mcs;
     memset(&sub_mcs, 0, sizeof(sub_mcs));
     sub_mcs.event = BB_EVENT_MCS_CHANGE;
     sub_mcs.callback = on_link_event;
     sub_mcs.user = NULL;
-    int sub_ret = bb_ioctl(cfg->link->dev, BB_SET_EVENT_SUBSCRIBE, &sub_mcs, NULL);
+    int sub_ret = dev ? bb_ioctl(dev, BB_SET_EVENT_SUBSCRIBE, &sub_mcs, NULL) : -1;
     if (sub_ret) {
         fprintf(stderr,
                 "bitrate_ctl: BB_SET_EVENT_SUBSCRIBE(MCS_CHANGE) failed (ret=%d) -- "
@@ -87,12 +114,14 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                 sub_ret);
     }
 
-    bb_set_event_callback_t sub_link;
-    memset(&sub_link, 0, sizeof(sub_link));
-    sub_link.event = BB_EVENT_LINK_STATE;
-    sub_link.callback = on_link_event;
-    sub_link.user = NULL;
-    bb_ioctl(cfg->link->dev, BB_SET_EVENT_SUBSCRIBE, &sub_link, NULL);
+    if (dev) {
+        bb_set_event_callback_t sub_link;
+        memset(&sub_link, 0, sizeof(sub_link));
+        sub_link.event = BB_EVENT_LINK_STATE;
+        sub_link.callback = on_link_event;
+        sub_link.user = NULL;
+        bb_ioctl(dev, BB_SET_EVENT_SUBSCRIBE, &sub_link, NULL);
+    }
 
     uint32_t last_applied_kbps = 0;
     int have_applied = 0;
@@ -208,8 +237,12 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         if (!poll_due && !woken)
             continue;
 
+        /* Atomic load: tx/main.c updates cfg->slot after a reconnect if
+         * the peer's connected slot resolves differently than before
+         * (see bitrate_ctl.h's own comment on this field). */
+        bb_slot_e slot = __atomic_load_n(&cfg->slot, __ATOMIC_ACQUIRE);
         uint32_t link_kbps;
-        if (read_tx_throughput_kbps(cfg->link, cfg->slot, &link_kbps) != 0)
+        if (read_tx_throughput_kbps(cfg->link, slot, &link_kbps) != 0)
             continue;
 
         uint32_t target_kbps = (uint32_t)((double)link_kbps * cfg->margin);

@@ -6,7 +6,13 @@
 
 int ar8030_link_connect(ar8030_link_t *link, const char *daemon_ip, int daemon_port)
 {
-    memset(link, 0, sizeof(*link));
+    /* Field-by-field, not a blanket memset(link, 0, ...): a mid-session
+     * reconnect (ar8030_link_reconnect_retry()) can run this while tx's
+     * bitrate_ctl.c thread is concurrently reading link->dev, and that
+     * field must go through an atomic store even for "reset to NULL"
+     * on a failed attempt -- see this struct's own header comment. */
+    __atomic_store_n(&link->dev, NULL, __ATOMIC_RELEASE);
+    link->host = NULL;
     link->sockfd = -1;
 
     int ret = bb_host_connect(&link->host, daemon_ip, daemon_port);
@@ -25,16 +31,17 @@ int ar8030_link_connect(ar8030_link_t *link, const char *daemon_ip, int daemon_p
         return -1;
     }
 
-    link->dev = bb_dev_open(devs[0]);
+    bb_dev_handle_t *dev = bb_dev_open(devs[0]);
     bb_dev_freelist(devs);
 
-    if (!link->dev) {
+    if (!dev) {
         fprintf(stderr, "ar8030_link: bb_dev_open failed\n");
         bb_host_disconnect(link->host);
         link->host = NULL;
         return -1;
     }
 
+    __atomic_store_n(&link->dev, dev, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -58,10 +65,11 @@ int ar8030_link_connect_retry(ar8030_link_t *link, const char *daemon_ip, int da
 int ar8030_link_open_socket(ar8030_link_t *link, bb_slot_e slot, uint32_t port, uint32_t flag,
                              bb_sock_opt_t *opt)
 {
-    if (!link->dev)
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
         return -1;
 
-    int fd = bb_socket_open(link->dev, slot, port, flag, opt);
+    int fd = bb_socket_open(dev, slot, port, flag, opt);
     if (fd < 0) {
         fprintf(stderr, "ar8030_link: bb_socket_open(slot=%d, port=%u) failed (ret=%d)\n", slot,
                 port, fd);
@@ -70,6 +78,25 @@ int ar8030_link_open_socket(ar8030_link_t *link, bb_slot_e slot, uint32_t port, 
 
     link->sockfd = fd;
     return 0;
+}
+
+int ar8030_link_force_close_socket(ar8030_link_t *link, bb_slot_e slot, uint32_t port)
+{
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
+        return -1;
+
+    bb_force_close_socket_t fc = { .slot = (uint8_t)slot, .port = (uint8_t)port };
+    return bb_ioctl(dev, BB_FORCE_CLS_SOCKET, &fc, NULL);
+}
+
+int ar8030_link_force_close_all_sockets(ar8030_link_t *link)
+{
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
+        return -1;
+
+    return bb_ioctl(dev, BB_FORCE_CLS_SOCKET_ALL, NULL, NULL);
 }
 
 void ar8030_link_close(ar8030_link_t *link)
@@ -81,12 +108,44 @@ void ar8030_link_close(ar8030_link_t *link)
         bb_socket_close(link->sockfd);
         link->sockfd = -1;
     }
-    if (link->dev) {
-        bb_dev_close(link->dev);
-        link->dev = NULL;
-    }
+
+    /* Atomic exchange, not a plain read-then-close: publishes NULL to any
+     * concurrent reader (tx's bitrate_ctl.c thread) as one indivisible
+     * step with grabbing the handle to close, rather than a check
+     * followed by a separate close-and-clear that leaves a window where
+     * another thread could still observe and use the about-to-be-freed
+     * handle. This ordering is what closed the exact use-after-free race
+     * the frame-shm ring reattach fix hit on its first live test (see
+     * README.md) -- NULL is already a value that reader has to treat as
+     * "skip this tick" regardless, so publishing it first costs nothing. */
+    bb_dev_handle_t *dev = __atomic_exchange_n(&link->dev, NULL, __ATOMIC_ACQ_REL);
+    if (dev)
+        bb_dev_close(dev);
+
     if (link->host) {
         bb_host_disconnect(link->host);
         link->host = NULL;
     }
+}
+
+int ar8030_link_is_alive(ar8030_link_t *link)
+{
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
+        return 0;
+
+    bb_get_status_in_t in;
+    bb_get_status_out_t out;
+    memset(&in, 0, sizeof(in));
+    memset(&out, 0, sizeof(out));
+    in.user_bmp = 0; /* not concerned with physical-layer info -- see bb_api.h's own doc comment */
+
+    return bb_ioctl(dev, BB_GET_STATUS, &in, &out) == 0;
+}
+
+int ar8030_link_reconnect_retry(ar8030_link_t *link, const char *daemon_ip, int daemon_port,
+                                 int retry_ms, const volatile int *stop_flag)
+{
+    ar8030_link_close(link);
+    return ar8030_link_connect_retry(link, daemon_ip, daemon_port, retry_ms, stop_flag);
 }

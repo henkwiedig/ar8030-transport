@@ -22,8 +22,16 @@
 #include <stdint.h>
 
 typedef struct {
-    ar8030_link_t *link; /* already-connected; bitrate_ctl only calls bb_ioctl on it */
-    bb_slot_e slot;       /* which slot's TX MCS to read (this side's own data slot) */
+    ar8030_link_t *link; /* already-connected; bitrate_ctl only calls bb_ioctl on it.
+                           * The pointer itself never changes, but its ->dev field can
+                           * (tx/main.c's read loop reconnects to the daemon after
+                           * detecting it died -- ar8030_link_reconnect_retry()) --
+                           * every access goes through __atomic_*(), see ar8030_link_t's
+                           * own header comment. */
+    bb_slot_e slot;       /* which slot's TX MCS to read (this side's own data slot).
+                           * Accessed via __atomic_*(): tx/main.c updates this after a
+                           * reconnect if resolve_connected_slot() finds the peer on a
+                           * different slot than before. */
 
     const char *waybeam_host; /* default "127.0.0.1" */
     int waybeam_port;         /* default 80 */

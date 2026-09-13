@@ -91,6 +91,27 @@
 #define BACKOFF_AFTER_CONSECUTIVE_STALLS 5
 #define BACKOFF_MS 50
 #define STATS_INTERVAL_S 1.0
+/* How often the main loop asks the daemon directly whether it's still
+ * there (ar8030_link_is_alive(), a single BB_GET_STATUS round trip) --
+ * see that function's own comment for why this can't just be inferred
+ * from bb_socket_write() timeouts. A few seconds is frequent enough to
+ * notice a daemon restart promptly without adding meaningful RPC load
+ * next to the actual video traffic. */
+#define DAEMON_HEALTH_CHECK_INTERVAL_S 3.0
+/* Confirmed live: reopening the data socket -- at startup or after a
+ * reconnect -- can still fail even with
+ * ar8030_link_force_close_all_sockets() called first. The single-socket
+ * ar8030_link_force_close_socket() was tried first and confirmed NOT to
+ * clear the stuck state (returned -2); force-close-*all* does clear it,
+ * but not always instantly -- the daemon's own log showed one open
+ * succeeding and then tearing itself back down again within about a
+ * millisecond, well under any real timeout, on an attempt sandwiched
+ * between two others that worked fine. A short retry loop here matches
+ * every other step already in this same connect/reconnect sequence
+ * (ar8030_link_connect_retry(), resolve_connected_slot()) -- none of
+ * them assume their first attempt succeeds either. */
+#define SOCKET_REOPEN_MAX_ATTEMPTS 5
+#define SOCKET_REOPEN_RETRY_MS 500
 
 static volatile int g_stop;
 
@@ -447,6 +468,13 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* Captured before the very first resolve overwrites args.slot below --
+     * the main loop's own reconnect path needs to know whether "-s auto"
+     * was actually requested, since a peer's connected slot isn't
+     * guaranteed to stay the same across a daemon restart (same reason
+     * -s auto exists at all: see this option's own usage() text). */
+    int slot_was_auto = (args.slot < 0);
+
     if (args.slot < 0) {
         args.slot = resolve_connected_slot(link.dev, &g_stop);
         if (args.slot < 0) {
@@ -460,8 +488,23 @@ int main(int argc, char **argv)
     bb_sock_opt_t sock_opt;
     sock_opt.tx_buf_size = 64 * 1024;
     sock_opt.rx_buf_size = 1024;
-    if (ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port, BB_SOCK_FLAG_TX,
-                                 &sock_opt) != 0) {
+    /* Same force-close + retry as the reconnect path below (see its own,
+     * longer comment) -- confirmed live that this exact failure isn't
+     * specific to reconnecting: it also hit a genuinely fresh startup
+     * once a prior run had left the daemon in this state (crashed
+     * without a clean bb_socket_close(), device not rebooted since). */
+    ar8030_link_force_close_all_sockets(&link);
+    int startup_open_ret = -1;
+    int startup_open_attempt;
+    for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
+         startup_open_attempt++) {
+        startup_open_ret = ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port,
+                                                    BB_SOCK_FLAG_TX, &sock_opt);
+        if (startup_open_ret == 0)
+            break;
+        usleep(SOCKET_REOPEN_RETRY_MS * 1000);
+    }
+    if (startup_open_ret != 0) {
         ar8030_link_close(&link);
         venc_frame_ring_destroy(ring);
         return 1;
@@ -527,6 +570,7 @@ int main(int argc, char **argv)
      * chunks before failing resets this: that is ordinary loss, not
      * sustained saturation. */
     int consecutive_stalls = 0;
+    double last_health_check_s = now_monotonic_s();
 
     uint16_t frame_seq = 0;
     while (!g_stop) {
@@ -536,6 +580,73 @@ int main(int argc, char **argv)
                 print_tx_stats(&stats, &stats_prev, now - stats_last_print, ring);
                 stats_prev = stats;
                 stats_last_print = now;
+            }
+        }
+
+        /* Periodic daemon-liveness probe, independent of whatever the
+         * data path below is doing -- see ar8030_link_is_alive()'s own
+         * comment for why a run of bb_socket_write() timeouts alone
+         * can't tell "the RF link is saturated" (self-clearing) apart
+         * from "ar8030d itself crashed or restarted" (never clears
+         * without this). */
+        double now_health = now_monotonic_s();
+        if (now_health - last_health_check_s >= DAEMON_HEALTH_CHECK_INTERVAL_S) {
+            last_health_check_s = now_health;
+            if (!ar8030_link_is_alive(&link)) {
+                fprintf(stderr, "tx: ar8030d connection lost, reconnecting...\n");
+                if (ar8030_link_reconnect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS,
+                                                 &g_stop) != 0)
+                    break; /* stopped while waiting for the daemon to come back */
+                fprintf(stderr, "tx: reconnected to ar8030d\n");
+
+                int slot = args.slot;
+                if (slot_was_auto) {
+                    bb_dev_handle_t *dev = __atomic_load_n(&link.dev, __ATOMIC_ACQUIRE);
+                    slot = resolve_connected_slot(dev, &g_stop);
+                    if (slot < 0)
+                        break; /* stopped before any peer ever reconnected */
+                    fprintf(stderr, "tx: resolved connected slot %d\n", slot);
+                }
+                args.slot = slot;
+                /* bitrate_ctl's own thread reads cfg->slot concurrently
+                 * (see bitrate_ctl.h's own comment on that field). */
+                __atomic_store_n(&bc_cfg.slot, (bb_slot_e)slot, __ATOMIC_RELEASE);
+
+                /* Confirmed live: a daemon killed abruptly (not a clean
+                 * shutdown) never runs its own bb_socket_close() teardown,
+                 * so the fresh daemon instance's first open on this same
+                 * slot/port fails with ret=-1 ("already opened", stale
+                 * chip-side state from the old session) even though
+                 * nothing is genuinely still using it. The single-socket
+                 * ar8030_link_force_close_socket() was tried here first
+                 * and confirmed live NOT to clear it (returned -2); the
+                 * broader ar8030_link_force_close_all_sockets() is the
+                 * one that actually worked -- see its own comment.
+                 * Ignore its return value: on the common path there is
+                 * nothing to force-close and this is a harmless no-op;
+                 * the retry loop below is the real, checked,
+                 * fatal-on-failure step. */
+                ar8030_link_force_close_all_sockets(&link);
+
+                int open_ret = -1;
+                int attempt;
+                for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
+                    open_ret = ar8030_link_open_socket(&link, (bb_slot_e)slot, (uint32_t)args.port,
+                                                        BB_SOCK_FLAG_TX, &sock_opt);
+                    if (open_ret == 0)
+                        break;
+                    usleep(SOCKET_REOPEN_RETRY_MS * 1000);
+                }
+                if (open_ret != 0) {
+                    fprintf(stderr, "tx: failed to reopen bb_socket after reconnect (%d attempts), stopping\n",
+                            attempt);
+                    g_stop = 1; /* bitrate_ctl's thread only exits on this -- see its own
+                                 * while (!*cfg->stop_flag) loop -- so pthread_join() below
+                                 * would otherwise block forever after this break. Confirmed
+                                 * live: without this, the process never actually exited. */
+                    break;
+                }
+                fprintf(stderr, "tx: bb_socket open (slot=%d port=%d)\n", slot, args.port);
             }
         }
 
