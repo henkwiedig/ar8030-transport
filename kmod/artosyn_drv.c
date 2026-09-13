@@ -319,10 +319,30 @@ static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t
 		 * is the *only* recovery for a lost interrupt now, since
 		 * there's no separate workqueue fallback in this design;
 		 * poll() (see artosyn_poll() below) covers the same case for
-		 * callers blocked in poll() rather than a blocking write(). */
-		sdio_claim_host(func);
-		artosyn_check_events(dev);
-		sdio_release_host(func);
+		 * callers blocked in poll() rather than a blocking write().
+		 *
+		 * Gated on write_condition() being false first, matching
+		 * artosyn_poll()'s own gating -- a write() call that still
+		 * has leftover write_valid_size room from a previous TX-ready
+		 * event (the common case under sustained streaming, where
+		 * one TX-ready event's worth of room typically outlives many
+		 * successive write() calls) must not pay for an extra,
+		 * unconditional SDIO bus round-trip (sdio_claim_host +
+		 * sdio_readb(REG_IRQ_STATUS)) on every single call. This was
+		 * ungated here even though the exact same "an extra register
+		 * read costs real bus time under saturated throughput"
+		 * mechanism already confirmed to regress poll() (see
+		 * artosyn_check_events()'s own comment) applies equally to
+		 * call-frequency here -- at typical per-write chunk sizes
+		 * this adds hundreds of wasted round-trips per second at
+		 * higher bitrates, self-inflicted bus contention that scales
+		 * with data rate and directly competes with the real
+		 * sdio_memcpy_toio() transfers below for bus time. */
+		if (!artosyn_write_condition(dev)) {
+			sdio_claim_host(func);
+			artosyn_check_events(dev);
+			sdio_release_host(func);
+		}
 
 		left = wait_event_interruptible_timeout(dev->tx_q, artosyn_write_condition(dev),
 							 msecs_to_jiffies(SDIO_WRITE_WAIT_MS));
@@ -393,9 +413,16 @@ static ssize_t artosyn_do_read(struct artosyn_dev *dev, void *buf, size_t count)
 		dev->read_offset = 0;
 		dev->read_valid_size = count;
 	} else {
-		sdio_claim_host(func);
-		artosyn_check_events(dev);
-		sdio_release_host(func);
+		/* See the matching gate in artosyn_do_write() -- same
+		 * reasoning: skip the courtesy register check entirely
+		 * whenever read_condition() is already true, instead of
+		 * paying for a redundant SDIO bus round-trip on every
+		 * single read() call regardless of need. */
+		if (!artosyn_read_condition(dev)) {
+			sdio_claim_host(func);
+			artosyn_check_events(dev);
+			sdio_release_host(func);
+		}
 
 		left = wait_event_interruptible_timeout(dev->rx_q, artosyn_read_condition(dev),
 							 msecs_to_jiffies(SDIO_READ_WAIT_MS));

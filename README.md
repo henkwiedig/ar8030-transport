@@ -1151,7 +1151,10 @@ progress"` stalls, zero `"recv bad socket pack"` messages, sustained
 ~18.5Mbit/s, 439MB+ transferred over a ~190 second run, `incomplete=0`
 the entire time. The first completely clean SDIO-mode run anywhere in
 this investigation, matching the vendor's own real `artosyn_sdio.ko`'s
-reference performance rather than just approaching it.
+reference performance rather than just approaching it. (That first run
+didn't happen to push past ~10-12Mbit/s -- see "Follow-up: the
+~10-12Mbit/s ceiling, root-caused and fixed" further down for a real
+regression only a higher-bitrate soak surfaced, and its fix.)
 
 ### Design decisions that came out of the investigation history
 
@@ -1229,13 +1232,25 @@ swap while the old combined driver's own `/dev/artosyn_sdio` is in use
 
 ```
 insmod artosyn_drv.ko fw_name=ar8030/ar8030.img cfg_name=ar8030/ar8030.json
-ar8030d -i 1 -l 2 &
+ar8030d -i 1 > /dev/null 2>&1 &
 ar8030-pair --no-persist --skip-if-connected -c /lib/firmware/ar8030/ar8030.json
 ar8030-linkctl bandwidth 20 -d tx -s auto -w 20
 ar8030-transport-tx -v
 ```
 
-### Not yet done, before this fully replaces the old combined driver
+**Never redirect `ar8030d`'s stdout to a file when testing this by hand**
+(`> some.log`, not `> /dev/null`) -- confirmed live to OOM-kill an
+unrelated process (`waybeam`) on a real air unit. `ar8030d` has no log-
+level flag and defaults to verbose per-RPC/per-socket-event tracing on
+stdout; `0009-com_log-cap-daemon-log-file-size.patch`'s own commit
+message already documents this exact failure mode for the daemon's
+*internal* file-based log (`/var/log/ar8030/daemon_log/*.log`, capped at
+2MB by that patch) filling the 28.5MB tmpfs-backed `/tmp` on this same
+Hi3516CV610 air unit and starving an arbitrary victim process of memory
+-- stdout mirrors the same volume of chatter but isn't covered by that
+cap, so capturing it to a file during manual testing reproduces the
+identical OOM by a different path. `/dev/null` it, or `-l <level>` if a
+future daemon build adds one; don't accumulate it.
 
 - **Only one clean-boot test run so far.** Extraordinary result, but
   one run -- re-confirm across multiple clean boots, different link
@@ -1277,6 +1292,81 @@ ar8030-transport-tx -v
   shape on paper, not exercised on real hardware.
 - **No automated test/CI** for this module at all yet (the userspace
   `test/roundtrip_test.c` in this repo doesn't cover kernel code).
+
+### Follow-up: the ~10-12Mbit/s ceiling, root-caused and fixed
+
+Addresses the first "not yet done" item above -- multiple clean-boot
+runs now confirmed, not just the original single 190s one -- and a real
+regression that only showed up once someone actually pushed bitrate past
+what that first run happened to test.
+
+**Symptom:** video streamed cleanly up to ~10Mbit/s, but pushing higher
+(the link was tuned to `mcs=12`, `BB_GET_MCS` reporting a 25933kbps
+ceiling -- plenty of headroom on paper) produced occasional
+`bitrate_ctl: URGENT ring backlog=N slots -> video0.bitrate=... kbps`
+throttling once past roughly 12-14Mbit/s. Already known not to be a
+hardware limit: this exact chip/antenna combination previously held a
+clean ~18-19Mbit/s with the vendor's own `artosyn_sdio.ko` + this
+project's daemon (see the isolation test table above), and separately
+with the vendor's stock image outright.
+
+**Root cause:** `artosyn_do_write()` and `artosyn_do_read()` in
+`kmod/artosyn_drv.c` both ran their "courtesy" mailbox-register check
+(`sdio_claim_host()` + `sdio_readb(REG_IRQ_STATUS)`, a real SDIO bus
+round-trip) **unconditionally on every single call**, even when
+`write_valid_size`/`read_valid_size` already had room left over from a
+previous TX/RX-ready event -- unlike `artosyn_poll()` in this same file,
+which correctly gates the identical check behind
+`if (!artosyn_read_condition(dev) && !artosyn_write_condition(dev))`.
+This is exactly the same class of bug this rewrite's own design notes
+already flag as a proven regression source (see `artosyn_check_events()`
+own comment about the old combined driver's poll()-calls-irqhandler
+experiment) -- an extra register read costs real bus time under
+saturated throughput -- just present here in the read/write paths
+instead of `poll()`, and easy to miss precisely because `poll()` right
+next to it does this correctly. The cost is fixed per *call*, not per
+byte, so it doesn't show up at low bitrates (few calls/sec) and only
+becomes bus-contending once call frequency (which scales with
+requested-bitrate ÷ per-write chunk size) climbs high enough --
+matching the observed "fine below ~10-12Mbit/s, throttles above" shape
+exactly.
+
+**Fix:** gate both courtesy checks the same way `artosyn_poll()` already
+does -- only claim the host and read the register when the condition is
+not already true. Correctness is unaffected (`wait_event_interruptible_
+timeout()` already re-checks the condition itself before deciding
+whether to actually sleep); this only removes a redundant bus
+transaction in the common case where room/data is already known to be
+available.
+
+**Confirmed on real hardware, clean-boot methodology (auto-start
+renamed out, manual bring-up per "Build and test" above):** sustained
+**~18.5-18.6Mbit/s**, zero `incomplete` frames, zero `failed` chunks,
+zero `full_drops`/`other_drops`, for the length of the soak -- matching
+the vendor-driver-era ceiling this project had previously only reached
+with the vendor's own kernel module.
+
+**Residual, rare `URGENT` events are not a transport bug.** A tight
+real-time capture (poll `ar8030-transport-tx -v`'s own log for `URGENT`,
+snapshot the daemon's own debug-pad log the instant one appears -- same
+method as the isolation-test era above) caught every occurrence: at each
+one, `dev_dat_so_write_proc`'s `send ok`/`send cpl` pairs were completing
+back-to-back with a **maximum 6-8ms gap** between consecutive log lines
+-- nowhere near what a real SDIO/daemon-level stall looks like elsewhere
+in this investigation (hundreds of ms to permanent). No stall signature
+at all at the moment the ring backlog is reported. This is consistent
+with a normal H.265 keyframe burst (periodically larger frames
+transiently exceeding the instantaneous transmit rate even at a
+well-tuned average bitrate) hitting `bitrate_ctl`'s own reactive
+backoff exactly as designed, not a driver/daemon defect. Event frequency
+also dropped sharply (from roughly every 10-15s to roughly every
+80-200+s, isolated singles instead of clusters) after switching channel
+mid-test, suggesting the remaining rate has some RF-interference
+component too, separate from anything fixable in this codebase.
+
+**Operational note for future sessions testing this by hand:** see the
+`ar8030d` stdout-redirection warning in "Build and test" above -- hit
+live during this same round of testing.
 
 ## Phase 2 (explicitly out of scope here)
 
