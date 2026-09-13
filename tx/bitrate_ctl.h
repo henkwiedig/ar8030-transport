@@ -51,7 +51,14 @@ typedef struct {
      * spike fill_pct with nothing wrong; low-water asks whether the ring
      * ever failed to drain, which is what actually distinguishes standing
      * backlog from a normal burst). ring may be NULL to disable this
-     * entirely (falls back to MCS-only behavior). */
+     * entirely (falls back to MCS-only behavior).
+     *
+     * Owned by the caller (tx/main.c), not this file -- read via
+     * __atomic_load_n() every tick rather than cached, since the caller's
+     * own read loop replaces it with a freshly-reattached ring after
+     * detecting waybeam restarted (see main.c's stat_named_shm()), and
+     * this thread would otherwise keep reading a stale, orphaned mapping
+     * forever after the first such restart. */
     venc_frame_ring_t *ring;
     uint32_t ring_backlog_high_slots; /* >= this many low-water slots is standing
                                         * backlog per venc_frame_ring.h's own doc

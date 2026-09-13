@@ -23,12 +23,15 @@
 #include "venc_frame_ring.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -363,6 +366,50 @@ static uint8_t frame_flags_from_meta(const VencFrameMeta *meta)
     return flags;
 }
 
+/* Stats the *currently named* shm object, independent of (and without
+ * touching) any mapping this process already has attached -- used to
+ * notice waybeam has restarted out from under us.
+ *
+ * venc_frame_ring_create() (waybeam's own producer-side call) does
+ * shm_unlink() then shm_open(O_CREAT|O_EXCL) on every single start --
+ * "stale-ring guard" in its own comment -- so a restart (a config change
+ * that requires one, or a crash) always creates a brand-new shm object
+ * under the same name, never reopens the existing one. Unlinking a POSIX
+ * shm object behaves like unlinking a regular file: it does not
+ * invalidate an already-open fd or an already-mmap()'d region in another
+ * process. So an already-attached consumer's mapping keeps working
+ * exactly as before -- reading a now-orphaned copy of the ring that the
+ * new producer will never write to again -- with no error, no signal, and
+ * (at this project's normal fps) nothing but a read timeout that just
+ * keeps recurring forever to tell you something's wrong.
+ *
+ * Comparing the inode of a *fresh* shm_open() of the same name against
+ * the one we last attached to is the standard fix for exactly this shape
+ * of problem (the same technique `tail -F` uses to notice a rotated log
+ * file). Returns 0 and fills *out_dev and *out_ino on success, -1 if the name
+ * doesn't currently resolve to anything (waybeam mid-restart, between its
+ * own shm_unlink() and next shm_open(), or not running at all). */
+static int stat_named_shm(const char *ring_name, dev_t *out_dev, ino_t *out_ino)
+{
+    char name[256];
+    if (ring_name[0] == '/')
+        snprintf(name, sizeof(name), "%s", ring_name);
+    else
+        snprintf(name, sizeof(name), "/%s", ring_name);
+
+    int fd = shm_open(name, O_RDONLY, 0);
+    if (fd < 0)
+        return -1;
+    struct stat st;
+    int ret = fstat(fd, &st);
+    close(fd);
+    if (ret != 0)
+        return -1;
+    *out_dev = st.st_dev;
+    *out_ino = st.st_ino;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct tx_args args;
@@ -383,6 +430,15 @@ int main(int argc, char **argv)
     if (!ring)
         return 0; /* stopped before waybeam ever came up */
     fprintf(stderr, "tx: attached to ring '%s'\n", args.ring_name);
+
+    /* Baseline for stat_named_shm()'s own staleness check below -- if this
+     * fails right after a successful attach (vanishingly unlikely, we just
+     * opened the same name), leave both at 0 so the first read timeout's
+     * check treats the current object as "unknown" and reattaches rather
+     * than silently skipping detection forever. */
+    dev_t ring_dev = 0;
+    ino_t ring_ino = 0;
+    stat_named_shm(args.ring_name, &ring_dev, &ring_ino);
 
     ar8030_link_t link;
     fprintf(stderr, "tx: connecting to ar8030d at %s:%d...\n", args.daemon_ip, args.daemon_port);
@@ -485,8 +541,68 @@ int main(int argc, char **argv)
 
         uint32_t out_len = 0;
         int ret = venc_frame_ring_read_wait(ring, ring_buf, ring_buf_size, &out_len, 200);
-        if (ret != 0)
-            continue; /* timeout, loop back and re-check g_stop */
+        if (ret != 0) {
+            /* A read timeout is also the cheapest place to notice waybeam
+             * restarted out from under us (see stat_named_shm()'s own
+             * comment) -- at this project's normal fps a healthy ring
+             * almost never goes 200ms without a fresh frame, so a timeout
+             * here is already a meaningful signal, not routine polling
+             * noise. The check itself (open+fstat+close by name) is cheap
+             * enough to run on every timeout regardless. */
+            dev_t cur_dev;
+            ino_t cur_ino;
+            int have_cur = stat_named_shm(args.ring_name, &cur_dev, &cur_ino) == 0;
+            if (!have_cur || cur_dev != ring_dev || cur_ino != ring_ino) {
+                fprintf(stderr, "tx: frame-shm ring '%s' %s -- waybeam restarted, reattaching\n",
+                        args.ring_name, have_cur ? "changed" : "disappeared");
+
+                /* Clear bitrate_ctl's view of the ring BEFORE freeing it.
+                 * That thread reads cfg->ring concurrently, every tick,
+                 * via an atomic load (see bitrate_ctl.c) -- destroying and
+                 * freeing the ring here while that pointer still
+                 * referenced it would be a genuine use-after-free race,
+                 * not just a stale read, and was confirmed live to
+                 * segfault the whole process (one thread crashing takes
+                 * down all of it) the first time this path was exercised
+                 * against a real waybeam restart. NULL is already a
+                 * supported state for cfg->ring (see its own "may be NULL"
+                 * comment), so the other thread just skips its backlog
+                 * check for the duration of the reattach below. */
+                __atomic_store_n(&bc_cfg.ring, NULL, __ATOMIC_RELEASE);
+
+                venc_frame_ring_destroy(ring);
+                ring = NULL;
+                while (!g_stop && !(ring = venc_frame_ring_attach(args.ring_name)))
+                    usleep(RETRY_MS * 1000);
+                if (!ring)
+                    break; /* stopped while waiting for waybeam to come back */
+                fprintf(stderr, "tx: reattached to ring '%s'\n", args.ring_name);
+
+                if (stat_named_shm(args.ring_name, &ring_dev, &ring_ino) != 0) {
+                    ring_dev = 0;
+                    ring_ino = 0;
+                }
+
+                if (ring->slot_data_size != ring_buf_size) {
+                    uint8_t *new_buf = realloc(ring_buf, ring->slot_data_size);
+                    if (new_buf) {
+                        ring_buf = new_buf;
+                        ring_buf_size = ring->slot_data_size;
+                    } else {
+                        fprintf(stderr, "tx: OOM growing ring read buffer to %u bytes, stopping\n",
+                                ring->slot_data_size);
+                        g_stop = 1;
+                    }
+                }
+
+                /* bitrate_ctl's own thread reads cfg->ring concurrently
+                 * (its own backlog check) -- publish the new pointer
+                 * atomically rather than a plain store, matching how it
+                 * loads it (see bitrate_ctl.c's own comment). */
+                __atomic_store_n(&bc_cfg.ring, ring, __ATOMIC_RELEASE);
+            }
+            continue; /* timeout (or just reattached), loop back and re-check g_stop */
+        }
         if (out_len < VENC_FRAME_META_SIZE)
             continue; /* malformed slot; ring already accounts this via bad_slot_drops */
 

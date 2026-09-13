@@ -182,10 +182,18 @@ information the air unit already has, no round trip to the ground needed.
 event callback can never wedge the loop. The observed throughput is
 scaled by a safety margin (`-m`, default 0.70), clamped to `[-n, -x]`
 kbps, rate-limited and given hysteresis so it doesn't chatter at an MCS
-boundary, and applied via `GET /api/v1/set?video0.bitrate=<kbps>` on
+boundary, and applied via `GET /api/v1/live/set?video0.bitrate=<kbps>` on
 waybeam's loopback HTTP API (`documentation/HTTP_API_CONTRACT.md` in
 waybeam_venc — `video0.bitrate` is `MUT_LIVE`, applied without a pipeline
-restart).
+restart). **`/live/set`, not the persisting `/api/v1/set`** — the latter
+is what this file actually called until this was found and fixed:
+waybeam's own docs describe `/live/set` as built specifically for
+"high-cadence automated writers (waybeam-link adaptive bitrate/caps/fps
+actuation)... persist-on-set would wear flash and boot into the last
+adaptive transient" — exactly this file's own access pattern, and exactly
+the two failure modes fixed by switching to it (unnecessary flash writes
+on every adaptive change, and a crash/reboot right after a link-quality
+dip no longer boots back up pinned at that low bitrate).
 
 **Second signal: ring backlog.** MCS says what the radio *should*
 currently be able to carry; it says nothing about whether this side's own
@@ -212,6 +220,81 @@ bitrate by `ring_backoff` (default 0.85), bypassing hysteresis, rate
 limited to once per 250ms rather than the normal path's 1500ms. Logged
 with an `URGENT` tag in stderr / `-v` output to distinguish it from an
 ordinary MCS-driven change.
+
+**Last-resort measure: centre-priority ROI.** waybeam supports
+centre-priority horizontal delta-QP bands (`fpv.roiEnabled`/`roiQp`/
+`roiSteps`/`roiCenter` — concentrates bits on the middle of frame, where a
+pilot is actually looking, at the expense of the edges). `bitrate_ctl.c`
+engages it (`fpv.roiEnabled=true`, via `/api/v1/live/set`, at waybeam's
+own shipped-default `roiQp`/`roiSteps`/`roiCenter` — this project sets
+none of those itself) only when *both* the standing-backlog signal above
+*and* `last_applied_kbps < roi_max_kbps` (default 3000, i.e. below
+~3Mbit/s) are true — deliberately not on every backlog blip, since
+`HTTP_API_CONTRACT.md` documents a real bitrate-overshoot risk from
+turning ROI on (`roi_qp`'s delta is subtracted from frame QP, so CBR pays
+for it by raising the base QP roughly 1:1, and once `base_qp +
+|roi_qp|` passes the encoder's QP ceiling the rate controller saturates
+and the target is missed by multiples — measured on this same CV610
+backend at ~1.4x at the default `max_qp` ceiling this project leaves
+untouched, but 5.8x-12x once `max_qp` is *also* lowered elsewhere, which
+this codebase never does). A keyframe-sized burst at an otherwise-healthy
+bitrate skips ROI entirely and pays none of that risk; it only engages
+once the link has already forced bitrate down near the floor. Disengages
+(`fpv.roiEnabled=false`) once backlog has been clear *and*
+`last_applied_kbps` has recovered back above `roi_max_kbps` for
+`roi_recovery_ms` (default 5000) — hysteresis against flapping right at
+the boundary. Any residual overshoot from turning ROI on is just more
+backlog, handled by this same loop on its next tick like any other
+overshoot source; no separate bitrate compensation is attempted.
+
+## Frame-shm ring: surviving a waybeam restart
+
+`ar8030-transport-tx` attaches to waybeam's frame-shm ring
+(`venc_frame_ring_attach()`) once at startup and keeps that `mmap()` for
+its whole lifetime. Some waybeam config changes require a pipeline
+restart to take effect, and waybeam can also simply crash and be
+restarted by its own init script — and `venc_frame_ring_create()`
+(waybeam's producer side) does `shm_unlink()` then
+`shm_open(O_CREAT|O_EXCL)` on **every single start** ("stale-ring guard"
+in its own comment), never reopening an existing object. `shm_unlink()`
+does not invalidate an already-`mmap()`'d region in another process —
+exactly like unlinking a regular file someone still has open — so an
+already-attached consumer's mapping keeps working precisely as before,
+now reading a permanently orphaned copy of the ring that the new
+producer will never write to again. Confirmed live: no crash, no signal,
+no error — just a read timeout that recurs forever, since at this
+project's normal fps a healthy ring almost never goes 200ms without a
+fresh frame.
+
+**Fix:** `tx/main.c`'s `stat_named_shm()` does a fresh `shm_open()` +
+`fstat()` by name (independent of the existing mapping) on every read
+timeout and compares the inode against the one recorded at the last
+successful attach — the same technique `tail -F` uses to notice a
+rotated log file. A mismatch (or the name resolving to nothing at all,
+mid-restart) means waybeam restarted; the read loop destroys the stale
+mapping, retries `venc_frame_ring_attach()` until it succeeds (mirroring
+the startup wait), reallocates the read buffer if the new ring's slot
+size differs, and republishes the new pointer.
+
+**A real race, caught on the very first live test against an actual
+waybeam restart, not a hypothetical:** `bitrate_ctl_run()` runs on its
+own thread and reads the same ring pointer concurrently every ~100ms
+tick for its own backlog check (see above). The first version of this
+fix destroyed (and freed) the old ring, then only published the new
+pointer to that thread *after* a successful reattach — leaving a window
+where the bitrate thread could load the stale pointer and dereference
+already-freed memory. Segfaulted the whole process (one thread crashing
+takes the rest down with it) on the very first real restart tested
+against, immediately after logging "waybeam restarted, reattaching" and
+before "reattached to ring". Fixed by publishing `NULL` to the shared
+ring pointer *before* freeing the old ring, not after attaching the new
+one — `NULL` is already a supported state for that field (it disables
+the backlog check entirely), so the other thread just skips its check
+for the brief duration of the reattach instead of ever seeing a dangling
+pointer. Confirmed clean across two consecutive real `waybeam restart`
+calls afterward: no crash, brief ring-fill spike immediately
+absorbed by the existing backlog throttle, streaming back to the
+pre-restart bitrate within a few seconds each time.
 
 ## Build
 

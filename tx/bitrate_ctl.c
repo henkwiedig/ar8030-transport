@@ -114,9 +114,17 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
          * only signal that would catch it in time. Bypasses hysteresis
          * entirely (any standing backlog is by definition worth reacting
          * to) but keeps its own short rate limit so a persistent backlog
-         * doesn't re-issue the same HTTP call every single tick. */
-        if (cfg->ring && have_applied && (now - last_apply_ms) >= (uint64_t)RING_BACKLOG_MIN_INTERVAL_MS) {
-            uint16_t backlog_slots = __atomic_load_n(&cfg->ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+         * doesn't re-issue the same HTTP call every single tick.
+         *
+         * cfg->ring is loaded atomically, fresh, every tick: tx/main.c's
+         * own read loop swaps it to a newly-reattached ring after
+         * detecting waybeam restarted out from under it (see main.c's
+         * stat_named_shm() comment), and this thread must not keep
+         * reading the old, now-orphaned mapping's low_water_slots forever
+         * once that happens. */
+        venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);
+        if (ring && have_applied && (now - last_apply_ms) >= (uint64_t)RING_BACKLOG_MIN_INTERVAL_MS) {
+            uint16_t backlog_slots = __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
             if (backlog_slots >= cfg->ring_backlog_high_slots) {
                 last_backlog_ms = now;
 
