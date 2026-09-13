@@ -40,7 +40,9 @@ static void usage(const char *argv0)
             "\n"
             "  status [-s slot]\n"
             "      Dump BB_GET_STATUS (per-user tx/rx mcs+bandwidth+freq, link\n"
-            "      state) and BB_GET_MCS for the given slot (default 0).\n"
+            "      state), BB_GET_MCS, and BB_GET_SOCK_INFO (per-port tx/rx byte\n"
+            "      counters and overflow counts, only for ports actually in use)\n"
+            "      for the given slot (default 0).\n"
             "\n"
             "  bandwidth <mhz> [-d tx|rx] [-s slot] [-w seconds]\n"
             "      Manually set channel bandwidth. <mhz> is one of\n"
@@ -332,13 +334,18 @@ static const char *bb_mode_name(uint8_t mode)
 /* cfg_sbmp/rt_sbmp are bitmasks over bb_slot_e (bit N = slot N). Printed as
  * a plain slot list instead of raw hex so "which slots actually exist"
  * doesn't require the reader to decode a bitmap by hand. */
-static void print_slot_list(const char *label, uint8_t bmp)
+/* Generic "which bits are set" printer -- shared by cfg_sbmp/rt_sbmp
+ * (slots, count = BB_SLOT_MAX) below and BB_GET_SOCK_INFO's port_bmp
+ * (ports, count = BB_SOCK_INFO_NUM) further down. Both happen to be 8 on
+ * this SDK, but that's coincidence, not a reason to hardcode one bound
+ * for both meanings -- count is a parameter, not BB_SLOT_MAX baked in. */
+static void print_bit_list(const char *label, uint8_t bmp, int count)
 {
     printf("%s:", label);
     int any = 0;
-    for (int s = 0; s < BB_SLOT_MAX; s++) {
-        if (bmp & (1u << s)) {
-            printf(" %d", s);
+    for (int i = 0; i < count; i++) {
+        if (bmp & (1u << i)) {
+            printf(" %d", i);
             any = 1;
         }
     }
@@ -383,8 +390,8 @@ static int cmd_status(int argc, char **argv)
      * fix on the daemon/SDK side (or a channel table trimmed to <=32
      * entries), not a client-side workaround. */
 
-    print_slot_list("configured slots", st_out.cfg_sbmp);
-    print_slot_list("active slots", st_out.rt_sbmp);
+    print_bit_list("configured slots", st_out.cfg_sbmp, BB_SLOT_MAX);
+    print_bit_list("active slots", st_out.rt_sbmp, BB_SLOT_MAX);
     for (int s = 0; s < BB_SLOT_MAX; s++) {
         /* Slots outside cfg_sbmp have no real backing state -- the
          * daemon's BB_GET_STATUS reply doesn't zero them, so without this
@@ -423,6 +430,45 @@ static int cmd_status(int argc, char **argv)
     memset(&mcs_out, 0, sizeof(mcs_out));
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
+
+    /* Per-port bb_socket usage for this same slot. Genuinely useful
+     * beyond a nice-to-have: this session's own ar8030d-reconnect work
+     * hit a real, live "port stuck reporting already opened" failure
+     * more than once (see force-close-socket's own doc comment above and
+     * README's "ar8030d connection: surviving a daemon restart") with no
+     * way to actually SEE which port the daemon thought was still in
+     * use -- this is that visibility.
+     *
+     * Deliberately keyed on port_bmp, not each uni_info's own
+     * `available` flag (which sbc-groundstations' ar8030-status.c uses
+     * instead) -- confirmed live on a real, actively-streaming socket
+     * that the two disagree: port_bmp correctly reported this project's
+     * own video port (2, stream-mode TX-only) as open, while that same
+     * port's tx/rx `available` both read 0 with every byte counter
+     * zeroed. Likely because the daemon's detailed per-port byte/
+     * overflow counters are only tracked for the datagram-style ar_net0
+     * ports (0/1) this ioctl was presumably designed around, not this
+     * project's own stream-mode socket type. Whatever the reason,
+     * `available` would have hidden exactly the port most worth seeing
+     * for the stuck-port scenario this exists to diagnose -- port_bmp is
+     * the bitmap BB_SET_CANDIDATES/force-close-all's own callers already
+     * treat as authoritative elsewhere in this SDK (cfg_sbmp/rt_sbmp
+     * above), so trust it here too. */
+    bb_get_sock_info_in_t sock_in = { .slot = (uint8_t)slot, .port = -1 };
+    bb_get_sock_info_out_t sock_out;
+    memset(&sock_out, 0, sizeof(sock_out));
+    if (bb_ioctl(g_hbb, BB_GET_SOCK_INFO, &sock_in, &sock_out) == 0) {
+        print_bit_list("open ports", sock_out.port_bmp, BB_SOCK_INFO_NUM);
+        for (int p = 0; p < BB_SOCK_INFO_NUM; p++) {
+            if (!(sock_out.port_bmp & (1u << p)))
+                continue;
+            bb_sock_uni_t *tx_u = &sock_out.sock_info[p].uni_info[BB_DIR_TX];
+            bb_sock_uni_t *rx_u = &sock_out.sock_info[p].uni_info[BB_DIR_RX];
+            printf("port %d: tx_bytes=%llu (overflow=%u) rx_bytes=%llu (overflow=%u)\n", p,
+                   (unsigned long long)tx_u->total_size, tx_u->overflow_cnt,
+                   (unsigned long long)rx_u->total_size, rx_u->overflow_cnt);
+        }
+    }
 
     return 0;
 }
