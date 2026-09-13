@@ -196,6 +196,29 @@ Vendor defaults when no config is present: **`win=10`, `{busy,idle,conti_busy,
 conti_idle}={6,4,2,0}`** (`0x68d18`–`0x68d28`; `conti_idle` is 0 from the
 preceding `memset`).
 
+**What the fields drive (firmware side).** The baseband's retransmission
+controller is a per-user windowed state machine:
+
+- `win` is the window length; the controller also tracks `timeout` and an
+  `enable` flag. Its own status dump prints `enable : %u`,
+  `window : %u`, `timeout : %u` (format strings at `spl.bin` VA `0x2628dc`,
+  `0x2628ec`, `0x2628fc`; printer @ `0x24b85c`).
+- `bb_link_retx_ctrl_feed` (`0x230cc6`) maintains per-user busy/idle bitmasks
+  across that window. `busy`/`idle` are the per-window thresholds; the
+  `conti_busy`/`conti_idle` names indicate "consecutive" thresholds before the
+  controller declares the link in trouble (name-based inference; the state
+  machine uses `1 << n` bitmask ops, consistent with windowed counting).
+- `bb_link_retx_evt_stat_cfg_reset` (`0x22f74c`) clears a per-user event/stat
+  block (`[0]=0xffffffff`, `[1]=0`, `[2]=0`).
+- `bb_link_node_retx_handle` and `bb_link_{ap,node}_retx_local_monitor` consume
+  that state to decide actual retransmissions.
+
+This is consistent with the status strings `retx count`, `retx max stat`,
+`peer slot ... retx(0x%02x)`, `retx req enabled/disabled locally`, and
+`user %u retx hold!`. In short: `retx_win`/`retx_param` tune *how aggressively
+the baseband detects a bad link and retransmits*, not whether retransmission
+happens at all.
+
 The vendor app configures this from a debug JSON file on the device, read at
 startup (`fpv_debug_cfg_read_all` @ `0x60308`):
 
@@ -371,14 +394,19 @@ add a thin adaptive last-resort FEC. Do not build it speculatively.
 
 ## 6. Known unknowns / next RE work
 
-- **Full 136-byte GET struct beyond the first 5 bytes** — only the 5-byte
-  config prefix is consumed by the stock app; the remainder is opaque. Decode
-  by diffing `BB_GET_RETX_EVENT_STATUS` output on hardware under known
-  conditions.
-- **Units/meaning of `win` and the 4 thresholds** — names are known (`win`,
-  `busy`, `idle`, `conti_busy`, `conti_idle`) but not their units or the state
-  machine they feed. Trace `bb_link_retx_ctrl_cfg` in the firmware (RV32) to
-  finish this.
+- **Full 136-byte record beyond the first 5 bytes** — only the 5-byte config
+  prefix is consumed by the stock app. The same 136-byte size appears on several
+  commands (`0x01000014`, `0x01000015`, `0x02000015`, `0x02000026`), so it is a
+  shared per-user config/status record. The firmware's own builder for
+  `0x02000015` zeroes 136 bytes and then sets byte 0, a word at offset 4, and
+  bytes at offsets 13–14 (`spl.asm` @ `0x24788c`), but the full map is not
+  statically pinned. Recover it by dumping `BB_GET_RETX_EVENT_STATUS` on
+  hardware and diffing while changing `retx_win`/`retx_param`, MCS, and link
+  state (procedure in Appendix C).
+- **Exact `win`/`busy`/`idle`/`conti_*` units** — the controller is windowed and
+  tracks `enable`/`window`/`timeout`; the thresholds are windowed
+  busy/idle/consecutive counts. Exact units (frames? windows?) still need a
+  hardware A/B.
 - **`retx_count` (config) vs `retx_win`/`retx_param` (debug JSON)** — likely
   different layers (per-user max retransmissions vs the controller window).
 - Names for the remaining ~80 opcodes in the 91-entry table (only the vendor
@@ -429,3 +457,45 @@ struct bb_retx_cfg st = {0};
 bb_ioctl(dev, BB_GET_RETX_EVENT_STATUS, NULL, &st);
 /* st.win, st.busy, st.idle, st.conti_busy, st.conti_idle */
 ```
+
+## Appendix C — dumping/annotating the 136-byte retx record (hardware)
+
+The first 5 bytes are known; the rest is unmapped. To annotate it, dump and
+diff the record under controlled changes:
+
+```c
+struct bb_retx_cfg st = {0};
+if (bb_ioctl(dev, 0x01000014, NULL, &st) == 0) {
+    for (int i = 0; i < (int)sizeof(st); i += 16) {
+        fprintf(stderr, "%04x:", i);
+        for (int j = 0; j < 16; j++) fprintf(stderr, " %02x", ((uint8_t *)&st)[i + j]);
+        fprintf(stderr, "\n");
+    }
+}
+```
+
+Suggested changes to diff against:
+1. `retx_win` = 1, 10, 50, 255.
+2. `retx_param` = vendor default `{6,4,2,0}`, then `{0,0,0,0}`, then a large
+   value.
+3. Move the craft in/out of range / force reconnects to make retransmission
+   actually happen.
+4. Cross-check against the firmware's own status fields (`enable`, `window`,
+   `timeout`, `retx count`, `retx max stat`, per-peer `retx(0x%02x)`), which are
+   printed by the stock stack and should correspond to bytes in the record.
+
+This is the concrete next step for turning the opaque 131 bytes into a readable
+per-user retransmission status block.
+
+## Appendix D — firmware-side retx functions (RV32 anchors)
+
+Useful entry points if you want to keep decompiling in Ghidra (RISC-V):
+
+| Function | VA (`spl.bin`, load base `0x204000`) |
+|---|---|
+| `bb_link_retx_ctrl_cfg` (inlined; log @ `0x246ebe`) | `0x246e6c` |
+| `bb_link_retx_ctrl_feed` | `0x230cc6` |
+| `bb_link_retx_evt_stat_cfg_reset` | `0x22f74c` |
+| retx status printer (`enable`/`window`/`timeout`/`offset`) | `0x24b85c` |
+| RPC dispatcher (jump table via `sh2add` + `jr`) | `0x244c8c` |
+| descriptor table (`{op,in,out}`, 91 entries) | `0x254800` (file `0x50800`) |
