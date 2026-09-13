@@ -60,6 +60,24 @@ typedef struct {
                                         * backlogged, e.g. 0.85 -- applied instead
                                         * of (never above) the MCS-derived target */
 
+    /* Centre-priority ROI (waybeam's fpv.roiEnabled) is a last-resort
+     * measure, not a response to every backlog blip -- intended for when
+     * the link itself has already forced bitrate down near the floor and
+     * we need to squeeze what little there is toward the part of frame a
+     * pilot is actually looking at, not a routine reaction to a
+     * keyframe-sized burst at an otherwise-comfortable bitrate (which
+     * would just pay ROI's own ~1.4x overshoot risk for nothing -- see
+     * bitrate_ctl.c's own comment at the call site). Gated on *both*
+     * signals: engages only when a standing ring backlog (the same
+     * condition that drives ring_backoff above) is observed while
+     * last_applied_kbps is already below roi_max_kbps, e.g. 3000 (this
+     * project's own "below 2-4Mbit/s" call); disengages once backlog has
+     * been clear *and* last_applied_kbps has recovered back above
+     * roi_max_kbps for roi_recovery_ms, e.g. 5000 -- hysteresis against
+     * flapping on/off right at the boundary. */
+    uint32_t roi_max_kbps;
+    int roi_recovery_ms;
+
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;
 

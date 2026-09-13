@@ -427,6 +427,10 @@ int main(int argc, char **argv)
     bc_cfg.ring = ring; /* already attached above; see bitrate_ctl.h's cfg->ring comment */
     bc_cfg.ring_backlog_high_slots = 2; /* venc_frame_ring.h: >=2 is standing backlog */
     bc_cfg.ring_backoff = 0.85;
+    bc_cfg.roi_max_kbps = 3000;    /* last-resort measure: only below ~3Mbit/s (this project's own
+                                     * "2-4Mbit/s" call, middle of the range) */
+    bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
+                                     * switching it back off */
     bc_cfg.stop_flag = &g_stop;
 
     pthread_t bc_thread;
