@@ -466,13 +466,28 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
 
-    /* BB_GET_1V1_INFO (rf_1tx/gain/snr for self+peer) was tried here and
-     * pulled again -- confirmed live to SIGILL this tool on air (SDIO
-     * transport) while working fine on ground (USB transport) with the
-     * exact same request. Same class of problem as BB_GET_CHAN_INFO
-     * above: an ioctl this daemon build cannot safely be asked for on at
-     * least one side. Do not re-add without first confirming on real air
-     * hardware that it no longer crashes. */
+    /* rf_1tx (1=single-antenna TX, 0=dual/MIMO TX) directly affects PHY
+     * throughput at a given MCS index -- a link that fell back to
+     * single-TX reports a much lower throughput than one running dual-TX
+     * at the identical reported mcs+bandwidth, which is otherwise
+     * invisible in the tx/rx mcs+bandwidth+freq dump above. Also useful
+     * for spotting a real SNR/gain asymmetry between this side and the
+     * peer, not just this side's own view. Previously crashed this tool
+     * outright on air (SIGILL) -- root-caused to session_ioctl.c's
+     * io_rpc_cb() copying the daemon's reply datalen into this call's
+     * fixed-size stack buffer with no bounds check; fixed there (clamped
+     * to get_bb_ioctl_cmdoutlen()) rather than worked around here. */
+    bb_get_1v1_info_in_t info_in = { .frame_num = 0 };
+    bb_get_1v1_info_out_t info_out;
+    memset(&info_out, 0, sizeof(info_out));
+    if (bb_ioctl(g_hbb, BB_GET_1V1_INFO, &info_in, &info_out) == 0) {
+        printf("BB_GET_1V1_INFO: self{snr=%u gain=[%u,%u] tx_mcs=%u tx_chan=%u tx_power=%u tx=%s} "
+               "peer{snr=%u gain=[%u,%u] tx_mcs=%u tx_chan=%u tx_power=%u tx=%s}\n",
+               info_out.self.snr, info_out.self.gain_a, info_out.self.gain_b, info_out.self.tx_mcs,
+               info_out.self.tx_chan, info_out.self.tx_power, info_out.self.rf_1tx ? "single" : "dual",
+               info_out.peer.snr, info_out.peer.gain_a, info_out.peer.gain_b, info_out.peer.tx_mcs,
+               info_out.peer.tx_chan, info_out.peer.tx_power, info_out.peer.rf_1tx ? "single" : "dual");
+    }
 
     /* Ranging ("dist_calc" in ar8030.json -- enable/window/timeout/offset,
      * matching bb_conf_distc_t's own fields exactly) is already enabled in
