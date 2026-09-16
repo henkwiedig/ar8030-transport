@@ -28,6 +28,7 @@
 #include "bb_api.h"
 #include "bb_dev.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,17 +83,19 @@ static void usage(const char *argv0)
             "      Manually set MCS gear (raw bb_phy_mcs_e index, matching\n"
             "      'status' output's own mcs= numbers).\n"
             "\n"
-            "  power-mode auto|manual\n"
-            "      Transmit power open/closed loop mode -- 'manual' (open loop)\n"
-            "      is required before 'power' below has any effect; 'auto'\n"
-            "      (closed loop) has the chip manage its own transmit power\n"
-            "      and ignore manual writes. Chip-wide, no per-user/slot\n"
-            "      parameter (matching BB_SET_POWER_MODE's own struct, which\n"
-            "      carries none).\n"
+            "  power-mode [auto|manual]\n"
+            "      With no argument, reads back the current mode (BB_GET_POWER_MODE).\n"
+            "      With an argument, sets it: transmit power open/closed loop\n"
+            "      mode -- 'manual' (open loop) is required before 'power' below\n"
+            "      has any effect; 'auto' (closed loop) has the chip manage its\n"
+            "      own transmit power and ignore manual writes. Chip-wide, no\n"
+            "      per-user/slot parameter (matching BB_SET_POWER_MODE's own\n"
+            "      struct, which carries none).\n"
             "\n"
             "  power <dbm> [-u user] [-w seconds]\n"
             "      Manually set transmit power for one physical user, in dBm,\n"
-            "      range [0-31] per BB_SET_POWER's own doc comment.\n"
+            "      range [0-31] per BB_SET_POWER's own doc comment. Also prints\n"
+            "      the equivalent in mW (mW = 10^(dBm/10)).\n"
             "\n"
             "  force-close-socket <slot> <port>\n"
             "      Force the daemon to release one socket's session state.\n"
@@ -343,6 +346,26 @@ static const char *bb_mode_name(uint8_t mode)
     }
 }
 
+/* Naming here matches cmd_power_mode's own auto/manual mapping, not
+ * bb_phy_pwr_mode_e's literal OPENLOOP/CLOSELOOP names -- see that
+ * function's own comment on why the two are inverted. */
+static const char *pwr_mode_name(uint8_t mode)
+{
+    switch (mode) {
+    case BB_PHY_PWR_OPENLOOP:
+        return "manual (open loop)";
+    case BB_PHY_PWR_CLOSELOOP:
+        return "auto (closed loop)";
+    default:
+        return "unknown";
+    }
+}
+
+static double dbm_to_mw(uint8_t dbm)
+{
+    return pow(10.0, (double)dbm / 10.0);
+}
+
 /* cfg_sbmp/rt_sbmp are bitmasks over bb_slot_e (bit N = slot N). Printed as
  * a plain slot list instead of raw hex so "which slots actually exist"
  * doesn't require the reader to decode a bitmap by hand. */
@@ -443,11 +466,16 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
 
+    bb_get_pwr_mode_out_t pwr_mode_out;
+    memset(&pwr_mode_out, 0, sizeof(pwr_mode_out));
+    if (bb_ioctl(g_hbb, BB_GET_POWER_MODE, NULL, &pwr_mode_out) == 0)
+        printf("BB_GET_POWER_MODE: %s\n", pwr_mode_name(pwr_mode_out.pwr_mode));
+
     bb_get_cur_pwr_in_t pwr_in = { .usr = 0 };
     bb_get_cur_pwr_out_t pwr_out;
     memset(&pwr_out, 0, sizeof(pwr_out));
     if (bb_ioctl(g_hbb, BB_GET_CUR_POWER, &pwr_in, &pwr_out) == 0)
-        printf("BB_GET_CUR_POWER(usr=0): pwr=%udBm\n", pwr_out.pwr);
+        printf("BB_GET_CUR_POWER(usr=0): pwr=%udBm (%.1fmW)\n", pwr_out.pwr, dbm_to_mw(pwr_out.pwr));
 
     /* Per-port bb_socket usage for this same slot. Genuinely useful
      * beyond a nice-to-have: this session's own ar8030d-reconnect work
@@ -712,7 +740,18 @@ static int cmd_mcs(int argc, char **argv)
 
 static int cmd_power_mode(int argc, char **argv)
 {
-    if (argc < 2 || (strcmp(argv[1], "auto") && strcmp(argv[1], "manual"))) {
+    if (argc < 2) {
+        bb_get_pwr_mode_out_t m;
+        memset(&m, 0, sizeof(m));
+        int ret = bb_ioctl(g_hbb, BB_GET_POWER_MODE, NULL, &m);
+        if (ret) {
+            fprintf(stderr, "linkctl: BB_GET_POWER_MODE failed, ret=%d\n", ret);
+            return 1;
+        }
+        printf("%s\n", pwr_mode_name(m.pwr_mode));
+        return 0;
+    }
+    if (strcmp(argv[1], "auto") && strcmp(argv[1], "manual")) {
         fprintf(stderr, "linkctl: power-mode needs 'auto' or 'manual'\n");
         return 1;
     }
@@ -760,7 +799,7 @@ static int cmd_power(int argc, char **argv)
 
     bb_set_pwr_in_t sp = { .usr = (uint8_t)user, .pwr = (uint8_t)dbm };
     int ret = bb_ioctl(g_hbb, BB_SET_POWER, &sp, NULL);
-    printf("BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d\n", user, dbm, ret);
+    printf("BB_SET_POWER(usr=%d, pwr=%ddBm / %.1fmW) ret=%d\n", user, dbm, dbm_to_mw((uint8_t)dbm), ret);
     return ret ? 1 : 0;
 }
 
