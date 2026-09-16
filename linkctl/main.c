@@ -466,6 +466,29 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
 
+    /* Ranging ("dist_calc" in ar8030.json -- enable/window/timeout/offset,
+     * matching bb_conf_distc_t's own fields exactly) is already enabled in
+     * this project's own config, so this just reads back whatever it's
+     * already producing rather than needing to turn anything on first.
+     * Raw units: the SDK's own doc comment gives no calibrated unit (just
+     * "-1 = no ranging result, >= 0 = ranging result"), so this prints the
+     * raw value rather than fabricate a meters conversion with no source
+     * for the scale factor. Read for every configured slot, same cfg_sbmp
+     * filter as the link_status loop above. */
+    bb_get_distc_result_in_t dist_in = { .slot_bmp = st_out.cfg_sbmp };
+    bb_get_distc_result_out_t dist_out;
+    memset(&dist_out, 0, sizeof(dist_out));
+    if (bb_ioctl(g_hbb, BB_GET_DISTC_RESULT, &dist_in, &dist_out) == 0) {
+        for (int s = 0; s < BB_SLOT_MAX; s++) {
+            if (!(st_out.cfg_sbmp & (1u << s)))
+                continue;
+            if (dist_out.distance[s] < 0)
+                printf("BB_GET_DISTC_RESULT(slot=%d): no ranging result\n", s);
+            else
+                printf("BB_GET_DISTC_RESULT(slot=%d): distance=%d (raw units)\n", s, dist_out.distance[s]);
+        }
+    }
+
     bb_get_pwr_mode_out_t pwr_mode_out;
     memset(&pwr_mode_out, 0, sizeof(pwr_mode_out));
     if (bb_ioctl(g_hbb, BB_GET_POWER_MODE, NULL, &pwr_mode_out) == 0)
