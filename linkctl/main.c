@@ -82,6 +82,18 @@ static void usage(const char *argv0)
             "      Manually set MCS gear (raw bb_phy_mcs_e index, matching\n"
             "      'status' output's own mcs= numbers).\n"
             "\n"
+            "  power-mode auto|manual\n"
+            "      Transmit power open/closed loop mode -- 'manual' (open loop)\n"
+            "      is required before 'power' below has any effect; 'auto'\n"
+            "      (closed loop) has the chip manage its own transmit power\n"
+            "      and ignore manual writes. Chip-wide, no per-user/slot\n"
+            "      parameter (matching BB_SET_POWER_MODE's own struct, which\n"
+            "      carries none).\n"
+            "\n"
+            "  power <dbm> [-u user] [-w seconds]\n"
+            "      Manually set transmit power for one physical user, in dBm,\n"
+            "      range [0-31] per BB_SET_POWER's own doc comment.\n"
+            "\n"
             "  force-close-socket <slot> <port>\n"
             "      Force the daemon to release one socket's session state.\n"
             "      For recovering a port stuck reporting \"already opened\"/\n"
@@ -431,6 +443,12 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
 
+    bb_get_cur_pwr_in_t pwr_in = { .usr = 0 };
+    bb_get_cur_pwr_out_t pwr_out;
+    memset(&pwr_out, 0, sizeof(pwr_out));
+    if (bb_ioctl(g_hbb, BB_GET_CUR_POWER, &pwr_in, &pwr_out) == 0)
+        printf("BB_GET_CUR_POWER(usr=0): pwr=%udBm\n", pwr_out.pwr);
+
     /* Per-port bb_socket usage for this same slot. Genuinely useful
      * beyond a nice-to-have: this session's own ar8030d-reconnect work
      * hit a real, live "port stuck reporting already opened" failure
@@ -692,6 +710,60 @@ static int cmd_mcs(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_power_mode(int argc, char **argv)
+{
+    if (argc < 2 || (strcmp(argv[1], "auto") && strcmp(argv[1], "manual"))) {
+        fprintf(stderr, "linkctl: power-mode needs 'auto' or 'manual'\n");
+        return 1;
+    }
+    /* Naming is inverted from mcs-mode/channel-mode's own auto=0/manual=1
+     * convention -- bb_phy_pwr_mode_e itself defines OPENLOOP=0 (manual: a
+     * fixed value from BB_SET_POWER) and CLOSELOOP=1 (auto: the chip's own
+     * feedback loop manages it) -- so map explicitly rather than reusing
+     * those other commands' !strcmp(...,"auto") pattern verbatim. */
+    bb_set_pwr_mode_in_t m = { .pwr_mode = (uint8_t)(!strcmp(argv[1], "auto") ? BB_PHY_PWR_CLOSELOOP
+                                                                               : BB_PHY_PWR_OPENLOOP) };
+    int ret = bb_ioctl(g_hbb, BB_SET_POWER_MODE, &m, NULL);
+    printf("BB_SET_POWER_MODE(pwr_mode=%u) ret=%d\n", m.pwr_mode, ret);
+    return ret ? 1 : 0;
+}
+
+static int cmd_power(int argc, char **argv)
+{
+    int user = 0, wait_s = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "u:w:");
+    while ((opt = getopt(argc, argv, "u:w:")) != -1) {
+        switch (opt) {
+        case 'u':
+            user = atoi(optarg);
+            break;
+        case 'w':
+            wait_s = atoi(optarg);
+            break;
+        default:
+            return 1;
+        }
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "linkctl: power needs a dBm value (0-31)\n");
+        return 1;
+    }
+    int dbm = atoi(argv[optind]);
+    if (dbm < 0 || dbm > 31) {
+        fprintf(stderr, "linkctl: power must be 0-31 dBm, got %d\n", dbm);
+        return 1;
+    }
+    if (wait_s > 0 && wait_for_connect(0, wait_s) != 0) {
+        fprintf(stderr, "linkctl: link not CONNECT after %ds, applying anyway\n", wait_s);
+    }
+
+    bb_set_pwr_in_t sp = { .usr = (uint8_t)user, .pwr = (uint8_t)dbm };
+    int ret = bb_ioctl(g_hbb, BB_SET_POWER, &sp, NULL);
+    printf("BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d\n", user, dbm, ret);
+    return ret ? 1 : 0;
+}
+
 static int cmd_force_close_socket(int argc, char **argv)
 {
     if (argc < 3) {
@@ -784,6 +856,10 @@ int main(int argc, char **argv)
         rc = cmd_mcs_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs"))
         rc = cmd_mcs(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "power-mode"))
+        rc = cmd_power_mode(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "power"))
+        rc = cmd_power(argc - 1, argv + 1);
     else if (!strcmp(cmd, "freq"))
         rc = cmd_freq(argc - 1, argv + 1);
     else if (!strcmp(cmd, "force-close-socket"))
