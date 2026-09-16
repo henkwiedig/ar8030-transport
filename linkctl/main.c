@@ -466,6 +466,14 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0)
         printf("BB_GET_MCS(dir=tx,slot=%d): mcs=%u throughput=%u kbps\n", slot, mcs_out.mcs, mcs_out.throughput);
 
+    /* BB_GET_1V1_INFO (rf_1tx/gain/snr for self+peer) was tried here and
+     * pulled again -- confirmed live to SIGILL this tool on air (SDIO
+     * transport) while working fine on ground (USB transport) with the
+     * exact same request. Same class of problem as BB_GET_CHAN_INFO
+     * above: an ioctl this daemon build cannot safely be asked for on at
+     * least one side. Do not re-add without first confirming on real air
+     * hardware that it no longer crashes. */
+
     /* Ranging ("dist_calc" in ar8030.json -- enable/window/timeout/offset,
      * matching bb_conf_distc_t's own fields exactly) is already enabled in
      * this project's own config, so this just reads back whatever it's
