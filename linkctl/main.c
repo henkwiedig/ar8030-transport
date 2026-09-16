@@ -83,6 +83,27 @@ static void usage(const char *argv0)
             "      Manually set MCS gear (raw bb_phy_mcs_e index, matching\n"
             "      'status' output's own mcs= numbers).\n"
             "\n"
+            "  mcs-range <min> <max> [-s slot]\n"
+            "      BB_SET_MCS_RANGE -- constrains which MCS levels are usable.\n"
+            "      Pass the literal word 'max' for either value to mean\n"
+            "      BB_PHY_MCS_MAX (\"no limit\"), per that field's own doc comment.\n"
+            "\n"
+            "  mcs-table <0|1|2> [mcs]\n"
+            "      With [mcs], pushes only that one entry (to retry/isolate a\n"
+            "      single failure from a full run) instead of all 7.\n"
+            "      Push a whole MCS policy table (7 entries covering mcs 1,2,5,\n"
+            "      7,8,10,12) via BB_SET_MCS_ITEM, all on slot 0. Reverse-\n"
+            "      engineered from stock's ar_ldy_gnd binary (Ghidra): its own\n"
+            "      \"reload mcs tab %%d\" routine is driven by fpv_config.json's\n"
+            "      \"video_strategy\" setting, and 0/1 select one table while 2\n"
+            "      selects a second, distinct one (different SNR thresholds and\n"
+            "      LDPC error-count gates per entry -- see linkctl/main.c's own\n"
+            "      mcs_tables[] for the exact transcribed values). BB_SET_MCS_ITEM\n"
+            "      does not exist in this SDK build's own header/dispatch table at\n"
+            "      all -- added here (bb_api.h/ioctl_tab.c) from the same decompile,\n"
+            "      cross-checked against bb_mcs_para_t's own field set. No -w/-s:\n"
+            "      always slot 0, matching every observed call site.\n"
+            "\n"
             "  power-mode [auto|manual]\n"
             "      With no argument, reads back the current mode (BB_GET_POWER_MODE).\n"
             "      With an argument, sets it: transmit power open/closed loop\n"
@@ -784,6 +805,124 @@ static int cmd_mcs(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int parse_mcs_or_max(const char *s)
+{
+    if (!strcmp(s, "max")) {
+        return BB_PHY_MCS_MAX;
+    }
+    return atoi(s);
+}
+
+static int cmd_mcs_range(int argc, char **argv)
+{
+    int slot = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "s:");
+    while ((opt = getopt(argc, argv, "s:")) != -1) {
+        if (opt == 's') {
+            slot = atoi(optarg);
+        } else {
+            return 1;
+        }
+    }
+    if (optind + 1 >= argc) {
+        fprintf(stderr, "linkctl: mcs-range needs <min> <max>\n");
+        return 1;
+    }
+    int mcs_min = parse_mcs_or_max(argv[optind]);
+    int mcs_max = parse_mcs_or_max(argv[optind + 1]);
+
+    bb_set_mcs_range_in_t mr = { .slot = (uint8_t)slot, .mcs_min = (uint8_t)mcs_min, .mcs_max = (uint8_t)mcs_max };
+    int ret = bb_ioctl(g_hbb, BB_SET_MCS_RANGE, &mr, NULL);
+    printf("BB_SET_MCS_RANGE(slot=%d, mcs_min=%d, mcs_max=%d) ret=%d\n", slot, mcs_min, mcs_max, ret);
+    return ret ? 1 : 0;
+}
+
+/* Transcribed byte-for-byte from Ghidra's decompile of stock ar_ldy_gnd's
+ * mcs-table-reload routine (FUN_001a1c68 in that binary) -- param_1==0
+ * and ==1 both hit the same branch (table index 0 below); ==2 hits a
+ * second, distinct branch (table index 1 below). Field order here
+ * matches bb_set_mcs_item_t exactly (mcs, ldpc_up_num, snr_up, snr_dw,
+ * ldpc_dw_num, up_keep_time, dw_keep_time) -- NOT bb_mcs_para_t's own
+ * declared order, which this wire struct does not reuse. */
+struct mcs_table_entry {
+    uint8_t  mcs;
+    uint8_t  ldpc_up_num;
+    uint16_t snr_up;
+    uint16_t snr_dw;
+    uint8_t  ldpc_dw_num;
+    uint16_t up_keep_time;
+    uint16_t dw_keep_time;
+};
+
+static const struct mcs_table_entry mcs_tables[2][7] = {
+    /* [0]: stock's "else" branch (video_strategy 0 or 1) */
+    {
+        { 1, 2, 0x24, 0x1d, 4, 1000, 15 },
+        { 2, 2, 0x5c, 0x41, 4, 0x5dc, 15 },
+        { 5, 2, 0xa8, 0x77, 4, 0x5dc, 15 },
+        { 7, 2, 0x12f, 0xf1, 4, 800, 15 },
+        { 8, 2, 0x256, 0x1db, 3, 800, 15 },
+        { 10, 2, 0x4a8, 0x3b3, 4, 1000, 12 },
+        { 12, 2, 0x736, 0x5ba, 2, 1000, 1 },
+    },
+    /* [1]: stock's video_strategy==2 branch */
+    {
+        { 1, 3, 0x24, 0x1d, 5, 1000, 0 },
+        { 2, 4, 0x41, 0x34, 6, 0x5dc, 100 },
+        { 5, 3, 0x72, 0x5a, 5, 0x5dc, 100 },
+        { 7, 3, 300, 0xd6, 5, 700, 0x19 },
+        { 8, 3, 0x214, 0x1a6, 5, 800, 15 },
+        { 10, 3, 0x426, 0x34b, 5, 1000, 0 },
+        { 12, 3, 0x736, 0x5bb, 5, 1000, 0 },
+    },
+};
+
+static int cmd_mcs_table(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "linkctl: mcs-table needs a value (0, 1, or 2)\n");
+        return 1;
+    }
+    int variant = atoi(argv[1]);
+    if (variant < 0 || variant > 2) {
+        fprintf(stderr, "linkctl: mcs-table must be 0, 1, or 2\n");
+        return 1;
+    }
+    const struct mcs_table_entry *table = mcs_tables[variant == 2 ? 1 : 0];
+
+    /* Optional 3rd arg: push only the single entry matching this mcs
+     * value, instead of all 7 -- for retrying/isolating one that failed
+     * in a full run. */
+    int only_mcs = argc >= 3 ? atoi(argv[2]) : -1;
+
+    int fail = 0;
+    for (int i = 0; i < 7; i++) {
+        if (only_mcs >= 0 && table[i].mcs != only_mcs) {
+            continue;
+        }
+        bb_set_mcs_item_t item;
+        memset(&item, 0, sizeof(item));
+        item.mcs           = table[i].mcs;
+        item.ldpc_up_num   = table[i].ldpc_up_num;
+        item.snr_up        = table[i].snr_up;
+        item.snr_dw        = table[i].snr_dw;
+        item.ldpc_dw_num   = table[i].ldpc_dw_num;
+        item.up_keep_time  = table[i].up_keep_time;
+        item.dw_keep_time  = table[i].dw_keep_time;
+
+        int ret = bb_ioctl(g_hbb, BB_SET_MCS_ITEM, &item, NULL);
+        printf("BB_SET_MCS_ITEM(mcs=%u snr_up=%u snr_dw=%u ldpc_up=%u ldpc_dw=%u "
+               "up_keep=%ums dw_keep=%ums) ret=%d\n",
+               item.mcs, item.snr_up, item.snr_dw, item.ldpc_up_num, item.ldpc_dw_num,
+               item.up_keep_time, item.dw_keep_time, ret);
+        if (ret) {
+            fail = 1;
+        }
+    }
+    return fail;
+}
+
 static int cmd_power_mode(int argc, char **argv)
 {
     if (argc < 2) {
@@ -941,6 +1080,10 @@ int main(int argc, char **argv)
         rc = cmd_mcs_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs"))
         rc = cmd_mcs(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "mcs-range"))
+        rc = cmd_mcs_range(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "mcs-table"))
+        rc = cmd_mcs_table(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power-mode"))
         rc = cmd_power_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power"))
