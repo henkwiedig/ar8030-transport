@@ -1599,6 +1599,59 @@ component too, separate from anything fixable in this codebase.
 `ar8030d` stdout-redirection warning in "Build and test" above -- hit
 live during this same round of testing.
 
+## `ar8030-lifecycled`: link supervisor + bind button
+
+`lifecycled/` builds `ar8030-lifecycled`, a separate process (not a
+thread inside `ar8030d` -- see `lifecycled/main.c`'s own header comment
+for why) that owns the AR8030 chip's whole lifecycle from outside: an
+initial hardware reset, following the daemon's `BB_EVENT_LINK_STATE`
+events (plus a `BB_GET_STATUS` fallback poll) to notice a real
+connect/drop, re-applying persisted bandwidth tuning, and running
+`hooks.d/<event>/*` scripts (`connected`/`dropped`/`idle`/`pairing`) on
+each real transition -- a board's own overlay drops executable scripts
+under a configured `--hook-dir` to react to any of these (LED state,
+bringing a TUN interface up/down, starting/stopping a video bridge)
+without this binary needing to know anything about what a given board
+actually wants to do.
+
+Built and installed on both sides exactly like `ar8030-linkctl` is (see
+"Build" above and each Buildroot package's own `.mk`) -- against the
+`ar8030` package's staged `libar8030_client.so`/headers, not inside the
+vendor SDK's own CMake tree. It moved here from
+`builder/package/ar8030`'s own patch stack (and
+`sbc-groundstations/package/ar8030`'s byte-identical duplicate of it)
+because it is entirely original code with no vendor lineage -- this is
+its actual home now, the same reasoning `kmod/artosyn_drv.c`'s own
+"Clean-room rewrite" section above already explains for the kernel side.
+
+**It never triggers a pairing dispatch itself.** `lifecycle.c`'s own
+comments cover this in detail: Ghidra decompiles of the stock
+`ar_ldy_gnd`/`ar_ldyhs_sky` streamers found their reconnect path never
+calls the pairing-dispatch ioctl either -- an already-paired chip's RTOS
+firmware reconnects to its configured candidate entirely on its own; the
+dispatch call is exclusively the vendor GUI's bind-button handler's job.
+An earlier version of this code did trigger pairing itself on every drop
+of an already-paired link and that caused a real, reproducible flapping
+bug (connect-then-drop-within-a-second), root-caused to exactly this
+mismatch with stock behavior.
+
+**`--bind-gpio <n>`** is the one thing this binary *does* initiate:
+watching a board's physical bind button directly (`lifecycle_bind.c`),
+running the SDK's own `ar8030-pair` binary (`dev_helper/bb_pair`,
+`package/ar8030` -- not reimplemented here) on a debounced press, and
+driving `hooks.d/pairing`/`connected`/`idle` directly from its result.
+This used to be a separate shell script with no shared state with this
+daemon, which caused its own bug: a rebind to an already-connected peer
+produced no observable transition in `lifecycle_thread_main`'s state
+machine (it only fires `connected` on the `IDLE -> CONNECTED`
+transition, never merely because a link is still up), so nothing ever
+told the script's LED loop to stop. Moving the button into this process
+fixes that at the root -- the button's own success/failure path drives
+the hooks it needs directly instead of hoping the reconnect-follower
+thread notices. Omit `--bind-gpio` (the default) on a board with no
+physical bind button; nothing about the reconnect-following/tuning/hook
+machinery above depends on it.
+
 ## Phase 2 (explicitly out of scope here)
 
 - **FEC.** `ar8030_chunk_hdr.reserved` is the only field reserved for

@@ -8,6 +8,9 @@
 linkctl/ar8030-linkctl
 linkctl/ar8030-linkctl-rx
 linkctl/ar8030-linkctl-tx
+lifecycled/ar8030-lifecycled
+lifecycled/ar8030-lifecycled-rx
+lifecycled/ar8030-lifecycled-tx
 
 # kmod/: out-of-tree kbuild leaves a lot more than *.o behind (the vendor
 # .mod.c is generated too, not source -- see kmod/Makefile's own header

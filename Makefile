@@ -67,9 +67,9 @@ TX_MAKE_VARS := $(if $(TX_CC),CC=$(TX_CC)) $(if $(TX_SDK_INC),AR8030_SDK_INC=$(T
 RX_MAKE_VARS := $(if $(RX_CC),CC=$(RX_CC)) $(if $(RX_SDK_INC),AR8030_SDK_INC=$(RX_SDK_INC)) \
 	$(if $(RX_SDK_LIB),AR8030_SDK_LIB=$(RX_SDK_LIB))
 
-.PHONY: all tx rx linkctl linkctl-tx linkctl-rx test check clean print-config
+.PHONY: all tx rx linkctl linkctl-tx linkctl-rx lifecycled lifecycled-tx lifecycled-rx test check clean print-config
 
-all: tx rx linkctl
+all: tx rx linkctl lifecycled
 
 tx:
 	@echo "== tx: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
@@ -96,6 +96,24 @@ linkctl-rx:
 	@echo "== linkctl-rx: CC=$(if $(RX_CC),$(RX_CC),<default: host gcc -- see 'make print-config'>)"
 	$(MAKE) -C linkctl $(RX_MAKE_VARS) BUILD_DIR=build-rx TARGET=ar8030-linkctl-rx
 
+# ar8030-lifecycled (see lifecycled/main.c) -- needed on both sides for
+# the same reason linkctl is (reconnect-following, tuning, hook dispatch
+# are useful air- and ground-side), built the same doubled way and for
+# the same reason (two arches' objects/binaries must not collide in one
+# source tree). Moved here from builder/package/ar8030's own patch stack
+# (and sbc-groundstations/package/ar8030's identical duplicate of it) --
+# entirely original code with no vendor lineage, so this is its actual
+# home now, same as tx/rx/linkctl.
+lifecycled: lifecycled-tx lifecycled-rx
+
+lifecycled-tx:
+	@echo "== lifecycled-tx: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
+	$(MAKE) -C lifecycled $(TX_MAKE_VARS) BUILD_DIR=build-tx TARGET=ar8030-lifecycled-tx
+
+lifecycled-rx:
+	@echo "== lifecycled-rx: CC=$(if $(RX_CC),$(RX_CC),<default: host gcc -- see 'make print-config'>)"
+	$(MAKE) -C lifecycled $(RX_MAKE_VARS) BUILD_DIR=build-rx TARGET=ar8030-lifecycled-rx
+
 # Host-only protocol round-trip test -- no cross toolchain or AR8030 SDK
 # involved, see test/roundtrip_test.c.
 test check:
@@ -106,6 +124,8 @@ clean:
 	$(MAKE) -C rx clean
 	$(MAKE) -C linkctl clean BUILD_DIR=build-tx TARGET=ar8030-linkctl-tx
 	$(MAKE) -C linkctl clean BUILD_DIR=build-rx TARGET=ar8030-linkctl-rx
+	$(MAKE) -C lifecycled clean BUILD_DIR=build-tx TARGET=ar8030-lifecycled-tx
+	$(MAKE) -C lifecycled clean BUILD_DIR=build-rx TARGET=ar8030-lifecycled-rx
 	$(MAKE) -C test clean
 
 print-config:
