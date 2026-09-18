@@ -29,6 +29,11 @@ static int mhz_to_bw_enum(int mhz)
     return -1;
 }
 
+int lc_tuning_valid_mhz(int mhz)
+{
+    return mhz_to_bw_enum(mhz) >= 0;
+}
+
 static void tuning_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
 {
     const char* slash = strrchr(cfg_path, '/');

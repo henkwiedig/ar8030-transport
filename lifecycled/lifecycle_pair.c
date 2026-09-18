@@ -1,10 +1,13 @@
 #include "lifecycle_pair.h"
 #include "lc_log.h"
+#include "lifecycle_hooks.h"
 #include <cjson/cJSON.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 /*
@@ -292,4 +295,118 @@ int lc_pair_apply_known_candidate(bb_dev_handle_t* handle, const char* cfg_path,
 
     cJSON_Delete(root);
     return ret;
+}
+
+/* Direct fork+pipe+execlp, no shell -- matches lc_hooks_dispatch's own
+ * no-shell convention. Captures ar8030-pair's stdout+stderr (2>&1) into
+ * buf. Returns its exit code, or -1 on a fork/pipe/wait failure. Moved
+ * here from lifecycle_bind.c unchanged (byte-for-byte) when lc_pair_run()
+ * was factored out to be callable from the HTTP control API too, not
+ * just the physical bind button. */
+static int run_pair_tool(const char* cfg_path, char* buf, size_t buf_sz)
+{
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+        execlp("ar8030-pair", "ar8030-pair", "-c", cfg_path, (char*)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+    size_t  total = 0;
+    ssize_t n;
+    while (total + 1 < buf_sz && (n = read(pipefd[0], buf + total, buf_sz - 1 - total)) > 0) {
+        total += (size_t)n;
+    }
+    buf[total] = 0;
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status)) {
+        return -1;
+    }
+    return WEXITSTATUS(status);
+}
+
+/* Parses "pair: peer <8 hex chars> connected on slot <N>" out of
+ * ar8030-pair's own captured stdout (dev_helper/bb_pair/txg_bb_pair.cpp's
+ * own log line, confirmed live against real device output) into a slot +
+ * 4-byte bb_mac_t (BB_MAC_LEN -- this chip's MAC is not a real 6-byte
+ * Ethernet address). Returns 0 on a match, -1 otherwise (caller falls
+ * back to slot=-1 and an unset mac, matching lc_hooks_dispatch's own
+ * NULL-mac convention). Moved here from lifecycle_bind.c along with
+ * run_pair_tool() above -- see lc_pair_run()'s own comment. */
+static int parse_pair_output(const char* buf, int* out_slot, bb_mac_t* out_mac)
+{
+    const char* p = strstr(buf, "pair: peer ");
+    if (!p) {
+        return -1;
+    }
+    p += strlen("pair: peer ");
+
+    char hex[9] = {0};
+    int  slot   = -1;
+    if (sscanf(p, "%8[0-9a-fA-F] connected on slot %d", hex, &slot) != 2 || strlen(hex) != 8) {
+        return -1;
+    }
+
+    memset(out_mac, 0, sizeof(*out_mac));
+    for (int i = 0; i < BB_MAC_LEN && i < 4; i++) {
+        unsigned int byte = 0;
+        sscanf(hex + i * 2, "%2x", &byte);
+        out_mac->addr[i] = (uint8_t)byte;
+    }
+    *out_slot = slot;
+    return 0;
+}
+
+int lc_pair_run(const lc_config_t* cfg, int* out_slot, bb_mac_t* out_mac)
+{
+    lc_hooks_dispatch(cfg->hook_dir, "pairing", cfg->role, -1, NULL);
+
+    char out[1024];
+    int  rc = run_pair_tool(cfg->cfg_path, out, sizeof(out));
+    lc_log("lifecycle: pair: ar8030-pair exited %d, output: %s", rc, out);
+
+    int      slot = -1;
+    bb_mac_t mac;
+    memset(&mac, 0, sizeof(mac));
+
+    if (rc == 0) {
+        if (parse_pair_output(out, &slot, &mac) == 0) {
+            lc_log("lifecycle: pair: pair succeeded (slot=%d), driving connected hooks directly", slot);
+            lc_hooks_dispatch(cfg->hook_dir, "connected", cfg->role, slot, &mac);
+        } else {
+            lc_log("lifecycle: pair: pair succeeded but couldn't parse its output, driving connected hooks with slot/mac unknown");
+            lc_hooks_dispatch(cfg->hook_dir, "connected", cfg->role, -1, NULL);
+        }
+    } else {
+        lc_log("lifecycle: pair: pair failed (rc=%d), leaving current link alone", rc);
+        /* Matches lifecycle_bind.c's own former reasoning for firing this:
+         * without it, a failed re-pair attempt would leave a board's own
+         * hooks.d LED state stuck on whatever "pairing" already set above. */
+        lc_hooks_dispatch(cfg->hook_dir, "idle", cfg->role, -1, NULL);
+    }
+
+    if (out_slot) {
+        *out_slot = slot;
+    }
+    if (out_mac) {
+        *out_mac = mac;
+    }
+    return rc == 0 ? 0 : -1;
 }

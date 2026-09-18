@@ -38,6 +38,7 @@ SRCS := \
 	lifecycle_client.c \
 	lifecycle_gpio.c \
 	lifecycle_hooks.c \
+	lifecycle_http.c \
 	lifecycle_pair.c \
 	lifecycle_tuning.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(SRCS:.c=.o)))

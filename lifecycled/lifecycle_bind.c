@@ -1,13 +1,8 @@
 #include "lifecycle_bind.h"
-#include "bb_api.h"
 #include "lc_log.h"
 #include "lifecycle_gpio.h"
-#include "lifecycle_hooks.h"
-#include <stdint.h>
-#include <stdio.h>
+#include "lifecycle_pair.h"
 #include <stdlib.h>
-#include <string.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 /*
@@ -38,6 +33,10 @@
  * (hook dispatch), not the handshake protocol itself. See
  * lifecycle_pair.c's own header comment for why a from-scratch
  * reimplementation of that dispatch was tried once already and removed.
+ * The actual fork+exec+hook-dispatch sequence now lives in
+ * lifecycle_pair.c's lc_pair_run(), factored out from this file so the
+ * HTTP control API's own "pair now" endpoint can trigger the identical
+ * sequence -- this file just owns deciding *when* (button press).
  *
  * Deliberately a second thread inside this process, not a third: unlike
  * the documented reason ar8030-lifecycled itself is a separate process
@@ -81,80 +80,6 @@ static int read_button(int gpio)
     return val;
 }
 
-/* Direct fork+pipe+execlp, no shell -- matches lc_hooks_dispatch's own
- * no-shell convention. Captures ar8030-pair's stdout+stderr (2>&1,
- * matching the shell script this replaces) into buf. Returns its exit
- * code, or -1 on a fork/pipe/wait failure. */
-static int run_pair_tool(const char* cfg_path, char* buf, size_t buf_sz)
-{
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        return -1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-        execlp("ar8030-pair", "ar8030-pair", "-c", cfg_path, (char*)NULL);
-        _exit(127);
-    }
-
-    close(pipefd[1]);
-    size_t  total = 0;
-    ssize_t n;
-    while (total + 1 < buf_sz && (n = read(pipefd[0], buf + total, buf_sz - 1 - total)) > 0) {
-        total += (size_t)n;
-    }
-    buf[total] = 0;
-    close(pipefd[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    if (!WIFEXITED(status)) {
-        return -1;
-    }
-    return WEXITSTATUS(status);
-}
-
-/* Parses "pair: peer <8 hex chars> connected on slot <N>" out of
- * ar8030-pair's own captured stdout (dev_helper/bb_pair/txg_bb_pair.cpp's
- * own log line, confirmed live against real device output while
- * debugging this move) into a slot + 4-byte bb_mac_t (BB_MAC_LEN -- this
- * chip's MAC is not a real 6-byte Ethernet address). Returns 0 on a
- * match, -1 otherwise (caller falls back to slot=-1 and an unset mac,
- * matching lc_hooks_dispatch's own NULL-mac convention). */
-static int parse_pair_output(const char* buf, int* out_slot, bb_mac_t* out_mac)
-{
-    const char* p = strstr(buf, "pair: peer ");
-    if (!p) {
-        return -1;
-    }
-    p += strlen("pair: peer ");
-
-    char hex[9] = {0};
-    int  slot   = -1;
-    if (sscanf(p, "%8[0-9a-fA-F] connected on slot %d", hex, &slot) != 2 || strlen(hex) != 8) {
-        return -1;
-    }
-
-    memset(out_mac, 0, sizeof(*out_mac));
-    for (int i = 0; i < BB_MAC_LEN && i < 4; i++) {
-        unsigned int byte = 0;
-        sscanf(hex + i * 2, "%2x", &byte);
-        out_mac->addr[i] = (uint8_t)byte;
-    }
-    *out_slot = slot;
-    return 0;
-}
-
 void* lifecycle_bind_thread_main(void* arg)
 {
     lifecycle_bind_ctx* ctx  = (lifecycle_bind_ctx*)arg;
@@ -184,39 +109,9 @@ void* lifecycle_bind_thread_main(void* arg)
         }
 
         lc_log("lifecycle: bind: button released, pairing");
-        lc_hooks_dispatch(ctx->cfg.hook_dir, "pairing", ctx->cfg.role, -1, NULL);
-
-        char out[1024];
-        int  rc = run_pair_tool(ctx->cfg.cfg_path, out, sizeof(out));
-        lc_log("lifecycle: bind: ar8030-pair exited %d, output: %s", rc, out);
-
-        if (rc == 0) {
-            int      slot = -1;
-            bb_mac_t mac;
-            memset(&mac, 0, sizeof(mac));
-            if (parse_pair_output(out, &slot, &mac) == 0) {
-                lc_log("lifecycle: bind: pair succeeded (slot=%d), driving connected hooks directly", slot);
-                lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, slot, &mac);
-            } else {
-                lc_log("lifecycle: bind: pair succeeded but couldn't parse its output, driving connected hooks with slot/mac unknown");
-                lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, -1, NULL);
-            }
-        } else {
-            lc_log("lifecycle: bind: pair failed (rc=%d), leaving current link alone", rc);
-            /* Nothing else resets the LED after a failed attempt --
-             * lifecycle_thread_main's own "idle" hook only ever fires
-             * once per process lifetime (its own idle_hook_fired latch),
-             * so without this the board would be stuck on the fast
-             * "binding mode" blink despite not actually binding anything
-             * any more. hooks.d/idle/ itself decides red-vs-slow-blink
-             * from the ".paired" marker file, so this correctly falls
-             * back to "searching" rather than "never bound" when
-             * re-binding an already-paired unit fails -- and if the old
-             * link is actually still up, lifecycle_thread_main's own
-             * "connected" hook corrects the LED again within a few
-             * seconds regardless. */
-            lc_hooks_dispatch(ctx->cfg.hook_dir, "idle", ctx->cfg.role, -1, NULL);
-        }
+        int slot = -1;
+        int rc   = lc_pair_run(&ctx->cfg, &slot, NULL);
+        lc_log("lifecycle: bind: pair %s (slot=%d)", rc == 0 ? "succeeded" : "failed", slot);
 
         /* Ignore further presses for a bit rather than re-triggering on
          * any residual bounce right after we already acted. */

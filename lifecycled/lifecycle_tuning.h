@@ -23,6 +23,13 @@ extern "C" {
  * to take on without dedicated hardware time.
  */
 
+/* Non-zero if mhz is one of the AR8030's actual bandwidth gears
+ * (1/2/5/10/20/40 -- see BW_MHZ_BY_ENUM). Exported so callers outside
+ * this file (the HTTP control API) can reject a bad value up front with
+ * a clear 400 instead of letting it fail silently deeper in
+ * lc_tuning_apply()/lc_tuning_save(). */
+int lc_tuning_valid_mhz(int mhz);
+
 /* Reads the persisted bandwidth (MHz: 1/2/5/10/20/40) from the sidecar
  * file next to cfg_path (same directory, fixed name "ar8030.tuning").
  * Returns the bandwidth in MHz on success, -1 if no sidecar exists yet

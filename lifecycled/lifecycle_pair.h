@@ -40,6 +40,27 @@ int lc_pair_has_been_paired(const char* cfg_path);
  * persisted yet or on error -- both non-fatal to the caller. */
 int lc_pair_apply_known_candidate(bb_dev_handle_t* handle, const char* cfg_path, lc_role_e role);
 
+/* Runs the SDK's own ar8030-pair binary (dev_helper/bb_pair) for the
+ * actual pairing handshake and drives hooks.d/{pairing,connected,idle}
+ * from its result -- the exact sequence the physical bind button
+ * (lifecycle_bind.c) already runs, factored out here so the HTTP control
+ * API's own "pair now" endpoint can trigger the identical sequence.
+ * NOT the same thing as the old, removed lc_pair_trigger() this file's
+ * own header comment mentions (a from-scratch BB_SET_PRJ_DISPATCH
+ * reimplementation) -- named lc_pair_run() specifically to avoid being
+ * confused with that; this one still just shells out to ar8030-pair like
+ * lifecycle_bind.c always has.
+ *
+ * Blocks until ar8030-pair exits (bounded by its own handshake timeout).
+ * out_slot/out_mac (either may be NULL) receive the connected slot/peer
+ * MAC on success, unset (-1 / zeroed) otherwise. Safe to call
+ * concurrently with the bind-button thread and from multiple HTTP
+ * requests at once -- see lifecycle_bind.c's own header comment on why
+ * concurrent hook dispatch/ar8030-pair invocation is already a supported
+ * pattern (fork-per-call, no shared mutable state). Returns 0 if
+ * ar8030-pair exited successfully, -1 otherwise. */
+int lc_pair_run(const lc_config_t* cfg, int* out_slot, bb_mac_t* out_mac);
+
 #ifdef __cplusplus
 }
 #endif

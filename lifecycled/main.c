@@ -32,6 +32,7 @@
 #include "lifecycle.h"
 #include "lifecycle_bind.h"
 #include "lifecycle_client.h"
+#include "lifecycle_http.h"
 #include <getopt.h>
 #include <pthread.h>
 #include <signal.h>
@@ -55,6 +56,11 @@ static void print_help(const char* argv0)
     printf("  --default-channel <n>     fallback channel if no tuning state yet (default: none)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (default: none -- no physical button on this board)\n");
+    printf("  --http-port <n>           start the HTTP control API on this port\n");
+    printf("                            (default: 0 -- disabled; see README's \"HTTP\n");
+    printf("                            control API\" section)\n");
+    printf("  --http-bind <addr>        address to bind the HTTP control API to\n");
+    printf("                            (default: 0.0.0.0, every interface)\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -82,6 +88,8 @@ enum {
     OPT_DEFAULT_BANDWIDTH,
     OPT_DEFAULT_CHANNEL,
     OPT_BIND_GPIO,
+    OPT_HTTP_PORT,
+    OPT_HTTP_BIND,
 };
 
 static void handle_sigterm(int sig)
@@ -104,6 +112,8 @@ int main(int argc, char** argv)
         .default_channel   = -1,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
+        .http_bind         = "0.0.0.0",
+        .http_port         = 0,
     };
 
     static struct option long_options[] = {
@@ -117,6 +127,8 @@ int main(int argc, char** argv)
         {"default-bandwidth", required_argument, 0, OPT_DEFAULT_BANDWIDTH},
         {"default-channel",   required_argument, 0, OPT_DEFAULT_CHANNEL  },
         {"bind-gpio",         required_argument, 0, OPT_BIND_GPIO        },
+        {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
+        {"http-bind",         required_argument, 0, OPT_HTTP_BIND        },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -160,6 +172,12 @@ int main(int argc, char** argv)
         case OPT_BIND_GPIO:
             cfg.bind_gpio = (int)strtol(optarg, NULL, 10);
             break;
+        case OPT_HTTP_PORT:
+            cfg.http_port = (uint16_t)strtoul(optarg, NULL, 10);
+            break;
+        case OPT_HTTP_BIND:
+            strncpy(cfg.http_bind, optarg, sizeof(cfg.http_bind) - 1);
+            break;
         case 'h':
             print_help(argv[0]);
             return 0;
@@ -185,6 +203,16 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    /* Only when --http-port was given (non-zero) -- disabled by default,
+     * see lifecycle_http.h's own header comment for why this is opt-in
+     * and what it exposes. Non-fatal if it fails to start (logged) --
+     * this daemon's core job (reconnect-following, tuning, hooks) doesn't
+     * depend on it. */
+    lifecycle_http_ctx* http_ctx = NULL;
+    if (cfg.http_port != 0) {
+        http_ctx = lifecycle_http_start(ctx, cfg.http_bind, cfg.http_port);
+    }
+
     /* Only when --bind-gpio was given -- lifecycle_bind_init() returns
      * NULL otherwise (see its own header comment), and this thread (the
      * only other thing in this binary competing for the main thread) is
@@ -196,6 +224,7 @@ int main(int argc, char** argv)
     }
 
     pthread_join(lc_thread, NULL);
+    lifecycle_http_stop(http_ctx);
 
     return 0;
 }

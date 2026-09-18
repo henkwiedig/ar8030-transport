@@ -67,12 +67,6 @@
 #define LC_CONNECT_CONFIRM_TICKS 3
 #define LC_DROP_CONFIRM_TICKS    6
 
-typedef enum {
-    LC_STATE_INIT = 0,
-    LC_STATE_IDLE,
-    LC_STATE_CONNECTED,
-} lc_state_e;
-
 struct lifecycle_ctx {
     lc_config_t cfg;
     lc_client_t client;
@@ -106,6 +100,24 @@ struct lifecycle_ctx {
      * process instead of once per second -- the branch that wants it is
      * otherwise checked on every 1s loop iteration. */
     int idle_hook_fired;
+
+    /* Guards state/connected_slot/last_bandwidth above against a
+     * concurrent lifecycle_get_status() call from another thread (the
+     * HTTP control API's own worker thread) -- see lifecycle.h's own
+     * comment on why this is a separate lock from g_link_state_lock and
+     * cmd_lock below. Only ever write-locked by the lifecycle thread
+     * itself (already single-threaded with respect to its own state), so
+     * this never blocks that thread on anything but a fast read. */
+    pthread_mutex_t status_lock;
+
+    /* One-slot mailbox for lifecycle_request_bandwidth() -- see that
+     * function's own comment in lifecycle.h for why a bandwidth change
+     * requested over HTTP is queued here instead of applied directly by
+     * the requesting thread. -1 = nothing queued. A second request
+     * overwriting an unconsumed first is fine (last-write-wins, same as
+     * calling the HTTP endpoint twice in a row would already imply). */
+    pthread_mutex_t cmd_lock;
+    int             pending_bandwidth_mhz;
 };
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -174,10 +186,13 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
         lc_log("lifecycle: calloc failed");
         return NULL;
     }
-    ctx->cfg            = *cfg;
-    ctx->state          = LC_STATE_INIT;
-    ctx->connected_slot = -1;
-    ctx->last_bandwidth = -1;
+    ctx->cfg                  = *cfg;
+    ctx->state                = LC_STATE_INIT;
+    ctx->connected_slot       = -1;
+    ctx->last_bandwidth       = -1;
+    ctx->pending_bandwidth_mhz = -1;
+    pthread_mutex_init(&ctx->status_lock, NULL);
+    pthread_mutex_init(&ctx->cmd_lock, NULL);
 
     lc_hooks_init();
 
@@ -218,7 +233,43 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
     if (bandwidth > 0) {
         lc_tuning_apply(ctx->client.handle, slot, bandwidth);
     }
+    pthread_mutex_lock(&ctx->status_lock);
     ctx->last_bandwidth = bandwidth;
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
+/* Drains lifecycle_request_bandwidth()'s one-slot mailbox, if anything is
+ * queued, and acts on it -- called once per main-loop tick regardless of
+ * ctx->state (unlike lc_apply_tuning_on_connect() above, which only ever
+ * runs exactly at the IDLE->CONNECTED transition). Always persists (so an
+ * HTTP request made while idle still sticks for the next connect, same
+ * persist-then-apply-on-connect path a normal --cfg-path-driven startup
+ * already uses), and additionally applies live via lc_tuning_apply() only
+ * if actually connected right now -- applying blind against a slot with
+ * no real peer would just be a wasted ioctl (see lc_tuning_apply()'s own
+ * BB_SET_BANDWIDTH target). */
+static void lc_drain_bandwidth_request(lifecycle_ctx* ctx)
+{
+    int requested_mhz;
+    pthread_mutex_lock(&ctx->cmd_lock);
+    requested_mhz              = ctx->pending_bandwidth_mhz;
+    ctx->pending_bandwidth_mhz = -1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (requested_mhz <= 0) {
+        return;
+    }
+
+    lc_log("lifecycle: http: bandwidth change requested: %d MHz", requested_mhz);
+    if (ctx->cfg.cfg_path[0]) {
+        lc_tuning_save(ctx->cfg.cfg_path, requested_mhz);
+    }
+    if (ctx->state == LC_STATE_CONNECTED) {
+        lc_tuning_apply(ctx->client.handle, ctx->connected_slot, requested_mhz);
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->last_bandwidth = requested_mhz;
+        pthread_mutex_unlock(&ctx->status_lock);
+    }
 }
 
 void* lifecycle_thread_main(void* arg)
@@ -282,6 +333,8 @@ void* lifecycle_thread_main(void* arg)
             did_fallback_poll  = 1;
         }
 
+        lc_drain_bandwidth_request(ctx);
+
         bb_link_state_e state;
         int              have_state = lc_get_link_state(&state);
 
@@ -302,9 +355,11 @@ void* lifecycle_thread_main(void* arg)
                 ctx->connect_confirm_count = 0;
                 /* Don't re-persist; just follow the transition. */
                 lc_log("lifecycle: observed CONNECT, following");
-                int slot            = lc_tuning_resolve_connected_slot(ctx->client.handle);
+                int slot = lc_tuning_resolve_connected_slot(ctx->client.handle);
+                pthread_mutex_lock(&ctx->status_lock);
                 ctx->connected_slot = slot >= 0 ? slot : 0;
                 ctx->state          = LC_STATE_CONNECTED;
+                pthread_mutex_unlock(&ctx->status_lock);
                 lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, ctx->connected_slot, NULL);
                 lc_apply_tuning_on_connect(ctx, ctx->connected_slot);
                 break;
@@ -350,9 +405,11 @@ void* lifecycle_thread_main(void* arg)
                 }
                 lc_log("lifecycle: link dropped (state=%d), re-pairing", (int)state);
                 lc_hooks_dispatch(ctx->cfg.hook_dir, "dropped", ctx->cfg.role, ctx->connected_slot, NULL);
+                pthread_mutex_lock(&ctx->status_lock);
                 ctx->state          = LC_STATE_IDLE;
                 ctx->connected_slot = -1;
                 ctx->last_bandwidth = -1;
+                pthread_mutex_unlock(&ctx->status_lock);
                 ctx->drop_miss_count = 0;
                 break;
             }
@@ -396,4 +453,34 @@ void* lifecycle_thread_main(void* arg)
     lc_client_disconnect(&ctx->client);
     lc_log("lifecycle: thread shutting down cleanly");
     return NULL;
+}
+
+void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
+{
+    memset(out, 0, sizeof(*out));
+    out->role = ctx->cfg.role;
+
+    pthread_mutex_lock(&ctx->status_lock);
+    out->state          = ctx->state;
+    out->connected_slot = ctx->connected_slot;
+    out->bandwidth_mhz  = ctx->last_bandwidth;
+    pthread_mutex_unlock(&ctx->status_lock);
+
+    out->paired = ctx->cfg.cfg_path[0] ? lc_pair_has_been_paired(ctx->cfg.cfg_path) : 0;
+}
+
+const lc_config_t* lifecycle_get_config(const lifecycle_ctx* ctx)
+{
+    return &ctx->cfg;
+}
+
+int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz)
+{
+    if (!lc_tuning_valid_mhz(mhz)) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_bandwidth_mhz = mhz;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
 }

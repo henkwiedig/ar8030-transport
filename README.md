@@ -1652,6 +1652,85 @@ thread notices. Omit `--bind-gpio` (the default) on a board with no
 physical bind button; nothing about the reconnect-following/tuning/hook
 machinery above depends on it.
 
+## HTTP control API
+
+`lifecycled/lifecycle_http.c` adds a small, opt-in REST + HTML control
+API to `ar8030-lifecycled` (`--http-port <n>`, `0`/unset = disabled, the
+default; `--http-bind <addr>`, default `0.0.0.0`) so either end of the
+link can be queried/driven with plain `curl` -- the actual motivation
+being air<->ground integration: a ground-side tool (or a person) can
+check/change either radio's link state over the same network the video
+already crosses, without shelling into either box. Runs on both air and
+ground (same binary, same flag) -- air's `S65ar8030-transport-tx` and
+ground's `S98ar8030-transport-rx` both pass it through unchanged via
+their own `AR8030_LIFECYCLED_ARGS` (`/etc/default/ar8030-transport-{tx,rx}`),
+e.g. `AR8030_LIFECYCLED_ARGS="--http-port 8899"`.
+
+**No auth, bound to every interface by default.** Same trust model as
+this project's other loopback-style control surfaces (waybeam's own
+`/api/v1/live/set`, `ar8030d`'s own RPC port) -- meant for a trusted
+local/link network, not for exposure beyond that. `--http-bind
+127.0.0.1` restricts it to loopback if that's all a given deployment
+needs.
+
+Endpoints (see `lifecycle_http.h`'s own header comment for the full
+design rationale):
+
+- **`GET /`** -- a small self-contained HTML control panel (status,
+  pair button, bandwidth selector, a raw `ar8030-linkctl` passthrough
+  panel). No external assets -- this is served by the device itself,
+  often with no other network reachable.
+- **`GET /api/v1/status`** -- this daemon's own view of the link:
+  ```
+  curl http://<host>:8899/api/v1/status
+  {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"paired":true}
+  ```
+- **`POST /api/v1/pair`** -- runs the exact same fork+exec
+  `ar8030-pair`+hook-dispatch sequence the physical bind button already
+  runs (`lifecycle_pair.c`'s `lc_pair_run()`), for boards with no
+  physical button or for triggering a rebind remotely:
+  `curl -X POST http://<host>:8899/api/v1/pair`.
+- **`POST /api/v1/bandwidth?mhz=<1|2|5|10|20|40>`** -- the *persisted*
+  way to change bandwidth: queues the request for the lifecycle thread
+  to persist (`lc_tuning_save()`, sticks across the next reconnect) and
+  apply (`lc_tuning_apply()`, if currently connected) on its own next 1s
+  tick, rather than issuing the `bb_ioctl` directly from the HTTP
+  thread -- `ctx->client.handle` is only ever safe to call from the
+  lifecycle thread itself (see `main.c`'s own header comment on why this
+  daemon is a whole separate process from `ar8030d` in the first place;
+  the same reasoning rules out a second thread in *this* process making
+  concurrent `bb_ioctl` calls on the same handle).
+  `curl -X POST 'http://<host>:8899/api/v1/bandwidth?mhz=20'`.
+- **`POST /api/v1/linkctl?cmd=<subcommand>&args=<space-separated args>`**
+  -- a generic, allow-listed passthrough to the standalone
+  `ar8030-linkctl` binary, covering every one of its own subcommands
+  (`status`, `channel-mode`, `channel`, `mcs-mode`, `mcs`, `mcs-range`,
+  `mcs-table`, `power-mode`, `power`, `freq`, `force-close-socket`,
+  `force-close-all`, and `bandwidth` for one-shot use) -- effectively
+  `linkctl -h`'s whole command surface, reachable over HTTP the same way
+  `curl` would invoke the CLI directly:
+  ```
+  curl -X POST 'http://<host>:8899/api/v1/linkctl?cmd=channel&args=5+-s+auto+-w+5'
+  {"ok":true,"exit_code":0,"output":"BB_SET_CHAN_MODE(auto_mode=0) ret=0\n...\n"}
+  ```
+  Safe to add this way specifically because every `ar8030-linkctl`
+  invocation opens its own independent, one-shot connection to `ar8030d`
+  and exits (`linkctl/main.c`'s own header comment) -- it never touches
+  this daemon's own `ctx->client` at all, so it needs no mailbox and runs
+  directly on the HTTP worker thread, the same "fork-per-call, no shared
+  mutable state" safety argument `lc_pair_run()` already relies on.
+  **Not persisted**: a raw `linkctl bandwidth` call through this
+  passthrough is a one-shot override that `lifecycle.c`'s own periodic
+  tuning re-assert (its "re-apply, not detect-and-persist" logic, see
+  that file's own comment) will silently overwrite with whatever was
+  last persisted/queued within `LC_POLL_FALLBACK_S` seconds while
+  connected -- use `/api/v1/bandwidth` above for anything meant to stick.
+  `args` is tokenized on plain whitespace straight into `execvp()`'s
+  `argv[]` -- no shell involved, so there is no quoting support and no
+  injection surface beyond "which argv entries does `ar8030-linkctl`
+  itself get", exactly as if each token had been typed as a separate CLI
+  argument.
+
 ## Phase 2 (explicitly out of scope here)
 
 - **FEC.** `ar8030_chunk_hdr.reserved` is the only field reserved for
