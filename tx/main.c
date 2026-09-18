@@ -492,8 +492,19 @@ int main(int argc, char **argv)
      * longer comment) -- confirmed live that this exact failure isn't
      * specific to reconnecting: it also hit a genuinely fresh startup
      * once a prior run had left the daemon in this state (crashed
-     * without a clean bb_socket_close(), device not rebooted since). */
-    ar8030_link_force_close_all_sockets(&link);
+     * without a clean bb_socket_close(), device not rebooted since).
+     *
+     * Scoped to this port only, NOT ar8030_link_force_close_all_sockets():
+     * audio_tx (see ../audio_tx/main.c) may already own a concurrently-open
+     * bb_socket on a different port of this same device, and
+     * BB_FORCE_CLS_SOCKET_ALL closes every port, not just this one --
+     * confirmed live to take down a running audio stream the instant this
+     * process (re)started. The narrower call was previously found not to
+     * clear a stale post-crash state on its own (see this project's earlier
+     * history), so this may reintroduce that specific failure mode; the
+     * retry loop below is the mitigation until/unless that's confirmed to
+     * still be a problem now that force-close is scoped. */
+    ar8030_link_force_close_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port);
     int startup_open_ret = -1;
     int startup_open_attempt;
     for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
@@ -625,8 +636,13 @@ int main(int argc, char **argv)
                  * Ignore its return value: on the common path there is
                  * nothing to force-close and this is a harmless no-op;
                  * the retry loop below is the real, checked,
-                 * fatal-on-failure step. */
-                ar8030_link_force_close_all_sockets(&link);
+                 * fatal-on-failure step.
+                 *
+                 * Scoped, not "all" -- see the startup call's own comment
+                 * above on why the broader ioctl can no longer be used
+                 * here now that audio_tx may be running concurrently on a
+                 * different port of this device. */
+                ar8030_link_force_close_socket(&link, (bb_slot_e)slot, (uint32_t)args.port);
 
                 int open_ret = -1;
                 int attempt;

@@ -170,6 +170,78 @@ params) rather than an internal fixed-size array, specifically so a
 a RAM-constrained target — `tx/main.c` mallocs it once at startup, sized
 to the actual `-c` in use, not the ceiling.
 
+## Embedded audio (Majestic-style, on a separate `bb_socket` port)
+
+`audio_tx`/`audio_rx` bridge waybeam's optional audio output across the
+same AR8030 link as video, landing on the **same UDP destination** as
+`ar8030-transport-rx`'s video output — the way the stock Majestic
+streamer put video and audio on one UDP port, demultiplexed by RTP
+payload type (H.265 = 97, Opus = 98) rather than a second port.
+
+This is two new standalone binaries, not two new threads inside
+`tx`/`rx`: video's connect/reconnect state machine already carries a lot
+of hard-won hardware-verified subtlety (see "`ar8030d` connection:
+surviving a daemon restart" below); adding a second `bb_socket`'s
+lifecycle to it would risk the working video path to fix audio. Each
+audio binary owns its own `ar8030d` connection and its own `bb_socket`,
+on logical port **3** by default (port 2 is `tx`'s video default; ports
+0/1 are reserved for the `ar_net0` IP bridge — see `tx/main.c`'s
+`DEFAULT_VIDEO_PORT` comment). This mirrors the vendor's own precedent:
+the stock Ascent streamer opens video on port 3 and audio on port 2
+*concurrently*, on the same chip — see "Stream mode, not datagram" above
+— so two ports serving two purposes at once is the proven shape, not a
+new one.
+
+Waybeam's own audio path (`cv610_audio.c` on the CV610 backend) already
+emits complete RTP/Opus packets (PT=98) to a **loopback** UDP
+destination — `outgoing.audioPort` — whenever `outgoing.server` is
+`unix://` or `frame-shm://` (see waybeam's
+`documentation/AUDIO_UDP_OUTPUT_FEASIBILITY.md` and
+`cv610_validation.c`), which is exactly what this project's own video
+path uses (`third_party/waybeam_frame_ring`). That loopback destination
+is the seam:
+
+```
+waybeam (frame-shm video)             air unit                    ground unit
+  cv610_audio.c ──UDP/RTP/Opus──► audio_tx (binds 127.0.0.1:5601)
+                                       │  ar8030_chunk_frame(codec=OPUS)
+                                       ▼
+                                  bb_socket (port 3, TX)
+                                       │  ...over the air...
+                                       ▼
+                                  bb_socket (port 3, RX) ◄── audio_rx
+                                                               │  ar8030_reassembly_feed()
+                                                               ▼
+                                                       send() -- verbatim, no re-packetization
+                                                               │
+                                                               ▼
+                                                   udp://<same -H:-p as rx/main.c>
+```
+
+Unlike video, there is **no re-encoding or re-packetization on either
+end**: `audio_tx` forwards each whole UDP datagram it receives from
+waybeam as one chunk (almost always exactly one — an Opus/RTP packet at
+32 kbit/s, 20 ms frames, is well under 200 bytes); `audio_rx` reassembles
+and `send()`s the resulting bytes unmodified. The bytes that land on the
+ground UDP socket are byte-for-byte what `cv610_audio.c`'s own RTP
+packetizer built. `common/ar8030_chunk.h`'s existing per-frame `codec`
+field (`AR8030_CHUNK_CODEC_OPUS`, alongside `AR8030_CHUNK_CODEC_H265`)
+is what lets a chunk on this port self-identify; nothing else in
+`common/` needed to change to support this.
+
+Point `audio_rx -H`/`-p` at the exact same host/port as `rx -H`/`-p` --
+that is what makes the two streams converge on one UDP destination.
+`audio_tx -u` must match waybeam's own `outgoing.audioPort`
+(`-U` is the bind host, default `127.0.0.1`, matching that field's
+loopback contract). `-o` on both audio binaries must agree with each
+other and must differ from `tx`/`rx`'s own `-o` (default 3 vs. video's
+default 2).
+
+Audio is entirely optional and independently start/stoppable: with
+`audio.enabled: false` in waybeam's config (or with `audio_tx`/`audio_rx`
+simply not running), video is completely unaffected — this was the whole
+point of not sharing state with `tx`/`rx`.
+
 ## Bitrate control
 
 `ar8030-transport-tx` reads its own current AP-side TX throughput
@@ -391,7 +463,7 @@ non-reproducible daemon build makes easy to hit by accident.
 ### Everything, auto-detecting both cross toolchains
 
 ```sh
-make            # cross-builds tx/ar8030-transport-tx and rx/ar8030-transport-rx
+make            # cross-builds tx/rx plus audio_tx/audio_rx (see "Embedded audio" above)
 make print-config  # show what toolchain/SDK paths were actually detected
 ```
 

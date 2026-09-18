@@ -74,6 +74,13 @@
 #define AR8030_CHUNK_FLAG_ENHANCE 0x04u
 
 #define AR8030_CHUNK_CODEC_H265 0x01u
+/* A chunk of this codec carries one whole, already RTP-packetized audio
+ * datagram (waybeam's cv610_audio.c own RTP/Opus packetizer output, PT=98)
+ * verbatim -- see audio_tx/main.c and audio_rx/main.c. Unlike H.265, there
+ * is no Annex-B re-parsing or RTP re-packetization on either end: the
+ * bytes that go in on the air side are the exact bytes handed to a UDP
+ * `send()` on the ground side. */
+#define AR8030_CHUNK_CODEC_OPUS 0x02u
 
 #pragma pack(push, 1)
 struct ar8030_chunk_hdr {

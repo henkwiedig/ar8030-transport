@@ -67,9 +67,9 @@ TX_MAKE_VARS := $(if $(TX_CC),CC=$(TX_CC)) $(if $(TX_SDK_INC),AR8030_SDK_INC=$(T
 RX_MAKE_VARS := $(if $(RX_CC),CC=$(RX_CC)) $(if $(RX_SDK_INC),AR8030_SDK_INC=$(RX_SDK_INC)) \
 	$(if $(RX_SDK_LIB),AR8030_SDK_LIB=$(RX_SDK_LIB))
 
-.PHONY: all tx rx linkctl linkctl-tx linkctl-rx lifecycled lifecycled-tx lifecycled-rx test check clean print-config
+.PHONY: all tx rx audio-tx audio-rx linkctl linkctl-tx linkctl-rx lifecycled lifecycled-tx lifecycled-rx test check clean print-config
 
-all: tx rx linkctl lifecycled
+all: tx rx audio-tx audio-rx linkctl lifecycled
 
 tx:
 	@echo "== tx: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
@@ -78,6 +78,19 @@ tx:
 rx:
 	@echo "== rx: CC=$(if $(RX_CC),$(RX_CC),<default: host gcc -- see 'make print-config'>)"
 	$(MAKE) -C rx $(RX_MAKE_VARS)
+
+# ar8030-transport-audio-{tx,rx} (see audio_tx/main.c, audio_rx/main.c) --
+# the Majestic-style embedded-audio path, built with the same per-side
+# toolchain/SDK as tx/rx since they link the same AR8030 SDK. Independent
+# binaries, not folded into `tx`/`rx`: see audio_tx/main.c's header
+# comment for why.
+audio-tx:
+	@echo "== audio-tx: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
+	$(MAKE) -C audio_tx $(TX_MAKE_VARS)
+
+audio-rx:
+	@echo "== audio-rx: CC=$(if $(RX_CC),$(RX_CC),<default: host gcc -- see 'make print-config'>)"
+	$(MAKE) -C audio_rx $(RX_MAKE_VARS)
 
 # ar8030-linkctl (see linkctl/main.c) is needed on BOTH sides -- unlike
 # tx/rx it isn't "the air tool" or "the ground tool", so this builds it
@@ -122,6 +135,8 @@ test check:
 clean:
 	$(MAKE) -C tx clean
 	$(MAKE) -C rx clean
+	$(MAKE) -C audio_tx clean
+	$(MAKE) -C audio_rx clean
 	$(MAKE) -C linkctl clean BUILD_DIR=build-tx TARGET=ar8030-linkctl-tx
 	$(MAKE) -C linkctl clean BUILD_DIR=build-rx TARGET=ar8030-linkctl-rx
 	$(MAKE) -C lifecycled clean BUILD_DIR=build-tx TARGET=ar8030-lifecycled-tx
