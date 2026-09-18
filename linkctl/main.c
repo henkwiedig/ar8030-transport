@@ -447,20 +447,38 @@ static int cmd_status(int argc, char **argv)
 
     printf("role=%s mode=%s\n", role_name(st_out.role), bb_mode_name(st_out.mode));
 
-    /* Deliberately NOT calling BB_GET_CHAN_INFO here. Its output struct
+    /* BB_GET_CHAN_INFO used to be skipped here entirely: its output struct
      * (bb_get_chan_info_out_t) has fixed-size freq[]/power[] arrays sized
-     * BB_CONFIG_MAX_CHAN_NUM (32), but this project's own ar8030.json
-     * configures 42 channels -- confirmed on real hardware (a fully
-     * self-consistent daemon+lib+linkctl build, single flash, no version
-     * skew) that this overflows the reply into whatever's next on the
-     * stack and segfaults, deterministically, every call. The
-     * auto_mode/work_chan fields (before the arrays in the struct) come
-     * back correct right up until the crash -- it's specifically the
-     * fixed 32-slot arrays choking on 42 configured channels. There is
-     * no way to safely call this ioctl on this device's config; if
-     * channel-mode/working-channel display is wanted again, it needs a
-     * fix on the daemon/SDK side (or a channel table trimmed to <=32
-     * entries), not a client-side workaround. */
+     * BB_CONFIG_MAX_CHAN_NUM, and this project's own ar8030.json configures
+     * 42 channels -- with the old cap of 32 that overflowed the reply into
+     * whatever was next on the stack and segfaulted, deterministically,
+     * every call. Fixed two ways together, neither of them a client-side
+     * workaround: session_ioctl.c's io_rpc_cb() now clamps any oversized RPC
+     * reply to the caller's actual buffer size instead of trusting the wire
+     * (patch 0020/0027), and BB_CONFIG_MAX_CHAN_NUM itself was raised from
+     * 32 to 60 (patch 0022/0029) so a 42-channel reply now fits without that
+     * clamp ever needing to fire for this call. Confirmed live before this
+     * patch that the chip itself was never limited to 32 -- channel indices
+     * above it (33, 40) already retuned successfully via
+     * BB_SET_CHAN/BB_SET_REMOTE -- only this host-side struct was.
+     *
+     * Only a compact one-line summary here (chan_num/auto_mode/work_chan +
+     * the working channel's own frequency looked up from freq[]), not the
+     * full freq[]/power[] table: this runs on every `status` call, which the
+     * HTTP control API's /api/v1/status polls every 2s (lifecycle_http.c),
+     * so keep the added RPC payload/parsing small rather than dumping up to
+     * 60 frequency/power pairs on every poll. work_chan is bounds-checked
+     * against both chan_num and the array size before indexing freq[] --
+     * chan_num is chip-reported and not otherwise validated here. */
+    bb_get_chan_info_out_t chan_out;
+    memset(&chan_out, 0, sizeof(chan_out));
+    if (bb_ioctl(g_hbb, BB_GET_CHAN_INFO, NULL, &chan_out) == 0) {
+        uint32_t cur_freq = (chan_out.work_chan < chan_out.chan_num && chan_out.work_chan < BB_CONFIG_MAX_CHAN_NUM)
+                                 ? chan_out.freq[chan_out.work_chan]
+                                 : 0;
+        printf("BB_GET_CHAN_INFO: chan_num=%u auto_mode=%s work_chan=%u acs_chan=%u freq=%u kHz\n", chan_out.chan_num,
+               chan_out.auto_mode ? "auto" : "manual", chan_out.work_chan, chan_out.acs_chan, cur_freq);
+    }
 
     print_bit_list("configured slots", st_out.cfg_sbmp, BB_SLOT_MAX);
     print_bit_list("active slots", st_out.rt_sbmp, BB_SLOT_MAX);
