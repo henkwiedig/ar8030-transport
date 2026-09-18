@@ -147,3 +147,95 @@ int lc_tuning_resolve_connected_slot(bb_dev_handle_t* handle)
     }
     return -1;
 }
+
+int lc_retx_valid(int win, int busy, int idle, int conti_busy, int conti_idle)
+{
+    return win >= 0 && win <= 255 && busy >= 0 && busy <= 255 && idle >= 0 && idle <= 255 && conti_busy >= 0 &&
+           conti_busy <= 255 && conti_idle >= 0 && conti_idle <= 255;
+}
+
+static void retx_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
+{
+    const char* slash = strrchr(cfg_path, '/');
+    if (slash) {
+        size_t dirlen = (size_t)(slash - cfg_path) + 1;
+        if (dirlen >= out_sz) {
+            dirlen = out_sz - 1;
+        }
+        memcpy(out, cfg_path, dirlen);
+        snprintf(out + dirlen, out_sz - dirlen, "ar8030.retx");
+    } else {
+        snprintf(out, out_sz, "ar8030.retx");
+    }
+}
+
+int lc_retx_load(const char* cfg_path, bb_retx_cfg_t* out)
+{
+    char path[512];
+    retx_sidecar_path(cfg_path, path, sizeof(path));
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    int win, busy, idle, conti_busy, conti_idle;
+    int ok = fscanf(f, "%d %d %d %d %d", &win, &busy, &idle, &conti_busy, &conti_idle) == 5;
+    fclose(f);
+    if (!ok || !lc_retx_valid(win, busy, idle, conti_busy, conti_idle)) {
+        lc_log("lifecycle: tuning: %s has no valid retx config, ignoring", path);
+        return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    out->win         = (uint8_t)win;
+    out->busy        = (uint8_t)busy;
+    out->idle        = (uint8_t)idle;
+    out->conti_busy  = (uint8_t)conti_busy;
+    out->conti_idle  = (uint8_t)conti_idle;
+    return 0;
+}
+
+int lc_retx_save(const char* cfg_path, int win, int busy, int idle, int conti_busy, int conti_idle)
+{
+    if (!lc_retx_valid(win, busy, idle, conti_busy, conti_idle)) {
+        lc_log("lifecycle: tuning: refusing to persist invalid retx config");
+        return -1;
+    }
+
+    char path[512];
+    retx_sidecar_path(cfg_path, path, sizeof(path));
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "%d %d %d %d %d\n", win, busy, idle, conti_busy, conti_idle);
+    fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: tuning: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int conti_busy, int conti_idle)
+{
+    if (!lc_retx_valid(win, busy, idle, conti_busy, conti_idle)) {
+        lc_log("lifecycle: tuning: retx config out of range, not applying");
+        return -1;
+    }
+    bb_retx_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.win         = (uint8_t)win;
+    cfg.busy        = (uint8_t)busy;
+    cfg.idle        = (uint8_t)idle;
+    cfg.conti_busy  = (uint8_t)conti_busy;
+    cfg.conti_idle  = (uint8_t)conti_idle;
+    int ret = bb_ioctl(handle, BB_SET_RETX_EVENT_STATUS, &cfg, NULL);
+    lc_log("lifecycle: tuning: BB_SET_RETX_EVENT_STATUS(win=%d,busy=%d,idle=%d,conti_busy=%d,conti_idle=%d) ret=%d",
+           win, busy, idle, conti_busy, conti_idle, ret);
+    return ret;
+}

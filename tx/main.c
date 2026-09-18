@@ -541,6 +541,9 @@ int main(int argc, char **argv)
                                      * "2-4Mbit/s" call, middle of the range) */
     bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
                                      * switching it back off */
+    bc_cfg.ldpc_ratio_high = 0.10; /* see bitrate_ctl.h's own comment: >=10% LDPC blocks failing is
+                                     * treated as the radio actively under repair pressure */
+    bc_cfg.ldpc_backoff = 0.85;    /* same cut factor as ring_backoff above */
     bc_cfg.stop_flag = &g_stop;
 
     pthread_t bc_thread;

@@ -37,6 +37,27 @@
 #define LC_POLL_FALLBACK_S     5
 #define LC_ESTABLISH_RETRY_S   3
 
+/* Vendor's own shipped defaults for the windowed retransmission
+ * controller (ar_ldyhs_sky's own fpv_bb_init, confirmed via this
+ * project's Ghidra decompile -- see bb_retx_cfg_t's own doc comment in
+ * bb_api.h). Applied at every connect whenever nothing has been
+ * persisted via /api/v1/retx-tuning yet, so the controller is always
+ * actively configured rather than left in its raw, never-set state --
+ * unlike bandwidth's own unconfigured state (which just means "chip's
+ * own default gear"), an unconfigured retx controller has no meaningful
+ * signal to read at all, which matters once this feeds a future rate-
+ * control input (see this project's own Phase C notes). Confirmed SAFE
+ * by this project's own hardware sweep (this exact combination, plus
+ * several more extreme ones, caused no adverse link effect) -- not
+ * confirmed CORRECT, since the units/semantics of these thresholds are
+ * still unverified; this is "the vendor's own choice, known not to
+ * break anything," not "the right value for this hardware." */
+#define LC_RETX_DEFAULT_WIN         10
+#define LC_RETX_DEFAULT_BUSY        6
+#define LC_RETX_DEFAULT_IDLE        4
+#define LC_RETX_DEFAULT_CONTI_BUSY  2
+#define LC_RETX_DEFAULT_CONTI_IDLE  0
+
 /* Debounces link-state transitions in BOTH directions -- confirmed live
  * (air and ground) that the chip itself can report CONNECT and then flip
  * straight back to IDLE within single-digit *milliseconds*, with zero
@@ -118,6 +139,20 @@ struct lifecycle_ctx {
      * calling the HTTP endpoint twice in a row would already imply). */
     pthread_mutex_t cmd_lock;
     int             pending_bandwidth_mhz;
+
+    /* Same one-slot-mailbox pattern, for lifecycle_request_retx() --
+     * guarded by the same cmd_lock rather than a new one, since both
+     * are just different requests the lifecycle thread drains on its
+     * own next tick. pending_retx_valid is the "anything queued" flag
+     * (unlike bandwidth, 0 is itself a legal value for every one of
+     * these 5 fields, so there's no single sentinel int that means
+     * "nothing queued"). */
+    int pending_retx_valid;
+    int pending_retx_win;
+    int pending_retx_busy;
+    int pending_retx_idle;
+    int pending_retx_conti_busy;
+    int pending_retx_conti_idle;
 };
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -236,6 +271,30 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
     pthread_mutex_lock(&ctx->status_lock);
     ctx->last_bandwidth = bandwidth;
     pthread_mutex_unlock(&ctx->status_lock);
+
+    /* Chip-wide, not tied to `slot` -- but only worth applying once a
+     * link has actually formed (mirrors bandwidth's own "connect first,
+     * tune second" ordering). Unlike bandwidth's own persisted-value-or-
+     * chip-default fallback, there is no "chip default" worth falling
+     * back to here: this project's own stack has simply never called
+     * BB_SET_RETX_EVENT_STATUS before, so the controller's raw state is
+     * all-zero, not a real default -- always apply *something* (LC_RETX_
+     * DEFAULT_* above absent a persisted choice) so the controller is
+     * always actively configured. This matters beyond "why not leave it
+     * alone": an unconfigured controller has no meaningful state for a
+     * future rate-control input to read, so treating "never touch it"
+     * as the safe default would just make Phase C's retx-driven backoff
+     * permanently unbuildable. */
+    bb_retx_cfg_t retx;
+    if (!ctx->cfg.cfg_path[0] || lc_retx_load(ctx->cfg.cfg_path, &retx) != 0) {
+        memset(&retx, 0, sizeof(retx));
+        retx.win        = LC_RETX_DEFAULT_WIN;
+        retx.busy       = LC_RETX_DEFAULT_BUSY;
+        retx.idle       = LC_RETX_DEFAULT_IDLE;
+        retx.conti_busy = LC_RETX_DEFAULT_CONTI_BUSY;
+        retx.conti_idle = LC_RETX_DEFAULT_CONTI_IDLE;
+    }
+    lc_retx_apply(ctx->client.handle, retx.win, retx.busy, retx.idle, retx.conti_busy, retx.conti_idle);
 }
 
 /* Drains lifecycle_request_bandwidth()'s one-slot mailbox, if anything is
@@ -270,6 +329,44 @@ static void lc_drain_bandwidth_request(lifecycle_ctx* ctx)
         ctx->last_bandwidth = requested_mhz;
         pthread_mutex_unlock(&ctx->status_lock);
     }
+}
+
+/* Same drain pattern as lc_drain_bandwidth_request() above, for
+ * lifecycle_request_retx()'s own mailbox -- always persists (sticks
+ * across the next reconnect), and additionally applies live via
+ * lc_retx_apply() since this project's own hardware sweep confirmed a
+ * live SET after boot actually takes effect (unlike the vendor's own
+ * app, which only ever sets this once, at init -- see bb_retx_cfg_t's
+ * doc comment). Chip-wide: unlike bandwidth this doesn't need
+ * ctx->connected_slot at all, so it applies regardless of ctx->state
+ * rather than gating on CONNECTED -- confirmed live that a live SET
+ * doesn't require an active link (real hardware sweep tested it while
+ * CONNECTED throughout, but the ioctl itself carries no slot/link
+ * precondition per bb_retx_cfg_t's own struct, which has no slot
+ * field either). */
+static void lc_drain_retx_request(lifecycle_ctx* ctx)
+{
+    int valid, win, busy, idle, conti_busy, conti_idle;
+    pthread_mutex_lock(&ctx->cmd_lock);
+    valid                     = ctx->pending_retx_valid;
+    win                       = ctx->pending_retx_win;
+    busy                      = ctx->pending_retx_busy;
+    idle                      = ctx->pending_retx_idle;
+    conti_busy                = ctx->pending_retx_conti_busy;
+    conti_idle                = ctx->pending_retx_conti_idle;
+    ctx->pending_retx_valid   = 0;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (!valid) {
+        return;
+    }
+
+    lc_log("lifecycle: http: retx config change requested: win=%d,busy=%d,idle=%d,conti_busy=%d,conti_idle=%d",
+           win, busy, idle, conti_busy, conti_idle);
+    if (ctx->cfg.cfg_path[0]) {
+        lc_retx_save(ctx->cfg.cfg_path, win, busy, idle, conti_busy, conti_idle);
+    }
+    lc_retx_apply(ctx->client.handle, win, busy, idle, conti_busy, conti_idle);
 }
 
 void* lifecycle_thread_main(void* arg)
@@ -334,6 +431,7 @@ void* lifecycle_thread_main(void* arg)
         }
 
         lc_drain_bandwidth_request(ctx);
+        lc_drain_retx_request(ctx);
 
         bb_link_state_e state;
         int              have_state = lc_get_link_state(&state);
@@ -481,6 +579,22 @@ int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz)
     }
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_bandwidth_mhz = mhz;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_retx(lifecycle_ctx* ctx, int win, int busy, int idle, int conti_busy, int conti_idle)
+{
+    if (!lc_retx_valid(win, busy, idle, conti_busy, conti_idle)) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_retx_win         = win;
+    ctx->pending_retx_busy        = busy;
+    ctx->pending_retx_idle        = idle;
+    ctx->pending_retx_conti_busy  = conti_busy;
+    ctx->pending_retx_conti_idle  = conti_idle;
+    ctx->pending_retx_valid       = 1;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }

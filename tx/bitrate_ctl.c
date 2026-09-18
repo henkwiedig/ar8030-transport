@@ -63,6 +63,38 @@ static int read_tx_throughput_kbps(ar8030_link_t *link, bb_slot_e slot, uint32_t
     return 0;
 }
 
+/* Physical-user index hardcoded to 0, matching this project's own existing
+ * single-user assumption elsewhere (e.g. linkctl/main.c's cmd_status
+ * hardcoding BB_GET_CUR_POWER's usr=0) -- multi-user setups aren't this
+ * project's target configuration. Returns -1 (leave *out_ratio untouched)
+ * on an RPC failure or an invalid reading (ldpc_num == 0, matching
+ * bb_quality_t's own "all zero means invalid" doc comment in bb_api.h) so
+ * a momentarily-unpopulated reading is never misread as a perfect 0%
+ * error ratio. */
+static int read_ldpc_ratio(ar8030_link_t *link, double *out_ratio)
+{
+    bb_dev_handle_t *dev = __atomic_load_n(&link->dev, __ATOMIC_ACQUIRE);
+    if (!dev)
+        return -1;
+
+    bb_get_user_quality_in_t in;
+    bb_get_user_quality_out_t out;
+    memset(&in, 0, sizeof(in));
+    memset(&out, 0, sizeof(out));
+    in.user_bmp = 0xffff;
+    in.average = 0;
+
+    if (bb_ioctl(dev, BB_GET_USER_QUALITY, &in, &out))
+        return -1;
+
+    bb_quality_t *q = &out.qualities[0];
+    if (!q->ldpc_num)
+        return -1;
+
+    *out_ratio = (double)q->ldpc_err / (double)q->ldpc_num;
+    return 0;
+}
+
 static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 {
     if (v < lo)
@@ -81,6 +113,26 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
  * backing up right now" alarm and should react close to as fast as the
  * signal itself updates). */
 #define RING_BACKLOG_MIN_INTERVAL_MS 250
+
+/* Same rate-limit class as RING_BACKLOG_MIN_INTERVAL_MS above -- this is
+ * an RPC (BB_GET_USER_QUALITY), not a shm read, but the same reasoning
+ * applies: an LDPC error burst is an "actively under repair pressure"
+ * alarm and should react close to as fast as the underlying baseband
+ * counters actually update, not be gated behind the ordinary MCS path's
+ * min_interval_ms (which exists to avoid spamming waybeam on routine MCS
+ * jitter, not on this).
+ *
+ * This briefly ran at 1000ms as a workaround for a real bug: the
+ * vendor SDK's own bb_quality_t was declared 8 bytes but the real
+ * per-entry wire size is 16, so every call logged a client-library
+ * "reply datalen... truncating" warning -- confirmed harmless to the
+ * data actually read (qualities[0] was always correct), but loud at
+ * high frequency. That's now fixed at the source
+ * (0030-bb_api-fix-bb_quality_t-real-size.patch corrects bb_quality_t's
+ * declared size to match, so libar8030_client.so no longer truncates
+ * this reply at all), so this runs at the same fast cadence as the ring
+ * path again -- see this project's own SDK patch series. */
+#define LDPC_BACKOFF_MIN_INTERVAL_MS 250
 
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 {
@@ -130,6 +182,7 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     int roi_enabled = 0;
     uint64_t last_backlog_ms = 0;
     uint64_t last_roi_disable_attempt_ms = 0;
+    uint64_t last_ldpc_apply_ms = 0;
 
     while (!*cfg->stop_flag) {
         usleep(100 * 1000);
@@ -226,6 +279,47 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                     roi_enabled = 0;
                 } else {
                     fprintf(stderr, "bitrate_ctl: waybeam fpv.roiEnabled=false returned status=%d\n", status);
+                }
+            }
+        }
+
+        /* LDPC error-ratio backoff: independent of, and checked before,
+         * the ordinary MCS-driven path below -- see bitrate_ctl.h's own
+         * comment on ldpc_ratio_high/ldpc_backoff for why this exists and
+         * why it bypasses hysteresis the same way the ring-backlog path
+         * above does. Only ever cuts (never raises) last_applied_kbps;
+         * recovery back up happens through the normal MCS-driven path's
+         * own next poll once the ratio drops back below threshold, same
+         * as the ring path's cut side has no dedicated "undo" either. */
+        if (cfg->ldpc_ratio_high > 0.0 && have_applied &&
+            (now - last_ldpc_apply_ms) >= (uint64_t)LDPC_BACKOFF_MIN_INTERVAL_MS) {
+            /* Set on every attempt, not just a tripped one -- this is what
+             * actually enforces LDPC_BACKOFF_MIN_INTERVAL_MS. Setting it
+             * only inside the tripped branch below left the healthy-link
+             * case (ratio never crosses threshold, the common case)
+             * completely unthrottled: confirmed live, this call's own
+             * pre-existing "reply datalen... truncating" warning (see
+             * read_ldpc_ratio()'s own comment) kept firing every ~100ms
+             * tick regardless of this constant's value until fixed here. */
+            last_ldpc_apply_ms = now;
+            double ldpc_ratio;
+            if (read_ldpc_ratio(cfg->link, &ldpc_ratio) == 0 && ldpc_ratio >= cfg->ldpc_ratio_high) {
+                uint32_t ldpc_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ldpc_backoff),
+                                                  cfg->min_kbps, cfg->max_kbps);
+                if (ldpc_target < last_applied_kbps) {
+                    char path[128];
+                    snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", ldpc_target);
+                    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+                    if (status >= 200 && status < 300) {
+                        fprintf(stderr, "bitrate_ctl: LDPC error ratio=%.1f%% -> video0.bitrate=%u kbps\n",
+                                ldpc_ratio * 100.0, ldpc_target);
+                        last_applied_kbps = ldpc_target;
+                        last_apply_ms = now;
+                    } else {
+                        fprintf(stderr,
+                                "bitrate_ctl: waybeam %s returned status=%d (LDPC ratio=%.1f%%)\n", path,
+                                status, ldpc_ratio * 100.0);
+                    }
                 }
             }
         }

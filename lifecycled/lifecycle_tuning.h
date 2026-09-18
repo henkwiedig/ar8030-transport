@@ -59,6 +59,39 @@ int lc_tuning_apply(bb_dev_handle_t* handle, int slot, int bandwidth_mhz);
  * none are connected. */
 int lc_tuning_resolve_connected_slot(bb_dev_handle_t* handle);
 
+/*
+ * BB_SET_RETX_EVENT_STATUS / BB_GET_RETX_EVENT_STATUS (see bb_api.h's own
+ * doc comment on bb_retx_cfg_t) -- the windowed retransmission
+ * controller's own tuning parameters. Confirmed live on real hardware
+ * (2026-09) that a SET after boot actually takes effect (read back
+ * matches what was written), unlike bandwidth this is chip-wide, not
+ * per-slot -- BB_SET_RETX_EVENT_STATUS's own struct carries no slot
+ * field. Only the first 5 of the struct's 136 bytes are understood
+ * (win/busy/idle/conti_busy/conti_idle); this file only ever reads/
+ * writes those 5, leaving the rest zeroed on SET and ignored on GET.
+ */
+
+/* Non-zero if every one of the 5 values fits a uint8_t (0-255) -- the
+ * only constraint currently known; unlike lc_tuning_valid_mhz() there is
+ * no fixed set of legal values to check against since the real units
+ * of these thresholds are still unconfirmed (see bb_retx_cfg_t's own
+ * doc comment). */
+int lc_retx_valid(int win, int busy, int idle, int conti_busy, int conti_idle);
+
+/* Reads the persisted retx config from the sidecar file next to
+ * cfg_path (same directory, fixed name "ar8030.retx"). Returns 0 and
+ * fills *out on success, -1 if no sidecar exists yet or it's
+ * unreadable/invalid. */
+int lc_retx_load(const char* cfg_path, bb_retx_cfg_t* out);
+
+/* Atomically persists the 5 values to the sidecar file next to
+ * cfg_path. Returns 0 on success. */
+int lc_retx_save(const char* cfg_path, int win, int busy, int idle, int conti_busy, int conti_idle);
+
+/* Applies the 5 values via BB_SET_RETX_EVENT_STATUS (chip-wide, no slot
+ * parameter). Returns the ioctl's own return code (0 on success). */
+int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int conti_busy, int conti_idle);
+
 #ifdef __cplusplus
 }
 #endif

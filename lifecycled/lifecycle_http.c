@@ -371,6 +371,41 @@ static void handle_bandwidth(lifecycle_http_ctx* http, int fd, const char* query
     send_json(fd, 202, "Accepted", json);
 }
 
+/* POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle= --
+ * same mailbox pattern as handle_bandwidth() above, for the windowed
+ * retransmission controller's own tuning parameters (see
+ * lifecycle_tuning.h's own doc comment on lc_retx_apply() for what
+ * these mean and what's still unverified about them: units are
+ * unconfirmed, only the range 0-255 is enforced here). All 5 query
+ * parameters are required -- there's no "change just one, leave the
+ * rest as last-applied" partial-update support, since this process
+ * doesn't cache the chip's own currently-applied values anywhere it
+ * could fill in the gaps from (unlike bandwidth, which reads back via
+ * BB_GET_STATUS elsewhere); a caller wanting to tweak one field should
+ * read /api/v1/status's own linkctl_status text (ar8030-linkctl retx)
+ * first to get the current 5 values before posting all 5 back. */
+static void handle_retx_tuning(lifecycle_http_ctx* http, int fd, const char* query)
+{
+    int win, busy, idle, conti_busy, conti_idle;
+    if (query_param_int(query, "win", &win) != 0 || query_param_int(query, "busy", &busy) != 0 ||
+        query_param_int(query, "idle", &idle) != 0 || query_param_int(query, "conti_busy", &conti_busy) != 0 ||
+        query_param_int(query, "conti_idle", &conti_idle) != 0) {
+        send_json(fd, 400, "Bad Request",
+                  "{\"ok\":false,\"error\":\"missing one of win/busy/idle/conti_busy/conti_idle query "
+                  "parameters (all 5 required)\"}");
+        return;
+    }
+    if (lifecycle_request_retx(http->lc, win, busy, idle, conti_busy, conti_idle) != 0) {
+        send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"all 5 values must be in range 0-255\"}");
+        return;
+    }
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"ok\":true,\"queued\":{\"win\":%d,\"busy\":%d,\"idle\":%d,\"conti_busy\":%d,\"conti_idle\":%d}}",
+             win, busy, idle, conti_busy, conti_idle);
+    send_json(fd, 202, "Accepted", json);
+}
+
 /* ── control panel (static, no server-side templating) ───────────────── */
 
 static const char INDEX_HTML[] =
@@ -624,6 +659,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_pair(http, fd);
     } else if (strcmp(path, "/api/v1/bandwidth") == 0 && strcmp(method, "POST") == 0) {
         handle_bandwidth(http, fd, query);
+    } else if (strcmp(path, "/api/v1/retx-tuning") == 0 && strcmp(method, "POST") == 0) {
+        handle_retx_tuning(http, fd, query);
     } else if (strcmp(path, "/api/v1/linkctl") == 0) {
         handle_linkctl(fd, query);
     } else {

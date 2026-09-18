@@ -167,6 +167,14 @@ const lc_config_t* lifecycle_get_config(const lifecycle_ctx* ctx);
  * request was queued, -1 otherwise (nothing queued, nothing changed). */
 int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz);
 
+/* Same mailbox pattern as lifecycle_request_bandwidth() above, for the
+ * windowed retransmission controller's own tuning parameters (see
+ * lifecycle_tuning.h's own comment on lc_retx_apply()/lc_retx_save()).
+ * Chip-wide, not per-slot -- applied regardless of which slot is
+ * connected. Returns 0 if all 5 values are in range (0-255) and the
+ * request was queued, -1 otherwise. */
+int lifecycle_request_retx(lifecycle_ctx* ctx, int win, int busy, int idle, int conti_busy, int conti_idle);
+
 #ifdef __cplusplus
 }
 #endif

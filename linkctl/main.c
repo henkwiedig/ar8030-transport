@@ -41,9 +41,13 @@ static void usage(const char *argv0)
             "\n"
             "  status [-s slot]\n"
             "      Dump BB_GET_STATUS (per-user tx/rx mcs+bandwidth+freq, link\n"
-            "      state), BB_GET_MCS, and BB_GET_SOCK_INFO (per-port tx/rx byte\n"
-            "      counters and overflow counts, only for ports actually in use)\n"
-            "      for the given slot (default 0).\n"
+            "      state), BB_GET_MCS, BB_GET_1V1_INFO, BB_GET_USER_QUALITY/\n"
+            "      BB_GET_PEER_QUALITY (per-user/peer snr + LDPC block-error\n"
+            "      ratio + antenna gain -- the closest available proxy to how\n"
+            "      much repair work the baseband's FEC/retx layer is doing),\n"
+            "      and BB_GET_SOCK_INFO (per-port tx/rx byte counters and\n"
+            "      overflow counts, only for ports actually in use) for the\n"
+            "      given slot (default 0).\n"
             "\n"
             "  bandwidth <mhz> [-d tx|rx] [-s slot] [-w seconds]\n"
             "      Manually set channel bandwidth. <mhz> is one of\n"
@@ -119,6 +123,17 @@ static void usage(const char *argv0)
             "      coming from this mechanism -- likely a factory-calibrated\n"
             "      default baked into air's chip/firmware that neither stock nor\n"
             "      this tool ever writes.\n"
+            "\n"
+            "  retx [--set <win> <busy> <idle> <conti_busy> <conti_idle>]\n"
+            "      Dump (and optionally tune) the windowed retransmission\n"
+            "      controller's own event/status record via\n"
+            "      BB_GET_RETX_EVENT_STATUS/BB_SET_RETX_EVENT_STATUS -- added\n"
+            "      to this SDK build from an external firmware analysis,\n"
+            "      independently confirmed via Ghidra (see linkctl/main.c's own\n"
+            "      cmd_retx comment). Only the first 5 of 136 bytes are decoded;\n"
+            "      the rest print as raw hex. --set is UNVERIFIED on real\n"
+            "      hardware (live-SET-after-boot behavior unconfirmed) --\n"
+            "      always read back and test from a clean boot.\n"
             "\n"
             "  power-mode [auto|manual]\n"
             "      With no argument, reads back the current mode (BB_GET_POWER_MODE).\n"
@@ -403,6 +418,15 @@ static double dbm_to_mw(uint8_t dbm)
     return pow(10.0, (double)dbm / 10.0);
 }
 
+/* bb_quality_t's own doc comment in bb_api.h: "conversion to db formula:
+ * 10log(snr/36)" -- same raw snr units BB_GET_1V1_INFO's self/peer.snr
+ * already use unconverted above; this converts for BB_GET_USER_QUALITY/
+ * BB_GET_PEER_QUALITY's own printing below. */
+static double snr_to_db(uint16_t snr)
+{
+    return 10.0 * log10((double)snr / 36.0);
+}
+
 /* cfg_sbmp/rt_sbmp are bitmasks over bb_slot_e (bit N = slot N). Printed as
  * a plain slot list instead of raw hex so "which slots actually exist"
  * doesn't require the reader to decode a bitmap by hand. */
@@ -544,15 +568,92 @@ static int cmd_status(int argc, char **argv)
                info_out.peer.tx_chan, info_out.peer.tx_power, info_out.peer.rf_1tx ? "single" : "dual");
     }
 
+    /* LDPC block-error ratio -- a real error-rate proxy for how much
+     * repair work the baseband's own FEC/retx layer is doing that neither
+     * BB_GET_STATUS nor BB_GET_1V1_INFO above carries (both give
+     * snr/gain/mcs but not ldpc_err/ldpc_num). BB_GET_USER_QUALITY is this
+     * side's own per-physical-user reading; BB_GET_PEER_QUALITY is the
+     * connected peer's, keyed by slot instead of user index -- both are
+     * documented as bb_quality_t{snr,ldpc_err,ldpc_num,gain_a,gain_b}
+     * (8 bytes) arrays.
+     *
+     * CONFIRMED ON REAL HARDWARE (both air and ground, 2026-09):
+     * both replies come back roughly 2x the size sizeof() the SDK header's
+     * own struct predicts (BB_GET_USER_QUALITY: 160 bytes on the wire vs.
+     * 80 expected for BB_DATA_USER_MAX=10 entries; BB_GET_PEER_QUALITY:
+     * 128 vs. 64 for BB_SLOT_MAX=8) -- logged by session_ioctl.c's own
+     * io_rpc_cb() truncation guard ("reply datalen=... exceeds expected
+     * ..., truncating"), the same class of header/wire mismatch already
+     * hit and fixed for BB_GET_CHAN_INFO. Unlike that single-struct case,
+     * an array's element STRIDE being wrong corrupts every index beyond
+     * the first, not just trailing bytes: only qualities[0] is guaranteed
+     * to start at the wire's own byte 0 regardless of the real per-entry
+     * size, so it's the only index safe to trust until the actual stride
+     * is confirmed (a small follow-up RE task, same class as the
+     * BB_GET_RETX_EVENT_STATUS work but much smaller). Cross-validated
+     * live: the ground unit's own peer-slot-0 reading (its view of the
+     * air AP) matched the air unit's own user-0 reading (snr~10.2-10.3dB,
+     * gain=[20,103]) almost exactly -- two independent daemons agreeing on
+     * the same physical link is strong evidence index 0 itself is
+     * correctly aligned. bitrate_ctl.c's read_ldpc_ratio() already only
+     * reads index 0 for exactly this reason. Do not loop over further
+     * indices here until the real stride is confirmed. */
+    bb_get_user_quality_in_t uq_in = { .user_bmp = 0xffff, .average = 0 };
+    bb_get_user_quality_out_t uq_out;
+    memset(&uq_out, 0, sizeof(uq_out));
+    if (bb_ioctl(g_hbb, BB_GET_USER_QUALITY, &uq_in, &uq_out) == 0) {
+        bb_quality_t *q = &uq_out.qualities[0];
+        if (q->snr || q->ldpc_num || q->gain_a || q->gain_b) {
+            double ratio = q->ldpc_num ? (double)q->ldpc_err / (double)q->ldpc_num : 0.0;
+            printf("user 0 quality: snr=%.1fdB ldpc=%u/%u (%.1f%%) gain=[%u,%u]\n", snr_to_db(q->snr),
+                   q->ldpc_err, q->ldpc_num, ratio * 100.0, q->gain_a, q->gain_b);
+        }
+    }
+
+    bb_get_peer_quality_in_t pq_in = { .slot_bmp = st_out.cfg_sbmp, .arverage = 0 };
+    bb_get_peer_quality_out_t pq_out;
+    memset(&pq_out, 0, sizeof(pq_out));
+    if (bb_ioctl(g_hbb, BB_GET_PEER_QUALITY, &pq_in, &pq_out) == 0) {
+        bb_quality_t *q = &pq_out.qualities[0];
+        if ((st_out.cfg_sbmp & 1u) && (q->snr || q->ldpc_num || q->gain_a || q->gain_b)) {
+            double ratio = q->ldpc_num ? (double)q->ldpc_err / (double)q->ldpc_num : 0.0;
+            printf("peer slot 0 quality: snr=%.1fdB ldpc=%u/%u (%.1f%%) gain=[%u,%u]\n", snr_to_db(q->snr),
+                   q->ldpc_err, q->ldpc_num, ratio * 100.0, q->gain_a, q->gain_b);
+        }
+    }
+
     /* Ranging ("dist_calc" in ar8030.json -- enable/window/timeout/offset,
-     * matching bb_conf_distc_t's own fields exactly) is already enabled in
-     * this project's own config, so this just reads back whatever it's
-     * already producing rather than needing to turn anything on first.
-     * Raw units: the SDK's own doc comment gives no calibrated unit (just
-     * "-1 = no ranging result, >= 0 = ranging result"), so this prints the
-     * raw value rather than fabricate a meters conversion with no source
-     * for the scale factor. Read for every configured slot, same cfg_sbmp
+     * matching bb_conf_distc_t's own fields exactly) has *never* actually
+     * produced a result on real hardware despite that config already
+     * having enable:true, which is exactly the symptom
+     * lc_pair_apply_known_candidate() (lifecycle_pair.c) already hit for
+     * pairing candidates: BB_SET_CANDIDATES/BB_SET_AP_MAC live in the
+     * chip's volatile RAM and are confirmed (via decompile of stock
+     * ar_ldy_gnd) to NOT be loaded from the on-disk JSON at boot --
+     * something has to push them live every time. Testing the same
+     * suspicion here: push BB_CFG_DISTC live, with the identical
+     * enable/window/timeout/offset values already sitting unused in
+     * ar8030.json, immediately before reading BB_GET_DISTC_RESULT below,
+     * and log its return so a run on real hardware shows straight away
+     * whether the chip even accepts this command (this SDK build has
+     * already been caught silently not implementing at least one other
+     * BB_CFG_* command -- BB_CFG_SLOT_RX_MCS's bw_auto policy, "req 5 not
+     * found", see this file's own top-of-file comment) or whether it's
+     * accepted but ranging still needs something else. Raw units: the
+     * SDK's own doc comment gives no calibrated unit (just "-1 = no
+     * ranging result, >= 0 = ranging result"), so this prints the raw
+     * value rather than fabricate a meters conversion with no source for
+     * the scale factor. Read for every configured slot, same cfg_sbmp
      * filter as the link_status loop above. */
+    bb_conf_distc_t distc_cfg = {
+        .enable  = 1,
+        .window  = 3,
+        .timeout = 63,
+        .offset  = 20,
+    };
+    int distc_ret = bb_ioctl(g_hbb, BB_CFG_DISTC, &distc_cfg, NULL);
+    printf("BB_CFG_DISTC(enable=1,window=3,timeout=63,offset=20): ret=%d\n", distc_ret);
+
     bb_get_distc_result_in_t dist_in = { .slot_bmp = st_out.cfg_sbmp };
     bb_get_distc_result_out_t dist_out;
     memset(&dist_out, 0, sizeof(dist_out));
@@ -617,6 +718,86 @@ static int cmd_status(int argc, char **argv)
         }
     }
 
+    return 0;
+}
+
+/* BB_GET_RETX_EVENT_STATUS / BB_SET_RETX_EVENT_STATUS -- the windowed
+ * retransmission controller's own tuning parameters (how aggressively
+ * the baseband declares this link "in trouble" and re-sends), NOT the
+ * same thing as BB_SET_RETX_COUNT (a separate, unrelated per-slot max-
+ * retries cap this tool doesn't touch). Both opcodes were missing from
+ * this SDK build entirely (like BB_SET_MCS_ITEM, see mcs-table's own
+ * comment) and were added here from an external firmware analysis,
+ * independently confirmed by this project via Ghidra decompile of the
+ * vendor streamer binary -- see bb_retx_cfg_t's own doc comment in
+ * bb_api.h for exactly what is and isn't verified. Only the first 5 of
+ * the struct's 136 bytes are meaningful; the rest print as raw hex for
+ * completeness only.
+ *
+ * CONFIRMED DEAD END on real hardware (2026-09, live-monitoring a real
+ * link): those remaining 131 bytes are not a stable per-opcode record
+ * at all -- they're leaked, reused ar8030d-internal buffer memory. One
+ * captured sample decoded byte-for-byte as the daemon's own literal log
+ * string, `[ 0][ERR] bb_ioctl: req 0x0100006B failed -1\r\n`, i.e. a
+ * completely unrelated BB_GET_1V1_INFO failure's own error message,
+ * left over in whatever buffer this opcode's reply happened to reuse.
+ * Other samples showed pointer-looking values in the same byte range.
+ * Never build a control loop (retx-pressure signal, etc.) on anything
+ * past byte 4 of this struct -- there is nothing stable there to read. */
+static void print_retx_cfg(const bb_retx_cfg_t *cfg)
+{
+    printf("win=%u busy=%u idle=%u conti_busy=%u conti_idle=%u\n", cfg->win, cfg->busy, cfg->idle,
+           cfg->conti_busy, cfg->conti_idle);
+    printf("reserved[131] (leaked ar8030d-internal memory, not real protocol data -- see this "
+           "function's own comment):");
+    for (size_t i = 0; i < sizeof(cfg->reserved); i++)
+        printf(" %02x", cfg->reserved[i]);
+    printf("\n");
+}
+
+static int cmd_retx(int argc, char **argv)
+{
+    bb_retx_cfg_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (bb_ioctl(g_hbb, BB_GET_RETX_EVENT_STATUS, NULL, &cfg)) {
+        fprintf(stderr, "linkctl: BB_GET_RETX_EVENT_STATUS failed\n");
+        return 1;
+    }
+    printf("current: ");
+    print_retx_cfg(&cfg);
+
+    if (argc < 2 || strcmp(argv[1], "--set") != 0)
+        return 0;
+
+    if (argc != 7) {
+        fprintf(stderr, "linkctl: retx --set needs exactly 5 values: win busy idle conti_busy conti_idle\n");
+        return 1;
+    }
+    fprintf(stderr,
+            "linkctl: WARNING -- live SET after boot is UNVERIFIED on real hardware (the vendor\n"
+            "app itself only ever calls this once, at its own init). Test from a clean boot,\n"
+            "expect the link may need to be re-established, and read back below to see\n"
+            "whether anything actually changed.\n");
+    bb_retx_cfg_t set_cfg;
+    memset(&set_cfg, 0, sizeof(set_cfg));
+    set_cfg.win = (uint8_t)strtoul(argv[2], NULL, 10);
+    set_cfg.busy = (uint8_t)strtoul(argv[3], NULL, 10);
+    set_cfg.idle = (uint8_t)strtoul(argv[4], NULL, 10);
+    set_cfg.conti_busy = (uint8_t)strtoul(argv[5], NULL, 10);
+    set_cfg.conti_idle = (uint8_t)strtoul(argv[6], NULL, 10);
+
+    int ret = bb_ioctl(g_hbb, BB_SET_RETX_EVENT_STATUS, &set_cfg, NULL);
+    printf("BB_SET_RETX_EVENT_STATUS(");
+    print_retx_cfg(&set_cfg);
+    printf("): ret=%d\n", ret);
+    if (ret)
+        return 1;
+
+    memset(&cfg, 0, sizeof(cfg));
+    if (bb_ioctl(g_hbb, BB_GET_RETX_EVENT_STATUS, NULL, &cfg) == 0) {
+        printf("read back: ");
+        print_retx_cfg(&cfg);
+    }
     return 0;
 }
 
@@ -1118,6 +1299,8 @@ int main(int argc, char **argv)
         rc = cmd_mcs_range(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs-table"))
         rc = cmd_mcs_table(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "retx"))
+        rc = cmd_retx(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power-mode"))
         rc = cmd_power_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power"))

@@ -93,6 +93,22 @@ typedef struct {
     uint32_t roi_max_kbps;
     int roi_recovery_ms;
 
+    /* Third, independent backoff signal alongside MCS throughput and ring
+     * backlog above: BB_GET_USER_QUALITY's LDPC block-error ratio
+     * (ldpc_err/ldpc_num) on this side's own physical user. This is the
+     * closest signal already available to this project (no unverified/
+     * unregistered opcode needed -- see baseband-firmware-analysis doc)
+     * to the vendor streamer's own fpv_bb_is_send_retx_too_many() radio-
+     * repair-pressure check, which stock uses to trigger exactly this
+     * kind of bitrate cut. Bypasses hysteresis like the ring path (an
+     * LDPC error burst is itself the kind of thing worth reacting to
+     * immediately), with its own short rate limit -- see bitrate_ctl.c's
+     * read site. 0 disables this path entirely (falls back to MCS+ring-
+     * only behavior, matching how ring == NULL already disables that
+     * path). */
+    double ldpc_ratio_high; /* e.g. 0.10 -- ldpc_err/ldpc_num at/above this trips the backoff */
+    double ldpc_backoff;    /* multiplies last_applied_kbps when tripped, e.g. 0.85 */
+
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;
 

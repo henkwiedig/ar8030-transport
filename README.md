@@ -319,6 +319,64 @@ the boundary. Any residual overshoot from turning ROI on is just more
 backlog, handled by this same loop on its next tick like any other
 overshoot source; no separate bitrate compensation is attempted.
 
+**Third signal: LDPC block-error ratio.** MCS and ring backlog above are
+both blind to a real failure mode an external firmware
+reverse-engineering analysis (static analysis of the AR8030 baseband
+firmware and vendor streamer binary, not part of this repo) surfaced: the
+stock vendor
+streamer's own `fpv_video_buffer_cache_monitor()` also checks
+`fpv_bb_is_send_retx_too_many()` and cuts bitrate specifically when the
+baseband's own retransmission/FEC layer is under repair pressure — a
+"radio actively fixing errors" signal that this project's loop had no
+equivalent of. The doc's own reverse-engineered windowed retx-event
+controller (`BB_GET_RETX_EVENT_STATUS`/`BB_SET_RETX_EVENT_STATUS`) has
+since been added (same "req %x not found" gap `BB_SET_MCS_ITEM` had
+before its own patch — see `0031-bb_api-add-missing-BB_RETX_EVENT_STATUS.patch`,
+mirrored to sbc-groundstations as `0024-*`) and confirmed live: a `SET`
+after boot really does take effect (read back matches every value
+written, swept across the full range with no adverse link effect), and
+`ar8030-lifecycled` now exposes it as a runtime-tunable
+(`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`,
+mirroring `/api/v1/bandwidth`'s own mailbox pattern, persisted to an
+`ar8030.retx` sidecar and re-applied on every connect — vendor defaults
+`10,6,4,2,0` apply automatically when nothing's been persisted, since an
+unconfigured controller has no meaningful state to ever read a signal
+from). But it does **not** feed `bitrate_ctl.c` as a rate-control
+signal, and is not expected to: live-monitoring the reply on a real
+link found the struct's 131 bytes past its 5 documented fields are not
+real per-opcode data at all, just leaked/reused `ar8030d`-internal
+buffer memory (one captured sample decoded byte-for-byte as the
+daemon's own unrelated error log string). There is no retx-pressure
+signal to read from this opcode. What's used instead for the LDPC
+signal below, with zero RE risk, is `BB_GET_USER_QUALITY`'s
+already-fully-typed `bb_quality_t`
+(`snr`, `ldpc_err`, `ldpc_num`, `gain_a`, `gain_b`) — the LDPC block-error
+ratio (`ldpc_err`/`ldpc_num`) is a direct measure of how much FEC repair
+work the baseband is doing right now, and the closest available proxy to
+the vendor's own signal without the unverified opcode. `bitrate_ctl.c`
+checks this every ~250ms (`ldpc_ratio_high`, default 0.10) and cuts the
+last-applied bitrate by `ldpc_backoff` (default 0.85) the same way the
+ring-backlog path does — bypassing hysteresis, cut only (recovery happens
+through the normal MCS-driven path's next poll).
+
+Confirmed live on real hardware: the vendor SDK's own `bb_quality_t`
+(used by `BB_GET_USER_QUALITY` and `BB_GET_PEER_QUALITY`) was declared
+8 bytes but the real per-entry wire size is 16 — every call was silently
+truncated by the client library's own reply-length clamp, spamming
+"reply datalen=160 exceeds expected 80, truncating" on every single call
+once this project started polling it at a useful cadence. Fixed at the
+source rather than worked around: `0030-bb_api-fix-bb_quality_t-real-size.patch`
+(mirrored to sbc-groundstations as `0023-*`) widens `bb_quality_t` by the
+confirmed-real 8 extra bytes (not yet decoded, but confirmed genuinely
+populated on the wire rather than padding), so the daemon's real reply is
+never truncated. `qualities[0]` is the only array index confirmed
+populated on this firmware's single-user-mode link (cross-validated
+between air and ground — see this patch's own commit message for the
+full investigation); every other index reads zero.
+`ar8030-linkctl status` also now prints this same per-user/peer LDPC ratio
+(plus `BB_GET_PEER_QUALITY` for the connected peer's own slot) for
+visibility outside the control loop.
+
 ## Frame-shm ring: surviving a waybeam restart
 
 `ar8030-transport-tx` attaches to waybeam's frame-shm ring
@@ -1773,6 +1831,29 @@ design rationale):
   the same reasoning rules out a second thread in *this* process making
   concurrent `bb_ioctl` calls on the same handle).
   `curl -X POST 'http://<host>:8899/api/v1/bandwidth?mhz=20'`.
+- **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
+  -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
+  the windowed retransmission controller's own tuning parameters
+  (`BB_SET_RETX_EVENT_STATUS`, see `lifecycle_tuning.h`'s own doc comment
+  on `lc_retx_apply()`). All 5 values are required (0-255 each) -- there
+  is no partial-update support, since this process doesn't cache the
+  chip's own current values anywhere it could fill gaps in from; read
+  `ar8030-linkctl retx` first if you only want to change one field.
+  Persists to an `ar8030.retx` sidecar next to `cfg_path`, and the
+  vendor's own defaults (`win=10,busy=6,idle=4,conti_busy=2,
+  conti_idle=0` -- confirmed SAFE by this project's own hardware sweep,
+  not confirmed *correct*: the units of these thresholds are still
+  unverified) apply automatically on every connect when nothing has
+  been persisted yet, so the controller is never left in its raw,
+  never-configured state.
+  `curl -X POST 'http://<host>:8899/api/v1/retx-tuning?win=10&busy=6&idle=4&conti_busy=2&conti_idle=0'`.
+  **Confirmed NOT usable as a rate-control signal**: live-monitoring
+  `BB_GET_RETX_EVENT_STATUS`'s reply on a real link found the struct's
+  131 bytes past these 5 fields are leaked/reused `ar8030d`-internal
+  buffer memory, not real per-opcode telemetry (one captured sample
+  decoded byte-for-byte as the daemon's own unrelated error log string)
+  -- this endpoint exists for tuning the controller itself, not for
+  reading retx pressure back out of it.
 - **`POST /api/v1/linkctl?cmd=<subcommand>&args=<space-separated args>`**
   -- a generic, allow-listed passthrough to the standalone
   `ar8030-linkctl` binary, covering every one of its own subcommands
@@ -1807,9 +1888,17 @@ design rationale):
 
 - **FEC.** `ar8030_chunk_hdr.reserved` is the only field reserved for
   this; no implementation yet. A chunk lost today just drops its frame.
-- **Cross-link telemetry-based bitrate.** The current loop only uses
-  each side's own local `BB_GET_MCS` reading; no RTT/loss feedback from
-  the peer.
+- **Cross-link telemetry-based bitrate.** The loop now also reads
+  `BB_GET_USER_QUALITY`'s local LDPC block-error ratio (see "Bitrate
+  control" above) — still no RTT/loss feedback carried *from the peer*
+  over the link itself. The baseband's own windowed retx-event
+  controller (`BB_GET_RETX_EVENT_STATUS`) is now wired in as a tunable
+  (see "HTTP control API"'s own `/api/v1/retx-tuning` above) but
+  confirmed NOT usable as a rate-
+  control signal — its own reply carries no real telemetry past 5
+  configured bytes (see that section's own comment on the leaked-memory
+  finding), so there is nothing left to gate a bitrate loop on via this
+  opcode.
 - **Per-MCS-level bitrate margin table.** `bitrate_ctl.c` applies one
   flat `-m` margin to whatever `BB_GET_MCS` reports. The vendor's own
   `fpv_bb_get_cur_tgt_videobitrate` (reverse-engineered from
