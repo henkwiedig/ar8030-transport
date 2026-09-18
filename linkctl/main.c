@@ -29,9 +29,11 @@
 #include "bb_dev.h"
 
 #include <math.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void usage(const char *argv0)
@@ -131,9 +133,22 @@ static void usage(const char *argv0)
             "      to this SDK build from an external firmware analysis,\n"
             "      independently confirmed via Ghidra (see linkctl/main.c's own\n"
             "      cmd_retx comment). Only the first 5 of 136 bytes are decoded;\n"
-            "      the rest print as raw hex. --set is UNVERIFIED on real\n"
-            "      hardware (live-SET-after-boot behavior unconfirmed) --\n"
-            "      always read back and test from a clean boot.\n"
+            "      the rest print as raw hex (confirmed leaked ar8030d-internal\n"
+            "      memory, not real data). --set is confirmed to take effect live\n"
+            "      after boot (unlike the vendor's own app, which only ever sets\n"
+            "      this once, at its own init) -- still always read back.\n"
+            "\n"
+            "  retx-watch\n"
+            "      Live-monitor BB_EVENT_RETX_TOO_MANY -- the actual event the\n"
+            "      vendor streamer subscribes to and polls before cutting\n"
+            "      bitrate (independently recovered via Ghidra decompile of\n"
+            "      fpv_bb_is_send_retx_too_many(), NOT the same thing as the\n"
+            "      `retx` command above; see BB_EVENT_RETX_TOO_MANY's own doc\n"
+            "      comment in bb_api.h). Prints one line per firing plus a 10s\n"
+            "      heartbeat, until Ctrl-C. Unlike every other command here,\n"
+            "      this one does not exit after one bb_ioctl -- it's meant for\n"
+            "      watching this fire live while forcing real link stress (e.g.\n"
+            "      moving the peer out of range).\n"
             "\n"
             "  power-mode [auto|manual]\n"
             "      With no argument, reads back the current mode (BB_GET_POWER_MODE).\n"
@@ -801,6 +816,90 @@ static int cmd_retx(int argc, char **argv)
     return 0;
 }
 
+/* Bumped by on_retx_too_many_event() -- see that callback's own comment
+ * for why `arg` is never dereferenced. Signal-safe-cheap per
+ * bb_event_callback's own "synchronous locally" doc comment in
+ * bb_api.h, same constraint tx/bitrate_ctl.c's own callbacks already
+ * follow. */
+static volatile sig_atomic_t g_retx_too_many;
+static volatile sig_atomic_t g_stop_watch;
+
+static void on_retx_too_many_event(void *arg, void *user)
+{
+    (void)arg;
+    (void)user;
+    g_retx_too_many++;
+}
+
+static void on_sigint(int sig)
+{
+    (void)sig;
+    g_stop_watch = 1;
+}
+
+static uint64_t watch_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* Deliberately NOT one-shot, unlike every other command in this file
+ * (see this file's own top-of-file comment on that general design) --
+ * a live event monitor is the natural way to actually verify
+ * BB_EVENT_RETX_TOO_MANY fires on real link stress (e.g. moving the
+ * peer out of range) without digging through ar8030d's own text log
+ * (the daemon_log directory). Runs until Ctrl-C, printing one line per firing
+ * plus a periodic heartbeat so it's clear the subscription itself is
+ * still alive even during a long quiet stretch. See bb_api.h's own
+ * BB_EVENT_RETX_TOO_MANY doc comment for what is and isn't confirmed
+ * about this event (notably: `arg`'s payload layout is not, so this
+ * only ever counts firings, never inspects one). */
+static int cmd_retx_watch(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    bb_set_event_callback_t sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.event = BB_EVENT_RETX_TOO_MANY;
+    sub.callback = on_retx_too_many_event;
+    sub.user = NULL;
+    int ret = bb_ioctl(g_hbb, BB_SET_EVENT_SUBSCRIBE, &sub, NULL);
+    if (ret) {
+        fprintf(stderr, "linkctl: BB_SET_EVENT_SUBSCRIBE(RETX_TOO_MANY) failed (ret=%d)\n", ret);
+        return 1;
+    }
+    printf("watching for BB_EVENT_RETX_TOO_MANY -- Ctrl-C to stop\n");
+
+    signal(SIGINT, on_sigint);
+
+    sig_atomic_t last_seen = 0;
+    uint64_t last_heartbeat_ms = watch_now_ms();
+    while (!g_stop_watch) {
+        usleep(100 * 1000);
+        sig_atomic_t now_count = g_retx_too_many;
+        uint64_t now = watch_now_ms();
+        if (now_count != last_seen) {
+            printf("[%llu.%03llus] BB_EVENT_RETX_TOO_MANY fired (count=%d)\n", (unsigned long long)(now / 1000),
+                   (unsigned long long)(now % 1000), (int)now_count);
+            last_seen = now_count;
+            last_heartbeat_ms = now;
+        } else if (now - last_heartbeat_ms >= 10000) {
+            printf("[%llu.%03llus] still watching (count=%d)\n", (unsigned long long)(now / 1000),
+                   (unsigned long long)(now % 1000), (int)now_count);
+            last_heartbeat_ms = now;
+        }
+    }
+    printf("stopped -- total firings: %d\n", (int)g_retx_too_many);
+
+    bb_set_event_callback_t unsub;
+    memset(&unsub, 0, sizeof(unsub));
+    unsub.event = BB_EVENT_RETX_TOO_MANY;
+    bb_ioctl(g_hbb, BB_SET_EVENT_UNSUBSCRIBE, &unsub, NULL);
+    return 0;
+}
+
 static int cmd_bandwidth(int argc, char **argv)
 {
     int slot = 0, dir = BB_DIR_TX, wait_s = 0;
@@ -1301,6 +1400,8 @@ int main(int argc, char **argv)
         rc = cmd_mcs_table(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))
         rc = cmd_retx(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "retx-watch"))
+        rc = cmd_retx_watch(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power-mode"))
         rc = cmd_power_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "power"))

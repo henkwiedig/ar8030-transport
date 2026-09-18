@@ -109,6 +109,29 @@ typedef struct {
     double ldpc_ratio_high; /* e.g. 0.10 -- ldpc_err/ldpc_num at/above this trips the backoff */
     double ldpc_backoff;    /* multiplies last_applied_kbps when tripped, e.g. 0.85 */
 
+    /* Fourth backoff signal: BB_EVENT_RETX_TOO_MANY, the actual event the
+     * vendor streamer subscribes to and polls via its own
+     * fpv_bb_is_send_retx_too_many() before cutting bitrate -- this is
+     * the real mechanism the ldpc_* fields above were originally only a
+     * proxy for (LDPC ratio was the closest ALREADY-REGISTERED signal at
+     * the time; this event id itself was missing from the SDK's own
+     * bb_event_e entirely and had to be independently recovered via
+     * Ghidra decompile, tracing fpv_bb_is_send_retx_too_many() back to
+     * its actual trigger -- see BB_EVENT_RETX_TOO_MANY's own doc comment
+     * in bb_api.h). Deliberately NOT parsed for payload: bb_event_callback's
+     * own doc comment says `arg` is event-specific, but this event's
+     * payload layout is only known second-hand (the vendor app's own
+     * local re-derivation after its own internal IPC indirection, not a
+     * directly-confirmed `arg` layout for THIS SDK's own callback
+     * delivery) -- so the callback here only bumps a counter, exactly
+     * like the existing BB_EVENT_MCS_CHANGE/BB_EVENT_LINK_STATE
+     * subscriptions already do, and the main loop treats every firing as
+     * the same conservative "radio is actively under repair pressure"
+     * hint regardless of whatever gating condition the vendor's own
+     * payload parsing might apply. Bypasses hysteresis like the ring/LDPC
+     * paths, with its own rate limit. 0 disables this path entirely. */
+    double retx_event_backoff; /* multiplies last_applied_kbps on every event firing, e.g. 0.85 */
+
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;
 

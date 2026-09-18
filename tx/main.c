@@ -544,6 +544,10 @@ int main(int argc, char **argv)
     bc_cfg.ldpc_ratio_high = 0.10; /* see bitrate_ctl.h's own comment: >=10% LDPC blocks failing is
                                      * treated as the radio actively under repair pressure */
     bc_cfg.ldpc_backoff = 0.85;    /* same cut factor as ring_backoff above */
+    bc_cfg.retx_event_backoff = 0.85; /* see bitrate_ctl.h's own comment: fires on every
+                                        * BB_EVENT_RETX_TOO_MANY, the vendor's own real
+                                        * retx-pressure signal (independently recovered via
+                                        * Ghidra, not in the SDK's own bb_event_e) */
     bc_cfg.stop_flag = &g_stop;
 
     pthread_t bc_thread;

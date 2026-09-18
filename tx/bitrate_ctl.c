@@ -22,6 +22,21 @@ static void on_link_event(void *arg, void *user)
     g_wake++;
 }
 
+/* Separate counter from g_wake above -- this one drives an immediate,
+ * rate-limited backoff in the main loop (see the ldpc/ring paths' own
+ * shape), not just a "check sooner" hint for the ordinary MCS-driven
+ * poll. Deliberately does not touch `arg`: see bitrate_ctl.h's own
+ * comment on retx_event_backoff for why this event's payload layout
+ * isn't trusted. Same signal-safe-cheap constraint as on_link_event. */
+static volatile sig_atomic_t g_retx_too_many;
+
+static void on_retx_too_many_event(void *arg, void *user)
+{
+    (void)arg;
+    (void)user;
+    g_retx_too_many++;
+}
+
 static uint64_t now_ms(void)
 {
     struct timespec ts;
@@ -134,6 +149,10 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
  * path again -- see this project's own SDK patch series. */
 #define LDPC_BACKOFF_MIN_INTERVAL_MS 250
 
+/* Same rate-limit class as LDPC_BACKOFF_MIN_INTERVAL_MS above -- see
+ * bitrate_ctl.h's own comment on retx_event_backoff. */
+#define RETX_EVENT_BACKOFF_MIN_INTERVAL_MS 250
+
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 {
     /* Loaded once here via the same atomic accessor the rest of this file
@@ -175,14 +194,38 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         bb_ioctl(dev, BB_SET_EVENT_SUBSCRIBE, &sub_link, NULL);
     }
 
+    /* BB_EVENT_RETX_TOO_MANY -- see bitrate_ctl.h's own comment on
+     * retx_event_backoff. Best-effort like the two subscriptions above:
+     * a failure here (plausible on older firmware that never raises
+     * this id) just means this backoff path never fires, not a reason
+     * to abort the whole control loop. cfg->retx_event_backoff == 0
+     * skips subscribing at all, matching how ring == NULL already skips
+     * that path entirely. */
+    if (dev && cfg->retx_event_backoff > 0.0) {
+        bb_set_event_callback_t sub_retx;
+        memset(&sub_retx, 0, sizeof(sub_retx));
+        sub_retx.event = BB_EVENT_RETX_TOO_MANY;
+        sub_retx.callback = on_retx_too_many_event;
+        sub_retx.user = NULL;
+        int retx_sub_ret = bb_ioctl(dev, BB_SET_EVENT_SUBSCRIBE, &sub_retx, NULL);
+        if (retx_sub_ret) {
+            fprintf(stderr,
+                    "bitrate_ctl: BB_SET_EVENT_SUBSCRIBE(RETX_TOO_MANY) failed (ret=%d) -- "
+                    "this backoff path will never fire\n",
+                    retx_sub_ret);
+        }
+    }
+
     uint32_t last_applied_kbps = 0;
     int have_applied = 0;
     uint64_t last_apply_ms = 0;
     sig_atomic_t last_seen_wake = 0;
+    sig_atomic_t last_seen_retx_too_many = 0;
     int roi_enabled = 0;
     uint64_t last_backlog_ms = 0;
     uint64_t last_roi_disable_attempt_ms = 0;
     uint64_t last_ldpc_apply_ms = 0;
+    uint64_t last_retx_event_apply_ms = 0;
 
     while (!*cfg->stop_flag) {
         usleep(100 * 1000);
@@ -319,6 +362,41 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                         fprintf(stderr,
                                 "bitrate_ctl: waybeam %s returned status=%d (LDPC ratio=%.1f%%)\n", path,
                                 status, ldpc_ratio * 100.0);
+                    }
+                }
+            }
+        }
+
+        /* BB_EVENT_RETX_TOO_MANY backoff: edge-triggered off g_retx_too_many
+         * (set by on_retx_too_many_event(), see bitrate_ctl.h's own
+         * comment on retx_event_backoff), not a threshold check like the
+         * LDPC path above -- there is no ratio to compare here, just "did
+         * this fire since last tick". Rate-limited the same way (own
+         * short interval, independent of the ordinary MCS path's
+         * min_interval_ms) so a burst of several events in quick
+         * succession cuts once, not once per event. Bypasses hysteresis,
+         * cut only -- same shape as every other fast-path signal in this
+         * file. */
+        if (cfg->retx_event_backoff > 0.0 && have_applied &&
+            (now - last_retx_event_apply_ms) >= (uint64_t)RETX_EVENT_BACKOFF_MIN_INTERVAL_MS) {
+            sig_atomic_t retx_too_many_now = g_retx_too_many;
+            if (retx_too_many_now != last_seen_retx_too_many) {
+                last_seen_retx_too_many = retx_too_many_now;
+                last_retx_event_apply_ms = now;
+                uint32_t retx_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->retx_event_backoff),
+                                                  cfg->min_kbps, cfg->max_kbps);
+                if (retx_target < last_applied_kbps) {
+                    char path[128];
+                    snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", retx_target);
+                    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+                    if (status >= 200 && status < 300) {
+                        fprintf(stderr, "bitrate_ctl: BB_EVENT_RETX_TOO_MANY -> video0.bitrate=%u kbps\n",
+                                retx_target);
+                        last_applied_kbps = retx_target;
+                        last_apply_ms = now;
+                    } else {
+                        fprintf(stderr, "bitrate_ctl: waybeam %s returned status=%d (RETX_TOO_MANY)\n", path,
+                                status);
                     }
                 }
             }
