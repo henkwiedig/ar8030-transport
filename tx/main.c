@@ -158,15 +158,16 @@ static void usage(const char *argv0)
             "  -t <ms>        per-chunk bb_socket_write ack-wait timeout (default %d)\n"
             "  -w <host>      waybeam HTTP host (default %s)\n"
             "  -P <port>      waybeam HTTP port (default %d)\n"
-            "  -m <fraction>  bitrate margin applied to link throughput (default 0.70)\n"
+            "  -m <fraction>  bitrate margin applied to link throughput (default 0.545)\n"
             "  -n <kbps>      minimum bitrate floor (default 512)\n"
-            "  -x <kbps>      maximum bitrate ceiling (default 20000)\n"
-            "  -Q <slots>     ring backlog that triggers an URGENT bitrate cut (default 2; the\n"
+            "  -x <kbps>      maximum bitrate ceiling (default 35000)\n"
+            "  -Q <slots>     ring backlog that triggers an URGENT bitrate cut (default 6; the\n"
             "                 ring has 8 slots, one frame each -- higher reacts later, tolerates bursts)\n"
-            "  -K <fraction>  bitrate multiplier applied per URGENT cut (default 0.85)\n"
+            "  -K <fraction>  bitrate multiplier applied per URGENT cut (default 0.92)\n"
             "  -B <bytes>     socket tx_buf_size option (default 65536)\n"
             "  -R <bytes>     socket rx_buf_size option (default 1024)\n"
-            "  -X             open the socket RX|TX (stock does) instead of TX only\n"
+            "  -N             open the socket TX only (default is RX|TX like stock, which also\n"
+            "                 makes the daemon count it for `ar8030-linkctl rate`)\n"
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
@@ -186,18 +187,18 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->write_timeout_ms = DEFAULT_WRITE_TIMEOUT_MS;
     a->waybeam_host = DEFAULT_WAYBEAM_HOST;
     a->waybeam_port = DEFAULT_WAYBEAM_PORT;
-    a->margin = 0.70;
+    a->margin = 0.545; /* 20 Mbit/s of the 36.7 Mbit/s frame-changed link: the real drain rate is ~21.5, stock holds 21.3 */
     a->min_kbps = 512;
-    a->max_kbps = 20000;
+    a->max_kbps = 35000;
     a->verbose = 0;
     a->sock_tx_buf = 64 * 1024;
     a->sock_rx_buf = 1024;
-    a->sock_bidir = 0;
-    a->ring_backlog_slots = 2;
-    a->ring_backoff = 0.85;
+    a->sock_bidir = 1;
+    a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
+    a->ring_backoff = 0.92;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:Xvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:XNvh")) != -1) {
         switch (opt) {
         case 'r':
             a->ring_name = optarg;
@@ -240,6 +241,9 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'X':
             a->sock_bidir = 1;
+            break;
+        case 'N':
+            a->sock_bidir = 0;
             break;
         case 'Q':
             a->ring_backlog_slots = (uint32_t)strtoul(optarg, NULL, 10);
@@ -525,6 +529,8 @@ int main(int argc, char **argv)
     const uint32_t sock_flags = args.sock_bidir ? (BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX) : BB_SOCK_FLAG_TX;
     fprintf(stderr, "tx: socket flags=0x%x tx_buf=%u rx_buf=%u write_timeout=%dms port=%d\n", sock_flags,
             sock_opt.tx_buf_size, sock_opt.rx_buf_size, args.write_timeout_ms, args.port);
+    fprintf(stderr, "tx: bitrate control margin=%.3f min=%u max=%u kbps backlog_slots=%u backoff=%.2f\n", args.margin,
+            args.min_kbps, args.max_kbps, args.ring_backlog_slots, args.ring_backoff);
     /* Same force-close + retry as the reconnect path below (see its own,
      * longer comment) -- confirmed live that this exact failure isn't
      * specific to reconnecting: it also hit a genuinely fresh startup
