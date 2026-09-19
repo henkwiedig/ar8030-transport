@@ -52,6 +52,9 @@ typedef struct {
     char cfg_path[256];
 
     int default_bandwidth;
+    /* BB_SET_FRAME_CHANGE(mode=1) on the AP after every connect, 0 = leave
+     * the chip's own frame structure alone. See lc_frame_change_apply(). */
+    int frame_change;
     int default_channel; /* -1 = unset, no channel override at connect time */
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */

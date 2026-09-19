@@ -90,6 +90,15 @@ int lc_retx_save(const char* cfg_path, int win, int busy, int idle, int conti_bu
 
 /* Applies the 5 values via BB_SET_RETX_EVENT_STATUS (chip-wide, no slot
  * parameter). Returns the ioctl's own return code (0 on success). */
+/* BB_SET_FRAME_CHANGE (1V1 only). mode=1 exchanges the frame structure
+ * (confirmed live on air: BB_GET_MCS throughput at MCS 12 / 20M goes from
+ * 25933 to 36688 kbps, matching what stock reaches); mode=0 restores the
+ * original. Does not survive a reboot or re-link -- must be re-applied
+ * after every connect. Idempotent: confirmed live that repeating mode=1
+ * on an already-exchanged link leaves throughput unchanged, so it is safe
+ * to re-assert periodically. Returns the ioctl's own return code. */
+int lc_frame_change_apply(bb_dev_handle_t* handle, int mode);
+
 int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int conti_busy, int conti_idle);
 
 #ifdef __cplusplus

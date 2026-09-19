@@ -61,6 +61,8 @@ static void print_help(const char* argv0)
     printf("                            control API\" section)\n");
     printf("  --http-bind <addr>        address to bind the HTTP control API to\n");
     printf("                            (default: 0.0.0.0, every interface)\n");
+    printf("  --frame-change 0|1        AP only: apply BB_SET_FRAME_CHANGE(1) after every connect\n");
+    printf("                            (default 1; 0 leaves the chip's frame structure alone)\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -90,6 +92,7 @@ enum {
     OPT_BIND_GPIO,
     OPT_HTTP_PORT,
     OPT_HTTP_BIND,
+    OPT_FRAME_CHANGE,
 };
 
 static void handle_sigterm(int sig)
@@ -109,6 +112,7 @@ int main(int argc, char** argv)
         .hook_dir          = "/etc/ar8030/hooks.d",
         .cfg_path          = "",
         .default_bandwidth = 20,
+        .frame_change      = 1,
         .default_channel   = -1,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
@@ -129,6 +133,7 @@ int main(int argc, char** argv)
         {"bind-gpio",         required_argument, 0, OPT_BIND_GPIO        },
         {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
         {"http-bind",         required_argument, 0, OPT_HTTP_BIND        },
+        {"frame-change",      required_argument, 0, OPT_FRAME_CHANGE     },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -174,6 +179,9 @@ int main(int argc, char** argv)
             break;
         case OPT_HTTP_PORT:
             cfg.http_port = (uint16_t)strtoul(optarg, NULL, 10);
+            break;
+        case OPT_FRAME_CHANGE:
+            cfg.frame_change = atoi(optarg) ? 1 : 0;
             break;
         case OPT_HTTP_BIND:
             strncpy(cfg.http_bind, optarg, sizeof(cfg.http_bind) - 1);

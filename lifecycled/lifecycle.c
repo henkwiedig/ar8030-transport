@@ -295,6 +295,13 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
         retx.conti_idle = LC_RETX_DEFAULT_CONTI_IDLE;
     }
     lc_retx_apply(ctx->client.handle, retx.win, retx.busy, retx.idle, retx.conti_busy, retx.conti_idle);
+
+    /* AP side only -- it is the controlling side of the 1V1 link (stock
+     * gets ~40 Mbit/s at MCS 12 vs 25.9 without this). Chip-wide, needs an
+     * established link, and is lost on reboot/re-link, hence here. */
+    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
+        lc_frame_change_apply(ctx->client.handle, 1);
+    }
 }
 
 /* Drains lifecycle_request_bandwidth()'s one-slot mailbox, if anything is
@@ -534,6 +541,11 @@ void* lifecycle_thread_main(void* arg)
              * simpler and matches the one thing already proven to work. */
             if (did_fallback_poll && ctx->last_bandwidth > 0) {
                 lc_tuning_apply(ctx->client.handle, ctx->connected_slot, ctx->last_bandwidth);
+                /* Bandwidth renegotiation may reset the frame structure;
+                 * mode=1 is idempotent, so just re-assert it alongside. */
+                if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
+                    lc_frame_change_apply(ctx->client.handle, 1);
+                }
             }
             break;
 

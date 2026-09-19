@@ -239,3 +239,13 @@ int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int cont
            win, busy, idle, conti_busy, conti_idle, ret);
     return ret;
 }
+
+int lc_frame_change_apply(bb_dev_handle_t* handle, int mode)
+{
+    bb_set_frame_change_t fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.mode = mode ? 1 : 0;
+    int ret = bb_ioctl(handle, BB_SET_FRAME_CHANGE, &fc, NULL);
+    lc_log("lifecycle: tuning: BB_SET_FRAME_CHANGE(mode=%u) ret=%d", fc.mode, ret);
+    return ret;
+}
