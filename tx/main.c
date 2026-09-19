@@ -134,6 +134,14 @@ struct tx_args {
     double margin;
     uint32_t min_kbps;
     uint32_t max_kbps;
+    /* Socket experiment knobs (stock's video socket is opened RX|TX with
+     * options {5, 0x800} on port 3 -- see README/docs; these let that be
+     * tried without a rebuild). Defaults keep the previous behaviour. */
+    uint32_t sock_tx_buf;
+    uint32_t sock_rx_buf;
+    int sock_bidir;
+    uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
+    double ring_backoff;         /* bitrate multiplier per URGENT cut */
     int verbose;
 };
 
@@ -153,6 +161,12 @@ static void usage(const char *argv0)
             "  -m <fraction>  bitrate margin applied to link throughput (default 0.70)\n"
             "  -n <kbps>      minimum bitrate floor (default 512)\n"
             "  -x <kbps>      maximum bitrate ceiling (default 20000)\n"
+            "  -Q <slots>     ring backlog that triggers an URGENT bitrate cut (default 2; the\n"
+            "                 ring has 8 slots, one frame each -- higher reacts later, tolerates bursts)\n"
+            "  -K <fraction>  bitrate multiplier applied per URGENT cut (default 0.85)\n"
+            "  -B <bytes>     socket tx_buf_size option (default 65536)\n"
+            "  -R <bytes>     socket rx_buf_size option (default 1024)\n"
+            "  -X             open the socket RX|TX (stock does) instead of TX only\n"
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
@@ -176,9 +190,14 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->min_kbps = 512;
     a->max_kbps = 20000;
     a->verbose = 0;
+    a->sock_tx_buf = 64 * 1024;
+    a->sock_rx_buf = 1024;
+    a->sock_bidir = 0;
+    a->ring_backlog_slots = 2;
+    a->ring_backoff = 0.85;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:Xvh")) != -1) {
         switch (opt) {
         case 'r':
             a->ring_name = optarg;
@@ -212,6 +231,21 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'x':
             a->max_kbps = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'B':
+            a->sock_tx_buf = (uint32_t)strtoul(optarg, NULL, 0);
+            break;
+        case 'R':
+            a->sock_rx_buf = (uint32_t)strtoul(optarg, NULL, 0);
+            break;
+        case 'X':
+            a->sock_bidir = 1;
+            break;
+        case 'Q':
+            a->ring_backlog_slots = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'K':
+            a->ring_backoff = strtod(optarg, NULL);
             break;
         case 'v':
             a->verbose = 1;
@@ -486,8 +520,11 @@ int main(int argc, char **argv)
     }
 
     bb_sock_opt_t sock_opt;
-    sock_opt.tx_buf_size = 64 * 1024;
-    sock_opt.rx_buf_size = 1024;
+    sock_opt.tx_buf_size = args.sock_tx_buf;
+    sock_opt.rx_buf_size = args.sock_rx_buf;
+    const uint32_t sock_flags = args.sock_bidir ? (BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX) : BB_SOCK_FLAG_TX;
+    fprintf(stderr, "tx: socket flags=0x%x tx_buf=%u rx_buf=%u write_timeout=%dms port=%d\n", sock_flags,
+            sock_opt.tx_buf_size, sock_opt.rx_buf_size, args.write_timeout_ms, args.port);
     /* Same force-close + retry as the reconnect path below (see its own,
      * longer comment) -- confirmed live that this exact failure isn't
      * specific to reconnecting: it also hit a genuinely fresh startup
@@ -510,7 +547,7 @@ int main(int argc, char **argv)
     for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
          startup_open_attempt++) {
         startup_open_ret = ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port,
-                                                    BB_SOCK_FLAG_TX, &sock_opt);
+                                                    sock_flags, &sock_opt);
         if (startup_open_ret == 0)
             break;
         usleep(SOCKET_REOPEN_RETRY_MS * 1000);
@@ -535,8 +572,12 @@ int main(int argc, char **argv)
     bc_cfg.min_interval_ms = 1500;
     bc_cfg.poll_interval_ms = 2000;
     bc_cfg.ring = ring; /* already attached above; see bitrate_ctl.h's cfg->ring comment */
-    bc_cfg.ring_backlog_high_slots = 2; /* venc_frame_ring.h: >=2 is standing backlog */
-    bc_cfg.ring_backoff = 0.85;
+    bc_cfg.ring_backlog_high_slots = args.ring_backlog_slots; /* venc_frame_ring.h: >=2 is standing backlog */
+    bc_cfg.ring_backoff = args.ring_backoff;
+    bc_cfg.ramp_step = 0.10;          /* +10% per apply toward the MCS-derived target */
+    bc_cfg.ramp_settle_ms = 3000;     /* no increase until 3s of clear backlog */
+    bc_cfg.probe_ceiling_frac = 0.95; /* after a backlog cut, stay <95% of the offending rate ... */
+    bc_cfg.probe_hold_ms = 15000;     /* ... for 15s, then probe above it again */
     bc_cfg.roi_max_kbps = 3000;    /* last-resort measure: only below ~3Mbit/s (this project's own
                                      * "2-4Mbit/s" call, middle of the range) */
     bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
@@ -655,7 +696,7 @@ int main(int argc, char **argv)
                 int attempt;
                 for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
                     open_ret = ar8030_link_open_socket(&link, (bb_slot_e)slot, (uint32_t)args.port,
-                                                        BB_SOCK_FLAG_TX, &sock_opt);
+                                                        sock_flags, &sock_opt);
                     if (open_ret == 0)
                         break;
                     usleep(SOCKET_REOPEN_RETRY_MS * 1000);

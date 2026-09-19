@@ -129,6 +129,16 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
  * signal itself updates). */
 #define RING_BACKLOG_MIN_INTERVAL_MS 250
 
+/* After an URGENT cut, ignore further backlog for this long. A cut only
+ * takes effect once the encoder has emitted frames at the new rate and
+ * low_water_slots (itself a ~200ms window) has drained the frames that
+ * were already queued, so re-reading backlog every
+ * RING_BACKLOG_MIN_INTERVAL_MS right after a cut sees the *old* burst
+ * again and cuts a second, third, fourth time for one event -- confirmed
+ * live: 25681 -> 21828 -> 18553 -> 15770 -> 13404 kbps within ~1s. One
+ * burst, one cut. */
+#define RING_CUT_HOLDOFF_MS 1500
+
 /* Same rate-limit class as RING_BACKLOG_MIN_INTERVAL_MS above -- this is
  * an RPC (BB_GET_USER_QUALITY), not a shm read, but the same reasoning
  * applies: an LDPC error burst is an "actively under repair pressure"
@@ -223,6 +233,9 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     sig_atomic_t last_seen_retx_too_many = 0;
     int roi_enabled = 0;
     uint64_t last_backlog_ms = 0;
+    uint64_t last_urgent_cut_ms = 0;
+    uint32_t probe_ceiling_kbps = 0; /* 0 = none */
+    uint64_t probe_ceiling_until_ms = 0;
     uint64_t last_roi_disable_attempt_ms = 0;
     uint64_t last_ldpc_apply_ms = 0;
     uint64_t last_retx_event_apply_ms = 0;
@@ -255,7 +268,9 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 
                 uint32_t backlog_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ring_backoff),
                                                       cfg->min_kbps, cfg->max_kbps);
-                int cut_bitrate = backlog_target < last_applied_kbps;
+                int cut_bitrate = backlog_target < last_applied_kbps &&
+                                  (last_urgent_cut_ms == 0 ||
+                                   (now - last_urgent_cut_ms) >= (uint64_t)RING_CUT_HOLDOFF_MS);
 
                 /* Centre-priority ROI (waybeam's fpv.roiEnabled) is a
                  * last-resort measure, not a routine reaction to this
@@ -294,8 +309,17 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                         fprintf(stderr, "bitrate_ctl: URGENT ring backlog=%u slots -> %s\n", backlog_slots,
                                 path);
                         if (cut_bitrate) {
+                            if (cfg->probe_ceiling_frac > 0.0) {
+                                /* the rate that just backlogged is over the
+                                 * link's real ceiling; stay under it for a
+                                 * while (see bitrate_ctl.h) */
+                                probe_ceiling_kbps =
+                                    (uint32_t)((double)last_applied_kbps * cfg->probe_ceiling_frac);
+                                probe_ceiling_until_ms = now + (uint64_t)cfg->probe_hold_ms;
+                            }
                             last_applied_kbps = backlog_target;
                             last_apply_ms = now;
+                            last_urgent_cut_ms = now;
                         }
                         if (want_roi)
                             roi_enabled = 1;
@@ -432,6 +456,27 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         if (have_applied && (now - last_apply_ms) < (uint64_t)cfg->min_interval_ms)
             continue;
 
+        /* Stepwise ramp-up (see bitrate_ctl.h): only ever shapes
+         * increases; decreases fall through untouched. */
+        int ramped = 0;
+        if (have_applied && cfg->ramp_step > 0.0 && target_kbps > last_applied_kbps) {
+            if ((now - last_backlog_ms) < (uint64_t)cfg->ramp_settle_ms)
+                continue;
+            uint32_t step_cap = (uint32_t)((double)last_applied_kbps * (1.0 + cfg->ramp_step));
+            if (step_cap <= last_applied_kbps)
+                step_cap = last_applied_kbps + 1;
+            if (target_kbps > step_cap) {
+                target_kbps = step_cap;
+                ramped = 1;
+            }
+            if (probe_ceiling_kbps && now < probe_ceiling_until_ms && target_kbps > probe_ceiling_kbps) {
+                target_kbps = probe_ceiling_kbps;
+                ramped = 1;
+            }
+            if (target_kbps <= last_applied_kbps)
+                continue;
+        }
+
         /* /api/v1/live/set, not /api/v1/set: this fires routinely (every
          * MCS change plus the poll safety net) and waybeam's own
          * HTTP_API_CONTRACT.md documents /live/set as exactly the
@@ -451,7 +496,8 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             continue; /* try again next tick rather than pinning last_applied to an unapplied value */
         }
 
-        fprintf(stderr, "bitrate_ctl: link=%u kbps -> video0.bitrate=%u kbps\n", link_kbps, target_kbps);
+        fprintf(stderr, "bitrate_ctl: link=%u kbps -> video0.bitrate=%u kbps%s\n", link_kbps, target_kbps,
+                ramped ? " (ramp)" : "");
         last_applied_kbps = target_kbps;
         have_applied = 1;
         last_apply_ms = now;

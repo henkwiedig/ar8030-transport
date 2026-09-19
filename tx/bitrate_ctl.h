@@ -93,6 +93,26 @@ typedef struct {
     uint32_t roi_max_kbps;
     int roi_recovery_ms;
 
+    /* Stepwise ramp-up: any increase toward the MCS-derived target is
+     * capped at last_applied * (1 + ramp_step) per apply, instead of
+     * jumping straight there (which overshot, backlogged, and got cut
+     * again -- a bang-bang sawtooth). 0 disables (jump to target, the old
+     * behaviour). Decreases are never stepped -- cutting is always
+     * immediate.
+     *
+     * ramp_settle_ms: no increase until the ring has shown no backlog for
+     * this long.
+     *
+     * After an URGENT ring cut, increases are additionally held below
+     * probe_ceiling_frac * (the bitrate that just backlogged) for
+     * probe_hold_ms, then allowed to probe above it again (the link's
+     * real ceiling drifts with conditions, so it is never learned
+     * permanently). */
+    double ramp_step;
+    int ramp_settle_ms;
+    double probe_ceiling_frac;
+    int probe_hold_ms;
+
     /* Third, independent backoff signal alongside MCS throughput and ring
      * backlog above: BB_GET_USER_QUALITY's LDPC block-error ratio
      * (ldpc_err/ldpc_num) on this side's own physical user. This is the
