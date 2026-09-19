@@ -94,6 +94,33 @@ static void usage(const char *argv0)
             "      Pass the literal word 'max' for either value to mean\n"
             "      BB_PHY_MCS_MAX (\"no limit\"), per that field's own doc comment.\n"
             "\n"
+            "  mcs-table-air\n"
+            "      Push stock AIR's own 3-entry table (mcs 1,2,5) exactly as\n"
+            "      ar_ldyhs_sky's fpv_ap_reload_mcs_tab() does (note byte 10 = 2).\n"
+            "\n"
+            "  rate [-s slot] [seconds]\n"
+            "      Measured (not theoretical) throughput: samples BB_GET_SOCK_INFO's\n"
+            "      cumulative total_size counters for every open port twice, <seconds>\n"
+            "      apart (default 5), and prints Mbit/s per port and direction plus the\n"
+            "      socket buffer fill. Note: the daemon may only track these counters\n"
+            "      for some socket types -- all-zero means this port isn't counted, not\n"
+            "      that it is idle. Compare BB_GET_MCS's throughput (theoretical).\n"
+            "\n"
+            "  frame-change <0|1>\n"
+            "      BB_SET_FRAME_CHANGE (1V1 only): 1 = exchange frame structure,\n"
+            "      0 = restore the original. Compare BB_GET_MCS throughput after.\n"
+            "\n"
+            "  cfg-dump [-m mode] [file]\n"
+            "      Read the baseband configuration file via BB_GET_CFG (mode\n"
+            "      0 auto, 1 memory, 2 flash). Prints total length + crc16 and,\n"
+            "      with [file], writes the raw bytes there (else hex dump) --\n"
+            "      for diffing stock vs ours.\n"
+            "\n"
+            "  prj-cmd <cmd> [byte ...]\n"
+            "      Raw BB_SET_PRJ_DISPATCH: cmd id (dec/0x hex) + up to 252\n"
+            "      payload bytes. Stock init uses 0x8c <0|1> (rfo_kikp), 0x8a\n"
+            "      <ch> <u32> (adc_meas), 0xcb 0 0 0x01 0x03 ... (rf_path_b).\n"
+            "\n"
             "  mcs-table <0|1|2> [mcs]\n"
             "      Push a whole MCS policy table (7 entries covering mcs 1,2,5,\n"
             "      7,8,10,12) via BB_SET_MCS_ITEM, all on slot 0. Reverse-\n"
@@ -1237,6 +1264,217 @@ static int cmd_mcs_table(int argc, char **argv)
     return fail;
 }
 
+/* Stock AIR's table, from ar_ldyhs_sky fpv_ap_reload_mcs_tab @ 0x000685c0
+ * (3 entries only). Byte 10 of the wire struct (rsv2 here) is 2 in every
+ * entry -- unlike the ground table -- so it is set explicitly. */
+static int cmd_mcs_table_air(void)
+{
+    static const struct { uint8_t mcs, up, dwn; uint16_t snr_up, snr_dw, upk, dwk; } air[3] = {
+        { 1, 2, 4, 0x42, 0x2f, 1000, 500 },
+        { 2, 2, 3, 0x83, 0x5d, 500, 10 },
+        { 5, 2, 4, 0xee, 0xa9, 500, 30 },
+    };
+    int fail = 0;
+    for (int i = 0; i < 3; i++) {
+        bb_set_mcs_item_t item;
+        memset(&item, 0, sizeof(item));
+        item.mcs          = air[i].mcs;
+        item.ldpc_up_num  = air[i].up;
+        item.snr_up       = air[i].snr_up;
+        item.snr_dw       = air[i].snr_dw;
+        item.rsv2         = 2;
+        item.ldpc_dw_num  = air[i].dwn;
+        item.up_keep_time = air[i].upk;
+        item.dw_keep_time = air[i].dwk;
+        int ret = bb_ioctl(g_hbb, BB_SET_MCS_ITEM, &item, NULL);
+        printf("BB_SET_MCS_ITEM(air mcs=%u snr_up=%u snr_dw=%u ldpc_up=%u ldpc_dw=%u rsv2=2 up=%ums dw=%ums) ret=%d\n",
+               item.mcs, item.snr_up, item.snr_dw, item.ldpc_up_num, item.ldpc_dw_num,
+               item.up_keep_time, item.dw_keep_time, ret);
+        if (ret) {
+            fail = 1;
+        }
+    }
+    return fail;
+}
+
+/* Raw BB_SET_PRJ_DISPATCH, same 256-byte buffer layout the vendor uses
+ * (byte 0 = cmd id, bytes 1-3 padding, bytes 4.. payload). */
+static int read_sock_info(int slot, bb_get_sock_info_out_t *out)
+{
+    bb_get_sock_info_in_t in = { .slot = (uint8_t)slot, .port = -1 };
+    memset(out, 0, sizeof(*out));
+    return bb_ioctl(g_hbb, BB_GET_SOCK_INFO, &in, out);
+}
+
+static uint64_t mono_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int cmd_rate(int argc, char **argv)
+{
+    int slot = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "s:");
+    while ((opt = getopt(argc, argv, "s:")) != -1) {
+        if (opt == 's') {
+            slot = atoi(optarg);
+        } else {
+            return 1;
+        }
+    }
+    int seconds = optind < argc ? atoi(argv[optind]) : 5;
+    if (seconds < 1) {
+        seconds = 1;
+    }
+
+    bb_get_sock_info_out_t a, b;
+    if (read_sock_info(slot, &a) != 0) {
+        fprintf(stderr, "linkctl: BB_GET_SOCK_INFO failed\n");
+        return 1;
+    }
+    uint64_t t0 = mono_ms();
+    sleep((unsigned)seconds);
+    if (read_sock_info(slot, &b) != 0) {
+        fprintf(stderr, "linkctl: BB_GET_SOCK_INFO failed\n");
+        return 1;
+    }
+    double dt = (double)(mono_ms() - t0) / 1000.0;
+
+    bb_get_mcs_in_t mcs_in = { .dir = BB_DIR_TX, .slot = (uint8_t)slot };
+    bb_get_mcs_out_t mcs_out;
+    memset(&mcs_out, 0, sizeof(mcs_out));
+    if (bb_ioctl(g_hbb, BB_GET_MCS, &mcs_in, &mcs_out) == 0) {
+        printf("theoretical (BB_GET_MCS): mcs=%u throughput=%.1f Mbit/s\n", mcs_out.mcs,
+               mcs_out.throughput / 1000.0);
+    }
+    printf("measured over %.1fs, slot %d:\n", dt, slot);
+    print_bit_list("open ports", b.port_bmp, BB_SOCK_INFO_NUM);
+    int any_counted = 0;
+    for (int p = 0; p < BB_SOCK_INFO_NUM; p++) {
+        if (!(b.port_bmp & (1u << p))) {
+            continue;
+        }
+        for (int d = 0; d < BB_DIR_MAX; d++) {
+            bb_sock_uni_t *u0 = &a.sock_info[p].uni_info[d];
+            bb_sock_uni_t *u1 = &b.sock_info[p].uni_info[d];
+            double mbit = (double)(u1->total_size - u0->total_size) * 8.0 / dt / 1e6;
+            if (u1->total_size)
+                any_counted = 1;
+            printf("  port %d %s: %7.2f Mbit/s  (total=%llu bytes, buf %u/%u, overflow=%u, available=%u)\n", p,
+                   d == BB_DIR_TX ? "tx" : "rx", mbit, (unsigned long long)u1->total_size, u1->data_size,
+                   u1->buf_size, u1->overflow_cnt, u1->available);
+        }
+    }
+    if (!any_counted) {
+        printf("  (all counters zero: the daemon isn't counting these sockets -- see help)\n");
+    }
+    return 0;
+}
+
+static int cmd_frame_change(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "linkctl: frame-change needs 0 or 1\n");
+        return 1;
+    }
+    bb_set_frame_change_t fc;
+    memset(&fc, 0, sizeof(fc));
+    fc.mode = (uint8_t)(atoi(argv[1]) ? 1 : 0);
+    int ret = bb_ioctl(g_hbb, BB_SET_FRAME_CHANGE, &fc, NULL);
+    printf("BB_SET_FRAME_CHANGE(mode=%u) ret=%d\n", fc.mode, ret);
+    return ret ? 1 : 0;
+}
+
+static int cmd_cfg_dump(int argc, char **argv)
+{
+    int mode = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "m:");
+    while ((opt = getopt(argc, argv, "m:")) != -1) {
+        if (opt == 'm') {
+            mode = atoi(optarg);
+        } else {
+            return 1;
+        }
+    }
+    const char *path = optind < argc ? argv[optind] : NULL;
+    FILE *fp = NULL;
+    if (path && !(fp = fopen(path, "wb"))) {
+        perror("linkctl: cfg-dump: fopen");
+        return 1;
+    }
+
+    unsigned offset = 0, total = 0, crc = 0;
+    uint16_t seq = 1;
+    int rc = 0;
+    do {
+        bb_get_cfg_in_t in;
+        bb_get_cfg_out_t out;
+        memset(&in, 0, sizeof(in));
+        memset(&out, 0, sizeof(out));
+        in.seq = seq++;
+        in.mode = (uint8_t)mode;
+        in.offset = (uint16_t)offset;
+        in.length = BB_CFG_PAGE_SIZE - 12;
+        int ret = bb_ioctl(g_hbb, BB_GET_CFG, &in, &out);
+        if (ret) {
+            fprintf(stderr, "linkctl: BB_GET_CFG(offset=%u) failed, ret=%d\n", offset, ret);
+            rc = 1;
+            break;
+        }
+        if (offset == 0) {
+            total = out.total_length;
+            crc = out.total_crc16;
+            printf("cfg: mode=%d total_length=%u crc16=0x%04x\n", mode, total, crc);
+        }
+        if (out.length == 0 || out.length > sizeof(out.data)) {
+            break;
+        }
+        if (fp) {
+            fwrite(out.data, 1, out.length, fp);
+        } else {
+            for (unsigned i = 0; i < out.length; i++) {
+                if (i % 16 == 0) {
+                    printf("%s%04x:", i ? "\n" : "", offset + i);
+                }
+                printf(" %02x", out.data[i]);
+            }
+            printf("\n");
+        }
+        offset += out.length;
+    } while (offset < total);
+
+    if (fp) {
+        fclose(fp);
+        printf("cfg: wrote %u bytes to %s\n", offset, path);
+    }
+    return rc;
+}
+
+static int cmd_prj_cmd(int argc, char **argv)
+{
+    if (argc < 2) {
+        fprintf(stderr, "linkctl: prj-cmd needs <cmd> [byte ...]\n");
+        return 1;
+    }
+    uint8_t buf[256];
+    memset(buf, 0, sizeof(buf));
+    buf[0] = (uint8_t)strtoul(argv[1], NULL, 0);
+    if (argc - 2 > 252) {
+        fprintf(stderr, "linkctl: prj-cmd payload too long (max 252)\n");
+        return 1;
+    }
+    for (int i = 2; i < argc; i++) {
+        buf[4 + i - 2] = (uint8_t)strtoul(argv[i], NULL, 0);
+    }
+    int ret = bb_ioctl(g_hbb, BB_SET_PRJ_DISPATCH, buf, NULL);
+    printf("BB_SET_PRJ_DISPATCH(cmd=0x%02x, %d payload bytes) ret=%d\n", buf[0], argc - 2, ret);
+    return ret ? 1 : 0;
+}
+
 static int cmd_power_mode(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1398,6 +1636,16 @@ int main(int argc, char **argv)
         rc = cmd_mcs_range(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs-table"))
         rc = cmd_mcs_table(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "mcs-table-air"))
+        rc = cmd_mcs_table_air();
+    else if (!strcmp(cmd, "rate"))
+        rc = cmd_rate(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "frame-change"))
+        rc = cmd_frame_change(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "cfg-dump"))
+        rc = cmd_cfg_dump(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "prj-cmd"))
+        rc = cmd_prj_cmd(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))
         rc = cmd_retx(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx-watch"))
