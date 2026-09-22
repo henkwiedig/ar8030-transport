@@ -817,17 +817,17 @@ full command reference (`-h`).
 ## SDIO chardev: implemented, not yet proven (superseded -- see `kmod/`)
 
 **Update: this whole investigation's conclusion is a full clean-room
-rewrite, `kmod/artosyn_drv.c`, which resolved it.** Confirmed on real
+rewrite, `kmod/artosyn_sdio.c`, which resolved it.** Confirmed on real
 hardware: zero stalls, zero bad-socket-pack messages, sustained
 ~18.5Mbit/s, over 439MB transferred across a ~190 second run -- the
 first time in this entire investigation SDIO mode has run completely
 clean, matching the vendor's own reference performance. See "Clean-room
-rewrite: `kmod/artosyn_drv.c`" below for the full story and what's left
+rewrite: `kmod/artosyn_sdio.c`" below for the full story and what's left
 before this fully replaces the patched combined driver in normal use.
 Everything below this point is the investigation history that led
 there -- kept for the reasoning, not as current guidance; don't restart
 patching the old combined driver (`ascent/8030_sdk/yz_host_drv/driver/
-linux`) without first checking whether `kmod/artosyn_drv.c` already
+linux`) without first checking whether `kmod/artosyn_sdio.c` already
 covers what you're trying to fix.
 
 Even with the bandwidth fix above, real (paced) throughput through this
@@ -1493,7 +1493,7 @@ likely a firmware-chunk-send helper worth checking against this
 project's own `sdio_rom_send()`), and the `proc_*`/`artosyn_root_proc_*`
 family (lower priority — debug-interface only).
 
-## Clean-room rewrite: `kmod/artosyn_drv.c`
+## Clean-room rewrite: `kmod/artosyn_sdio.c`
 
 After the daemon-side fixes above (`0013`-`0015`) narrowed the SDIO
 stalls from severe (permanent wedges) to rare and self-healing, but not
@@ -1526,7 +1526,7 @@ regression only a higher-bitrate soak surfaced, and its fix.)
   for `WORKAROUND_FOR_INTERRUPT_LOST_ISSUE`) that had to be kept in sync
   by hand -- and didn't always stay in sync (`0004`'s decode bug existed
   in both copies; `0011`'s shared-waitqueue fix had to touch both).
-  `kmod/artosyn_drv.c` has exactly one such routine
+  `kmod/artosyn_sdio.c` has exactly one such routine
   (`artosyn_check_events()`), called from both the real IRQ handler and
   from `poll()` when idle -- matching the vendor's own actual
   architecture (confirmed via Ghidra decompilation of their real
@@ -1619,7 +1619,7 @@ future daemon build adds one; don't accumulate it.
   ~190s; run it for the length of an actual flight) before fully
   trusting it.
 - **Buildroot packaging is done.** `ar8030-transport-tx.mk` now builds
-  `kmod/artosyn_drv.c` via Buildroot's own `kernel-module` infra
+  `kmod/artosyn_sdio.c` via Buildroot's own `kernel-module` infra
   (`AR8030_TRANSPORT_TX_MODULE_SUBDIRS = kmod`, `AR8030_SDK_DRIVER_INC`
   pointed at `$(AR8030_DIR)/driver/linux/bus` -- the `ar8030` package's
   own extracted+patched source tree, a standard Buildroot cross-package
@@ -1640,7 +1640,7 @@ future daemon build adds one; don't accumulate it.
   pre-existing issue: the `waybeam` package's pinned git commit no
   longer resolves against its upstream remote -- a separate package,
   untouched by this change).
-- **DRV-mode is gone, not just deprioritized.** `artosyn_drv.c` never
+- **DRV-mode is gone, not just deprioritized.** `artosyn_sdio.c` never
   implements `oal_mdev.c`'s multiplexing, and `ar8030`'s own `Config.in`
   now says so plainly: only `-i 1` (SDIO) has a kernel-side counterpart
   left to open. This was a deliberate choice (confirmed with the
@@ -1672,7 +1672,7 @@ project's daemon (see the isolation test table above), and separately
 with the vendor's stock image outright.
 
 **Root cause:** `artosyn_do_write()` and `artosyn_do_read()` in
-`kmod/artosyn_drv.c` both ran their "courtesy" mailbox-register check
+`kmod/artosyn_sdio.c` both ran their "courtesy" mailbox-register check
 (`sdio_claim_host()` + `sdio_readb(REG_IRQ_STATUS)`, a real SDIO bus
 round-trip) **unconditionally on every single call**, even when
 `write_valid_size`/`read_valid_size` already had room left over from a
@@ -1729,6 +1729,61 @@ component too, separate from anything fixable in this codebase.
 `ar8030d` stdout-redirection warning in "Build and test" above -- hit
 live during this same round of testing.
 
+## Native `ar_net0`: kernel net_device instead of `ar8030-tun`
+
+(`kmod/artosyn_sdio.c` was `kmod/artosyn_drv.c` before this; the module
+is still `artosyn_drv.ko`.) The module now also registers `ar_net0` itself
+on the RTOS-id probe (`kmod/artosyn_net.c`, module parameter
+`native_net=1`, the default) -- the vendor OAL/DRV driver's `net_dev.c`
+data path rebuilt on this module's SDIO transport. The vendor call chain,
+what was taken from it and what wasn't, and the architecture are in
+[`doc/native-netdev.md`](doc/native-netdev.md). The short version:
+
+- **One IRQ owner, one FIFO reader.** The existing IRQ drain
+  (`artosyn_check_events()`) now reads each RX transfer itself and
+  demuxes it: RPC socket frames for `net_slot`/`net_port` (0/3) go to the
+  netdev, everything else is queued for `/dev/artosyn_sdio` `read()`, so
+  `ar8030d` runs unchanged. Writes from the daemon and the netdev are
+  serialised by `tx_mutex` (whole frames per write, so they never
+  interleave; the daemon no longer sees `-EBUSY`).
+- **Lifecycle:** registered (down) at probe; `ifup` sends `so_open`
+  (`TX|RX|DATAGRAM`, tx 60000 / rx 40000, like `ar8030-tun`), `ifdown`
+  sends `so_close`. lifecycled's connected/dropped hooks still drive it.
+- **Wire-compatible with `ar8030-tun`** (Ethernet frames in the same
+  `0xab..0xbc` datagram framing), so the ground can keep its TAP bridge.
+  The ground uses USB (`ar8030d -i 0`), which this SDIO module doesn't
+  cover.
+- Unlike the vendor code, `so_write` replies `-0x107`/`-0x108` resync the
+  socket's stream position, instead of wedging the socket on the first
+  write the chip didn't take.
+- `native_net=0` gives the old behaviour back (the daemon drains the FIFO
+  itself, no netdev).
+
+Counters beyond `ip -s link`: `/sys/class/net/ar_net0/ar8030/stats`.
+Debug logging: `/sys/module/artosyn_drv/parameters/debug` (bitmask,
+runtime-writable: 0x1 init, 0x2 irq, 0x4 rx, 0x8 tx, 0x10 hexdump).
+
+**Measured on the bench pair (2026-09-22), same boot, same video load,
+ground unchanged (`ar8030-tun`):**
+
+| | `ar8030-tun` on air (`native_net=0`) | native `ar_net0` |
+|---|---|---|
+| ping air->ground, avg | 35.6 ms | 34.4 ms |
+| TCP air->ground, 4 MiB | 20.3 s (~1.65 Mbit/s) | 3.5 s (~9.5 Mbit/s) |
+| TCP ground->air, 90 s | 183 KB (~16 kbit/s) | 409 KB (~36 kbit/s) |
+
+32 MiB air->ground alongside live video: complete, 25.3 s (~10.6 Mbit/s),
+no transport-tx failures or watchdog restarts (video bitrate backs off
+while the bulk transfer shares the RF link). The ground->air rate is an
+uplink/radio limit, not the driver: the air driver delivered exactly the
+bytes the air chip reported receiving on port 3, while the ground chip
+had accepted ~1.8x more.
+
+A module reload (`rmmod` + `modprobe` while the chip keeps running RTOS)
+still leaves `ar8030d` without a TX-ready window (first write -> `EIO`
+after 2 s, then detach) -- **identical with the pre-change module**, so
+reboot remains the way to reload.
+
 ## `ar8030-lifecycled`: link supervisor + bind button
 
 `lifecycled/` builds `ar8030-lifecycled`, a separate process (not a
@@ -1751,7 +1806,7 @@ vendor SDK's own CMake tree. It moved here from
 `builder/package/ar8030`'s own patch stack (and
 `sbc-groundstations/package/ar8030`'s byte-identical duplicate of it)
 because it is entirely original code with no vendor lineage -- this is
-its actual home now, the same reasoning `kmod/artosyn_drv.c`'s own
+its actual home now, the same reasoning `kmod/artosyn_sdio.c`'s own
 "Clean-room rewrite" section above already explains for the kernel side.
 
 **It never triggers a pairing dispatch itself.** `lifecycle.c`'s own
@@ -1815,6 +1870,32 @@ design rationale):
   curl http://<host>:8899/api/v1/status
   {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"paired":true}
   ```
+  `rf_temp_c` (one decimal, `null` without a reading) is included too,
+  see `/api/v1/rf-temp` below.
+- **`GET /api/v1/rf-temp`** -- RF-board temperature, polled once a second
+  by the lifecycle thread when started with `--rf-temp-adc <ch>`
+  (disabled by default; Caddx Ascent: channel 4). Cheap, unlike
+  `/api/v1/status` (which forks `ar8030-linkctl` on every call), so fine
+  to poll often:
+  ```
+  curl http://<host>:8899/api/v1/rf-temp
+  {"ok":true,"enabled":true,"adc_channel":4,"rf_temp_c":47.5,"adc_mv":1142}
+  ```
+  Reverse-engineered from stock `ar_ldyhs_sky` (see
+  `common/ar8030_rftemp.h`): the channel is armed with
+  `BB_SET_PRJ_DISPATCH` `0x8a <ch> <u32 500>` (stock's `fpv_bb_init`),
+  read with `BB_GET_PRJ_DISPATCH` `0x89 <ch>` (mV back in `out.data[4]`),
+  mapped through stock's 12-point thermistor table and smoothed
+  (0.75 old + 0.25 new) the way stock's `fpv_bb_update_rf_board_temp()`
+  does. Also written, in whole degC, to `--rf-temp-file` (default
+  `/tmp/rf_temperature.msg`, `""` to disable) -- that is what msposd
+  shows as the VTX temperature on this board. Readings below the table
+  mean no thermistor on that channel: `rf_temp_c` is `null` and the file
+  is removed. Stock only has one on its CX4861/CX4862 boards (project
+  type 5/8, separate RF board); the Ascent Lite (CX482/CX472, type 4/7)
+  has none -- channel 4 floats at ~230 mV there. The web panel shows it at
+  the top. One-shot, unsmoothed CLI equivalent:
+  `ar8030-linkctl rf-temp [-c ch] [-a]`.
 - **`POST /api/v1/pair`** -- runs the exact same fork+exec
   `ar8030-pair`+hook-dispatch sequence the physical bind button already
   runs (`lifecycle_pair.c`'s `lc_pair_run()`), for boards with no
@@ -1859,7 +1940,7 @@ design rationale):
   `ar8030-linkctl` binary, covering every one of its own subcommands
   (`status`, `channel-mode`, `channel`, `mcs-mode`, `mcs`, `mcs-range`,
   `mcs-table`, `power-mode`, `power`, `freq`, `force-close-socket`,
-  `force-close-all`, and `bandwidth` for one-shot use) -- effectively
+  `force-close-all`, `rf-temp`, and `bandwidth` for one-shot use) -- effectively
   `linkctl -h`'s whole command surface, reachable over HTTP the same way
   `curl` would invoke the CLI directly:
   ```
