@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * artosyn_drv.c -- clean-room AR8030 SDIO chardev driver.
+ * artosyn_sdio.c -- clean-room AR8030 SDIO driver core (artosyn_drv.ko).
  *
  * This is a from-scratch rewrite, not a patched copy of anything. It grew
  * out of an extended debugging investigation (see ../README.md's "SDIO
@@ -30,11 +30,15 @@
  *     patched driver (0004 had to fix the exact same decode bug in two
  *     places; 0011's shared-waitqueue fix likewise).
  *
- * Deliberately out of scope: the OAL/DRV-mode multiplexed transport
- * (/dev/ar_mdev<N>, driver/linux/oal_mdev.c) is untouched, separate,
- * already-working code -- this module does not coexist with it (only
- * one driver can own the physical SDIO function at a time); it's a
- * drop-in alternative for SDIO-mode use, not an addition to DRV mode.
+ * Native networking: on the RTOS-id probe this module also registers a
+ * net_device (artosyn_net.c), the vendor OAL/DRV driver's net_dev.c path
+ * rebuilt on top of this file's SDIO transport rather than the vendor's
+ * OAL queues. That needs the kernel to own the RX side of the FIFO: with
+ * native_net=1 (default) every RX transfer is drained here, the netdev's
+ * socket frames are consumed, and the rest is queued for
+ * /dev/artosyn_sdio read(), so ar8030d keeps working unchanged. See
+ * ../doc/native-netdev.md. The vendor's /dev/ar_mdev<N> (oal_mdev.c)
+ * DRV-mode chardev is still not provided.
  */
 
 #include <linux/module.h>
@@ -54,20 +58,14 @@
 #include <linux/mmc/sdio_func.h>
 #include <linux/mmc/sdio_ids.h>
 
-/* Shared with the existing combined driver (see this file's own Makefile
- * for the include path): ioctl commands, artosyn_{rw,msg,cmd}_args, and
- * the handful of protocol constants (FIFO_ADDRESS, SDIO_TRANS_MAX_SZIE,
- * SDIO_MAILBOX_CHANNEL_COUNT, SDIO_DEVICE_BLOCK_SIZE, SDIO_BOOT_*,
- * ARTOSDIO_MAGIC_HEADER_*) this rewrite has no reason to redefine. */
-#include "sdio.h"
-
-#define DRV_NAME "artosyn_drv"
+#include "artosyn_drv.h"
 
 /* Declared here (rather than down by their module_param() calls) since
  * artosyn_download_firmware() needs them and is defined well before
  * that point in this file. */
 static char *fw_name;
 static char *cfg_name;
+static bool native_net = true;
 
 /* SDIO function/vendor/device IDs. The chip enumerates as ARTO_ROMCODE_*
  * (its boot-ROM identity) on power-up; after a successful firmware push
@@ -144,40 +142,6 @@ struct spl_header {
 };
 #pragma pack(pop)
 
-struct artosyn_dev {
-	struct sdio_func *func;
-	struct miscdevice miscdev;
-	char name[32];
-
-	struct mutex io_mutex;   /* serializes read()/write() vs. each other and vs. remove() */
-	bool removed;
-
-	/* True only while the chip is still running its boot-ROM firmware
-	 * (i.e. between insmod and artosyn_download_firmware() completing).
-	 * The boot ROM's own SDIO handling doesn't generate the normal
-	 * TX/RX-ready mailbox events at all -- waiting on them here would
-	 * simply time out on every firmware chunk. This project's own
-	 * already-working combined driver has the exact same bypass
-	 * (dev->rom_mode in bus/sdio.c) for the exact same reason; missing
-	 * it was this rewrite's very first real-hardware bug. */
-	bool rom_mode;
-
-	wait_queue_head_t rx_q;
-	wait_queue_head_t tx_q;
-	wait_queue_head_t mailbox_q;
-
-	unsigned int read_offset;
-	unsigned int read_valid_size;
-	bool reading;
-
-	unsigned int write_offset;
-	unsigned int write_valid_size;
-	bool writing;
-
-	unsigned char message[SDIO_MAILBOX_CHANNEL_COUNT];
-	unsigned char msg_valid[SDIO_MAILBOX_CHANNEL_COUNT];
-};
-
 /* One instance at a time: this chip exposes a single SDIO function, and
  * sdio_claim_irq() only ever registers one handler for it. Matches the
  * vendor's own module (a single static "the device" pointer, not a
@@ -211,9 +175,101 @@ static struct artosyn_dev *g_dev;
  * event was found and handled (caller should keep draining), false once
  * the status register reports nothing pending.
  */
+/* Hard cap on what the /dev/artosyn_sdio RX queue may hold in net_mode.
+ * Without native networking the chip's own FIFO was the buffer (nothing
+ * was read until the daemon asked); now the kernel drains it eagerly, so a
+ * stalled reader must not be able to eat the (small, ~60 MB) air unit's
+ * memory. */
+#define CDEV_RXQ_MAX_BYTES     (2 * 1024 * 1024)
+
+static void artosyn_cdev_rx_queue(struct artosyn_dev *dev, struct sk_buff *skb)
+{
+	unsigned long flags;
+
+	/* Nobody listening: the old read()-driven path would have left this
+	 * in the chip's FIFO for a future reader, where it would eventually
+	 * be stale anyway. Dropping keeps the FIFO moving for the netdev. */
+	if (!atomic_read(&dev->open_count)) {
+		dev->cdev_rx_drops++;
+		kfree_skb(skb);
+		return;
+	}
+
+	spin_lock_irqsave(&dev->cdev_rxq.lock, flags);
+	if (dev->cdev_rxq_bytes + skb->len > CDEV_RXQ_MAX_BYTES) {
+		spin_unlock_irqrestore(&dev->cdev_rxq.lock, flags);
+		dev->cdev_rx_drops++;
+		dev_warn_ratelimited(&dev->func->dev, "cdev rx queue full (%u bytes), dropping %u bytes\n",
+				     dev->cdev_rxq_bytes, skb->len);
+		kfree_skb(skb);
+		return;
+	}
+	dev->cdev_rxq_bytes += skb->len;
+	__skb_queue_tail(&dev->cdev_rxq, skb);
+	spin_unlock_irqrestore(&dev->cdev_rxq.lock, flags);
+
+	wake_up_interruptible_all(&dev->rx_q);
+}
+
+/*
+ * net_mode RX: read one whole RX-ready transfer out of the FIFO and demux
+ * it (netdev socket frames vs. everything else). Caller holds the host.
+ * Chunked at SDIO_TRANS_MAX_SZIE, the same per-read ceiling the
+ * read()-driven path always had, so the chip sees the same access pattern.
+ */
+static void artosyn_rx_transfer(struct artosyn_dev *dev, unsigned int size)
+{
+	struct sk_buff *skb;
+	unsigned int done = 0;
+	int ret = 0;
+
+	skb = alloc_skb(size, GFP_KERNEL);
+
+	while (done < size) {
+		unsigned int chunk = min_t(unsigned int, size - done, SDIO_TRANS_MAX_SZIE);
+
+		/* Without an skb the transfer still has to leave the FIFO or
+		 * the chip stops signalling RX-ready: drain into scratch. */
+		ret = sdio_memcpy_fromio(dev->func, skb ? skb->data + done : dev->rx_scratch,
+					 FIFO_ADDRESS, chunk);
+		if (ret)
+			break;
+		done += chunk;
+	}
+	dev->read_offset = done;
+
+	if (!skb) {
+		dev->rx_errors++;
+		dev_err_ratelimited(&dev->func->dev, "rx: alloc_skb(%u) failed, dropped transfer\n", size);
+		return;
+	}
+
+	if (ret) {
+		dev->rx_errors++;
+		dev_err_ratelimited(&dev->func->dev, "rx: sdio_memcpy_fromio failed at %u/%u: %d\n",
+				    done, size, ret);
+		kfree_skb(skb);
+		return;
+	}
+
+	skb_put(skb, size);
+	dev->rx_transfers++;
+	dev->rx_transfer_bytes += size;
+	art_dbg(dev, ART_DBG_RX, "rx transfer %u bytes\n", size);
+	if (unlikely(artosyn_debug & ART_DBG_DUMP))
+		print_hex_dump(KERN_INFO, "artosyn rx: ", DUMP_PREFIX_OFFSET, 16, 1,
+			       skb->data, min_t(unsigned int, size, 128), false);
+
+	skb = artosyn_net_rx(dev, skb);
+	if (skb)
+		artosyn_cdev_rx_queue(dev, skb);
+}
+
 static bool artosyn_check_events(struct artosyn_dev *dev)
 {
 	struct sdio_func *func = dev->func;
+	unsigned int rx_size = 0;
+	bool rx_ready = false;
 	int err = -1;
 	u8 iir;
 	u8 mb_ena;
@@ -227,6 +283,8 @@ static bool artosyn_check_events(struct artosyn_dev *dev)
 		return true; /* status byte was non-zero but carried nothing we handle; keep draining */
 
 	mb_ena = sdio_readb(func, REG_MAILBOX_ENABLE, NULL);
+	dev->irq_events++;
+	art_dbg(dev, ART_DBG_IRQ, "irq: iir=0x%02x mb=0x%02x\n", iir, mb_ena);
 
 	for (ch = 0; ch < SDIO_MAILBOX_CHANNEL_COUNT; ch++) {
 		if (mb_ena & (1 << ch)) {
@@ -237,15 +295,27 @@ static bool artosyn_check_events(struct artosyn_dev *dev)
 	}
 
 	if (mb_ena & MB_EVT_RX_READY) {
-		dev->read_offset = 0;
-		dev->read_valid_size = (unsigned int)sdio_readb(func, REG_RX_READY_BLOCKS, NULL) << 9;
-		wake_up_interruptible_all(&dev->rx_q);
+		rx_size = (unsigned int)sdio_readb(func, REG_RX_READY_BLOCKS, NULL) << 9;
+		rx_ready = true;
 	}
 
 	if (mb_ena & MB_EVT_TX_READY) {
 		dev->write_offset = 0;
 		dev->write_valid_size = (unsigned int)sdio_readb(func, REG_TX_READY_BLOCKS, NULL) << 9;
 		wake_up_interruptible_all(&dev->tx_q);
+	}
+
+	/* RX last, so a writer woken by TX-ready above only waits for the
+	 * data transfer below rather than also for a register read. */
+	if (rx_ready) {
+		dev->read_offset = 0;
+		dev->read_valid_size = rx_size;
+		if (dev->net_mode && !dev->removed) {
+			if (rx_size)
+				artosyn_rx_transfer(dev, rx_size);
+		} else {
+			wake_up_interruptible_all(&dev->rx_q);
+		}
 	}
 
 	return true;
@@ -285,25 +355,18 @@ static bool artosyn_write_condition(struct artosyn_dev *dev)
  * daemon's sdio_write()) -- a short return here is normal flow control,
  * not an error, exactly like the vendor's real driver and this
  * project's existing one.
+ *
+ * Caller holds tx_mutex.
  */
-static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t count)
+static ssize_t artosyn_write_chunk(struct artosyn_dev *dev, const void *buf, size_t count)
 {
 	struct sdio_func *func = dev->func;
 	unsigned int room;
 	int ret;
 	long left;
 
-	mutex_lock(&dev->io_mutex);
-	if (dev->removed) {
-		mutex_unlock(&dev->io_mutex);
+	if (dev->removed)
 		return -EIO;
-	}
-	if (dev->writing) {
-		mutex_unlock(&dev->io_mutex);
-		return -EBUSY;
-	}
-	dev->writing = true;
-	mutex_unlock(&dev->io_mutex);
 
 	if (dev->rom_mode) {
 		/* Boot ROM doesn't generate TX-ready mailbox events -- see
@@ -346,15 +409,12 @@ static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t
 
 		left = wait_event_interruptible_timeout(dev->tx_q, artosyn_write_condition(dev),
 							 msecs_to_jiffies(SDIO_WRITE_WAIT_MS));
-		if (left <= 0) {
-			dev->writing = false;
+		if (left <= 0)
 			return -EIO;
-		}
 	}
 
 	mutex_lock(&dev->io_mutex);
 	if (dev->removed) {
-		dev->writing = false;
 		mutex_unlock(&dev->io_mutex);
 		return -EIO;
 	}
@@ -371,7 +431,6 @@ static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t
 
 	if (count == 0) {
 		sdio_release_host(func);
-		dev->writing = false;
 		mutex_unlock(&dev->io_mutex);
 		return -EAGAIN;
 	}
@@ -381,10 +440,45 @@ static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t
 		dev->write_offset = dev->write_valid_size;
 
 	sdio_release_host(func);
-	dev->writing = false;
 	mutex_unlock(&dev->io_mutex);
 
 	return ret ? ret : (ssize_t)count;
+}
+
+/* /dev/artosyn_sdio write() and the firmware push: one chunk, may be
+ * short. Blocks (instead of the old -EBUSY) while another writer -- now
+ * possibly the netdev TX worker -- owns the FIFO. */
+static ssize_t artosyn_do_write(struct artosyn_dev *dev, const void *buf, size_t count)
+{
+	ssize_t ret;
+
+	if (mutex_lock_interruptible(&dev->tx_mutex))
+		return -ERESTARTSYS;
+	ret = artosyn_write_chunk(dev, buf, count);
+	mutex_unlock(&dev->tx_mutex);
+	return ret;
+}
+
+/* Kernel-internal writers (netdev): the whole buffer, in order, without
+ * letting anyone else's write in between. */
+int artosyn_write_all(struct artosyn_dev *dev, const void *buf, size_t len)
+{
+	const u8 *p = buf;
+	ssize_t ret = 0;
+
+	mutex_lock(&dev->tx_mutex);
+	while (len) {
+		ret = artosyn_write_chunk(dev, p, len);
+		if (ret == -EAGAIN)
+			continue; /* window raced to zero; wait for the next TX-ready */
+		if (ret < 0)
+			break;
+		p += ret;
+		len -= ret;
+		ret = 0;
+	}
+	mutex_unlock(&dev->tx_mutex);
+	return ret;
 }
 
 static ssize_t artosyn_do_read(struct artosyn_dev *dev, void *buf, size_t count)
@@ -615,12 +709,91 @@ static int artosyn_open(struct inode *inode, struct file *filp)
 	if (!g_dev)
 		return -ENODEV;
 	filp->private_data = g_dev;
+	atomic_inc(&g_dev->open_count);
 	return 0;
 }
 
 static int artosyn_release(struct inode *inode, struct file *filp)
 {
+	struct artosyn_dev *dev = filp->private_data;
+
+	/* dev may already be gone (card removed while ar8030d still had the
+	 * fd open); only touch it if it's still the live instance. */
+	if (dev != g_dev)
+		return 0;
+
+	/* Last reader gone: whatever is still queued was addressed to it. */
+	if (atomic_dec_and_test(&dev->open_count)) {
+		unsigned long flags;
+
+		spin_lock_irqsave(&dev->cdev_rxq.lock, flags);
+		__skb_queue_purge(&dev->cdev_rxq);
+		dev->cdev_rxq_bytes = 0;
+		spin_unlock_irqrestore(&dev->cdev_rxq.lock, flags);
+	}
 	return 0;
+}
+
+/* Something for read() to return: in net_mode that's the RX queue the IRQ
+ * drain fills, otherwise unread bytes still sitting in the chip's FIFO. */
+static bool artosyn_rx_avail(struct artosyn_dev *dev)
+{
+	if (dev->net_mode)
+		return dev->removed || !skb_queue_empty(&dev->cdev_rxq);
+	return artosyn_read_condition(dev);
+}
+
+/*
+ * net_mode read(): hands out the queued RX transfers in order. Same wait
+ * semantics as artosyn_do_read() (courtesy poll, SDIO_READ_WAIT_MS, -EIO
+ * on timeout), and the same stream semantics: a read shorter than the
+ * head transfer leaves the rest for the next read(), just as a short read
+ * used to leave the rest in the FIFO.
+ */
+static ssize_t artosyn_cdev_read(struct artosyn_dev *dev, char __user *ubuf, size_t count)
+{
+	struct sk_buff *skb;
+	unsigned long flags;
+	size_t n;
+	long left;
+
+	if (!artosyn_rx_avail(dev)) {
+		sdio_claim_host(dev->func);
+		artosyn_check_events(dev);
+		sdio_release_host(dev->func);
+	}
+
+	left = wait_event_interruptible_timeout(dev->rx_q, artosyn_rx_avail(dev),
+						 msecs_to_jiffies(SDIO_READ_WAIT_MS));
+	if (left <= 0 || dev->removed)
+		return -EIO;
+
+	mutex_lock(&dev->io_mutex);
+	skb = skb_dequeue(&dev->cdev_rxq);
+	if (!skb) {
+		mutex_unlock(&dev->io_mutex);
+		return -EAGAIN;
+	}
+
+	n = min_t(size_t, count, skb->len);
+	if (copy_to_user(ubuf, skb->data, n)) {
+		skb_queue_head(&dev->cdev_rxq, skb);
+		mutex_unlock(&dev->io_mutex);
+		return -EFAULT;
+	}
+
+	spin_lock_irqsave(&dev->cdev_rxq.lock, flags);
+	dev->cdev_rxq_bytes -= n;
+	if (n < skb->len) {
+		skb_pull(skb, n);
+		__skb_queue_head(&dev->cdev_rxq, skb);
+		skb = NULL;
+	}
+	spin_unlock_irqrestore(&dev->cdev_rxq.lock, flags);
+	mutex_unlock(&dev->io_mutex);
+
+	kfree_skb(skb);
+	return n;
 }
 
 static ssize_t artosyn_fops_read(struct file *filp, char __user *ubuf, size_t count, loff_t *ppos)
@@ -628,6 +801,9 @@ static ssize_t artosyn_fops_read(struct file *filp, char __user *ubuf, size_t co
 	struct artosyn_dev *dev = filp->private_data;
 	void *bounce;
 	ssize_t ret;
+
+	if (dev->net_mode)
+		return artosyn_cdev_read(dev, ubuf, count);
 
 	if (count > SDIO_TRANS_MAX_SZIE)
 		count = SDIO_TRANS_MAX_SZIE;
@@ -683,11 +859,11 @@ static __poll_t artosyn_poll(struct file *filp, poll_table *wait)
 	 * in a way it wasn't when tried on this project's older, dual-path
 	 * combined driver. */
 	sdio_claim_host(dev->func);
-	if (!artosyn_read_condition(dev) && !artosyn_write_condition(dev))
+	if (!artosyn_rx_avail(dev) && !artosyn_write_condition(dev))
 		artosyn_check_events(dev);
 	sdio_release_host(dev->func);
 
-	if (artosyn_read_condition(dev))
+	if (artosyn_rx_avail(dev))
 		mask |= POLLIN | POLLRDNORM;
 	if (artosyn_write_condition(dev))
 		mask |= POLLOUT | POLLWRNORM;
@@ -787,9 +963,25 @@ static int artosyn_probe(struct sdio_func *func, const struct sdio_device_id *id
 
 	dev->func = func;
 	mutex_init(&dev->io_mutex);
+	mutex_init(&dev->tx_mutex);
 	init_waitqueue_head(&dev->rx_q);
 	init_waitqueue_head(&dev->tx_q);
 	init_waitqueue_head(&dev->mailbox_q);
+	skb_queue_head_init(&dev->cdev_rxq);
+	atomic_set(&dev->open_count, 0);
+
+	/* Kernel-owned RX has to be decided before the IRQ is live: an
+	 * RX-ready event handled the old way (just noted for a future read())
+	 * would sit in the FIFO forever once read() stops touching it. Never
+	 * in ROM mode -- the boot ROM speaks no RPC and the firmware push
+	 * doesn't read anything back. */
+	if (native_net && is_rtos_id(func)) {
+		dev->rx_scratch = kmalloc(SDIO_TRANS_MAX_SZIE, GFP_KERNEL);
+		if (dev->rx_scratch)
+			dev->net_mode = true;
+		else
+			dev_err(&func->dev, "native_net: no memory for rx scratch, falling back to chardev-only\n");
+	}
 	sdio_set_drvdata(func, dev);
 
 	sdio_claim_host(func);
@@ -832,6 +1024,16 @@ static int artosyn_probe(struct sdio_func *func, const struct sdio_device_id *id
 		dev_info(&func->dev, "%s: chip already running RTOS firmware (vid=0x%04x pid=0x%04x)\n",
 			 DRV_NAME, func->vendor, func->device);
 		g_dev = dev;
+
+		/* A netdev failure is not a probe failure: /dev/artosyn_sdio
+		 * (and so ar8030d) works either way, net_mode just routes
+		 * every RX transfer to it. */
+		if (dev->net_mode) {
+			ret = artosyn_net_probe(dev);
+			if (ret)
+				dev_err(&func->dev, "native_net: netdev setup failed: %d (chardev still available)\n",
+					ret);
+		}
 		return 0;
 	}
 
@@ -860,6 +1062,8 @@ err_disable_func:
 	sdio_disable_func(func);
 err_release_host:
 	sdio_release_host(func);
+	sdio_set_drvdata(func, NULL);
+	kfree(dev->rx_scratch);
 	kfree(dev);
 	return ret;
 }
@@ -871,6 +1075,10 @@ static void artosyn_remove(struct sdio_func *func)
 	if (!dev)
 		return;
 
+	/* Netdev first, while the chip can still be told to close the
+	 * socket (ndo_stop -> so_close goes through the normal write path). */
+	artosyn_net_remove(dev);
+
 	mutex_lock(&dev->io_mutex);
 	dev->removed = true;
 	mutex_unlock(&dev->io_mutex);
@@ -879,9 +1087,12 @@ static void artosyn_remove(struct sdio_func *func)
 	wake_up_interruptible_all(&dev->mailbox_q);
 
 	/* Give any in-flight read()/write() a moment to notice dev->removed
-	 * and return before we free dev out from under them. */
-	while (dev->reading || dev->writing)
+	 * and return before we free dev out from under them. Writers sleep
+	 * with tx_mutex held, so owning it once means none is left. */
+	while (dev->reading)
 		msleep(10);
+	mutex_lock(&dev->tx_mutex);
+	mutex_unlock(&dev->tx_mutex);
 
 	misc_deregister(&dev->miscdev);
 
@@ -892,6 +1103,8 @@ static void artosyn_remove(struct sdio_func *func)
 
 	if (g_dev == dev)
 		g_dev = NULL;
+	skb_queue_purge(&dev->cdev_rxq);
+	kfree(dev->rx_scratch);
 	kfree(dev);
 }
 
@@ -909,6 +1122,13 @@ static struct sdio_driver artosyn_driver = {
 	.probe = artosyn_probe,
 	.remove = artosyn_remove,
 };
+
+unsigned int artosyn_debug;
+module_param_named(debug, artosyn_debug, uint, 0644);
+MODULE_PARM_DESC(debug, "Debug log classes: 0x1 init, 0x2 irq, 0x4 rx, 0x8 tx, 0x10 hexdump (default 0)");
+
+module_param(native_net, bool, 0444);
+MODULE_PARM_DESC(native_net, "Register a native net_device on the RTOS chip and demux its socket in the kernel (default 1)");
 
 module_param(fw_name, charp, 0);
 MODULE_PARM_DESC(fw_name, "AR8030 firmware image path (request_firmware name)");
@@ -929,4 +1149,4 @@ module_init(artosyn_drv_init);
 module_exit(artosyn_drv_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Clean-room AR8030 SDIO chardev driver (/dev/artosyn_sdio)");
+MODULE_DESCRIPTION("Clean-room AR8030 SDIO driver (/dev/artosyn_sdio + native net_device)");

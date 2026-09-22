@@ -1,5 +1,6 @@
-# artosyn_drv: standalone out-of-tree kernel module (see artosyn_drv.c's
-# own header comment for what this is and why it exists).
+# artosyn_drv: standalone out-of-tree kernel module (see artosyn_sdio.c's
+# own header comment for what this is and why it exists, and
+# ../doc/native-netdev.md for the native net_device part, artosyn_net.c).
 #
 # Two different builds happen through this same Makefile, same as any
 # out-of-tree kernel module:
@@ -7,7 +8,8 @@
 #      the *kernel's own* build system against this directory (the
 #      `modules` target below), which re-enters this same Makefile a
 #      second time in "kbuild" mode (recognizable by KERNELRELEASE being
-#      set) to actually compile artosyn_drv.o -> .ko.
+#      set) to actually compile artosyn_sdio.o + artosyn_net.o ->
+#      artosyn_drv.ko.
 #   2. That second invocation only needs obj-m and the include path --
 #      everything else in this file is for the *first* invocation, mostly
 #      auto-detecting KDIR/CROSS_COMPILE from the sibling `builder` tree
@@ -64,6 +66,7 @@ else
 
 # --- kbuild pass (KERNELRELEASE is set) --------------------------------
 obj-m := artosyn_drv.o
+artosyn_drv-y := artosyn_sdio.o artosyn_net.o
 ccflags-y += -I$(AR8030_SDK_DRIVER_INC)
 
 endif
