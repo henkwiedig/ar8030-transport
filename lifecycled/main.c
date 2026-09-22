@@ -63,6 +63,10 @@ static void print_help(const char* argv0)
     printf("                            (default: 0.0.0.0, every interface)\n");
     printf("  --frame-change 0|1        AP only: apply BB_SET_FRAME_CHANGE(1) after every connect\n");
     printf("                            (default 1; 0 leaves the chip's frame structure alone)\n");
+    printf("  --rf-temp-adc <ch>        poll RF-board temperature on this AR8030 ADC channel\n");
+    printf("                            (default: none -- board-specific; Caddx Ascent: 4)\n");
+    printf("  --rf-temp-file <path>     also write it there in whole degC, \"\" = don't\n");
+    printf("                            (default /tmp/rf_temperature.msg)\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -93,6 +97,8 @@ enum {
     OPT_HTTP_PORT,
     OPT_HTTP_BIND,
     OPT_FRAME_CHANGE,
+    OPT_RF_TEMP_ADC,
+    OPT_RF_TEMP_FILE,
 };
 
 static void handle_sigterm(int sig)
@@ -118,6 +124,8 @@ int main(int argc, char** argv)
         .bind_gpio         = -1,
         .http_bind         = "0.0.0.0",
         .http_port         = 0,
+        .rf_temp_adc       = -1,
+        .rf_temp_file      = "/tmp/rf_temperature.msg",
     };
 
     static struct option long_options[] = {
@@ -134,6 +142,8 @@ int main(int argc, char** argv)
         {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
         {"http-bind",         required_argument, 0, OPT_HTTP_BIND        },
         {"frame-change",      required_argument, 0, OPT_FRAME_CHANGE     },
+        {"rf-temp-adc",       required_argument, 0, OPT_RF_TEMP_ADC      },
+        {"rf-temp-file",      required_argument, 0, OPT_RF_TEMP_FILE     },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -185,6 +195,12 @@ int main(int argc, char** argv)
             break;
         case OPT_HTTP_BIND:
             strncpy(cfg.http_bind, optarg, sizeof(cfg.http_bind) - 1);
+            break;
+        case OPT_RF_TEMP_ADC:
+            cfg.rf_temp_adc = (int)strtol(optarg, NULL, 10);
+            break;
+        case OPT_RF_TEMP_FILE:
+            snprintf(cfg.rf_temp_file, sizeof(cfg.rf_temp_file), "%s", optarg);
             break;
         case 'h':
             print_help(argv[0]);

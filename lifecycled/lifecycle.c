@@ -7,7 +7,9 @@
 #include "lifecycle_hooks.h"
 #include "lifecycle_pair.h"
 #include "lifecycle_tuning.h"
+#include "../common/ar8030_rftemp.h"
 #include <pthread.h>
+#include <stdio.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -153,6 +155,14 @@ struct lifecycle_ctx {
     int pending_retx_idle;
     int pending_retx_conti_busy;
     int pending_retx_conti_idle;
+
+    /* RF-board temperature (lc_poll_rf_temp()), guarded by status_lock
+     * like the rest of what lifecycle_get_status() exposes. */
+    int rf_temp_armed;
+    int rf_temp_rearm_wait; /* ticks until the next re-arm attempt */
+    int rf_temp_valid;
+    int rf_temp_c10;
+    int rf_temp_mv;
 };
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -376,6 +386,82 @@ static void lc_drain_retx_request(lifecycle_ctx* ctx)
     lc_retx_apply(ctx->client.handle, win, busy, idle, conti_busy, conti_idle);
 }
 
+/* Writes whole degC to cfg.rf_temp_file via rename(), so a reader never
+ * sees a half-written line. */
+static void lc_write_rf_temp_file(const lifecycle_ctx* ctx, int c10)
+{
+    char tmp[272];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", ctx->cfg.rf_temp_file);
+    FILE* f = fopen(tmp, "w");
+    if (!f) {
+        return;
+    }
+    fprintf(f, "%d\n", (c10 + 5) / 10);
+    fclose(f);
+    rename(tmp, ctx->cfg.rf_temp_file);
+}
+
+/* One RF-board temperature sample, once per main-loop tick -- stock polls
+ * from its own temperature thread the same way. The ADC channel is armed
+ * once up front (stock: fpv_bb_init) and re-armed whenever a read fails or
+ * returns 0 mV (not armed, e.g. after a chip reset), at most every
+ * LC_RFTEMP_REARM_TICKS. Smoothing matches stock's
+ * fpv_bb_update_rf_board_temp(): new = 0.75*old + 0.25*sample. */
+#define LC_RFTEMP_REARM_TICKS 5
+
+static void lc_poll_rf_temp(lifecycle_ctx* ctx)
+{
+    int ch = ctx->cfg.rf_temp_adc;
+    if (ch < 0) {
+        return;
+    }
+
+    if (!ctx->rf_temp_armed) {
+        if (ctx->rf_temp_rearm_wait > 0) {
+            ctx->rf_temp_rearm_wait--;
+            return;
+        }
+        int ret = ar8030_rftemp_arm(ctx->client.handle, ch);
+        lc_log("lifecycle: rf-temp: armed ADC channel %d (ret=%d)", ch, ret);
+        ctx->rf_temp_armed      = ret == 0;
+        ctx->rf_temp_rearm_wait = LC_RFTEMP_REARM_TICKS;
+        return; /* first measurement lands after the arm period */
+    }
+
+    int mv = 0;
+    if (ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) != 0 || mv <= 0) {
+        ctx->rf_temp_armed = 0;
+        return;
+    }
+
+    int sample = ar8030_rftemp_mv_to_c10(mv);
+    if (sample == AR8030_RFTEMP_NONE) {
+        /* Out of the thermistor's range: no sensor on this channel (see
+         * ar8030_rftemp.h). Report nothing rather than a made-up value. */
+        pthread_mutex_lock(&ctx->status_lock);
+        if (ctx->rf_temp_valid) {
+            lc_log("lifecycle: rf-temp: %d mV on ADC %d is below the thermistor table, no sensor?", mv, ch);
+        }
+        ctx->rf_temp_valid = 0;
+        ctx->rf_temp_mv    = mv;
+        pthread_mutex_unlock(&ctx->status_lock);
+        if (ctx->cfg.rf_temp_file[0]) {
+            unlink(ctx->cfg.rf_temp_file);
+        }
+        return;
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->rf_temp_c10   = ctx->rf_temp_valid ? (ctx->rf_temp_c10 * 3 + sample) / 4 : sample;
+    ctx->rf_temp_mv    = mv;
+    ctx->rf_temp_valid = 1;
+    int c10            = ctx->rf_temp_c10;
+    pthread_mutex_unlock(&ctx->status_lock);
+
+    if (ctx->cfg.rf_temp_file[0]) {
+        lc_write_rf_temp_file(ctx, c10);
+    }
+}
+
 void* lifecycle_thread_main(void* arg)
 {
     lifecycle_ctx* ctx = (lifecycle_ctx*)arg;
@@ -439,6 +525,7 @@ void* lifecycle_thread_main(void* arg)
 
         lc_drain_bandwidth_request(ctx);
         lc_drain_retx_request(ctx);
+        lc_poll_rf_temp(ctx);
 
         bb_link_state_e state;
         int              have_state = lc_get_link_state(&state);
@@ -574,6 +661,9 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->state          = ctx->state;
     out->connected_slot = ctx->connected_slot;
     out->bandwidth_mhz  = ctx->last_bandwidth;
+    out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
+    out->rf_temp_c10    = ctx->rf_temp_c10;
+    out->rf_temp_mv     = ctx->rf_temp_mv;
     pthread_mutex_unlock(&ctx->status_lock);
 
     out->paired = ctx->cfg.cfg_path[0] ? lc_pair_has_been_paired(ctx->cfg.cfg_path) : 0;

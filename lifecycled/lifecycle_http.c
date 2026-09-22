@@ -198,7 +198,7 @@ static void send_html(int fd, const char* html)
  * command" buried in linkctl's own captured stderr. */
 static const char* const LINKCTL_COMMANDS[] = {
     "status", "bandwidth", "channel-mode", "channel", "mcs-mode", "mcs", "mcs-range", "mcs-table",
-    "power-mode", "power", "freq", "force-close-socket", "force-close-all", NULL,
+    "power-mode", "power", "freq", "force-close-socket", "force-close-all", "rf-temp", NULL,
 };
 
 static int linkctl_command_valid(const char* cmd)
@@ -316,6 +316,16 @@ static void handle_linkctl(int fd, const char* query)
  * to run on every poll (the web page's own refresh() calls this every
  * 2s) -- see run_linkctl()'s own comment on why a linkctl invocation
  * never touches this daemon's own ctx->client. */
+/* JSON number with one decimal ("47.5"), or "null" without a reading. */
+static void format_rf_temp(const lc_status_t* st, char* out, size_t out_sz)
+{
+    if (!st->rf_temp_valid) {
+        snprintf(out, out_sz, "null");
+        return;
+    }
+    snprintf(out, out_sz, "%d.%d", st->rf_temp_c10 / 10, st->rf_temp_c10 % 10);
+}
+
 static void handle_status(lifecycle_http_ctx* http, int fd)
 {
     lc_status_t st;
@@ -331,11 +341,35 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     char escaped[8192];
     json_escape(out, escaped, sizeof(escaped));
 
-    char json[8500];
+    char rf_temp[48];
+    format_rf_temp(&st, rf_temp, sizeof(rf_temp));
+
+    char json[8600];
     snprintf(json, sizeof(json),
              "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,"
-              "\"paired\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, st.paired ? "true" : "false", rc, escaped);
+              "\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, st.paired ? "true" : "false", rf_temp, rc,
+             escaped);
+    send_json(fd, 200, "OK", json);
+}
+
+/* GET /api/v1/rf-temp -- just the RF-board temperature (lifecycle.c's
+ * lc_poll_rf_temp(), enabled via --rf-temp-adc). Cheap, unlike
+ * /api/v1/status, which forks ar8030-linkctl on every call: meant for
+ * frequent polling (OSD, dashboards). rf_temp_c is null until the first
+ * reading arrives, or always when polling is disabled. */
+static void handle_rf_temp(lifecycle_http_ctx* http, int fd)
+{
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+
+    char rf_temp[48];
+    format_rf_temp(&st, rf_temp, sizeof(rf_temp));
+
+    char json[160];
+    snprintf(json, sizeof(json), "{\"ok\":true,\"enabled\":%s,\"adc_channel\":%d,\"rf_temp_c\":%s,\"adc_mv\":%d}",
+             cfg->rf_temp_adc >= 0 ? "true" : "false", cfg->rf_temp_adc, rf_temp, st.rf_temp_mv);
     send_json(fd, 200, "OK", json);
 }
 
@@ -427,9 +461,11 @@ static const char INDEX_HTML[] =
     "#status,#lc_out{white-space:pre-wrap;background:#1a1a1a;padding:0.8em;border-radius:4px;"
     "font-family:monospace;font-size:0.85em;max-height:20em;overflow:auto}\n"
     ".ok{color:#4caf50}.bad{color:#f44336}\n"
+    ".temp{font-size:1.4em;font-weight:bold}.warm{color:#ffb300}.hot{color:#f44336}\n"
     "</style></head>\n"
     "<body>\n"
     "<h1>ar8030-lifecycled</h1>\n"
+    "<div class='row'>RF board: <span id='rftemp' class='temp'>--</span></div>\n"
     "<div class='row' id='status'>loading...</div>\n"
     "\n"
     "<h2>Pairing</h2>\n"
@@ -514,6 +550,10 @@ static const char INDEX_HTML[] =
     "wait(s) <input id='bwo_wait' class='n' type='number' value='5'>\n"
     "<button onclick='ctlBandwidthOnce()'>Apply once</button></div>\n"
     "\n"
+    "<div class='ctl'><span>RF-board temp (raw ADC)</span>\n"
+    "channel <input id='rt_ch' class='n' value='4'>\n"
+    "<button onclick='ctlRfTemp()'>Read</button></div>\n"
+    "\n"
     "<h2>Command output</h2>\n"
     "<div class='row' id='lc_out'>(nothing run yet)</div>\n"
     "\n"
@@ -525,6 +565,10 @@ static const char INDEX_HTML[] =
     "    var summary = 'role='+d.role+' state='+d.state+' connected_slot='+d.connected_slot+\n"
     "      ' bandwidth_mhz='+d.bandwidth_mhz+' paired='+d.paired+' (linkctl exit '+d.linkctl_exit_code+')';\n"
     "    document.getElementById('status').textContent = summary+'\\n\\n'+(d.linkctl_status||'');\n"
+    "    var t = document.getElementById('rftemp');\n"
+    "    if (d.rf_temp_c === null || d.rf_temp_c === undefined) { t.textContent = 'n/a'; t.className = 'temp'; }\n"
+    "    else { t.textContent = d.rf_temp_c.toFixed(1)+' \\u00b0C';\n"
+    "      t.className = 'temp'+(d.rf_temp_c >= 90 ? ' hot' : d.rf_temp_c >= 70 ? ' warm' : ''); }\n"
     "  }).catch(e=>{ document.getElementById('status').textContent = 'unreachable: '+e; });\n"
     "}\n"
     "function msg(text, ok){\n"
@@ -564,6 +608,7 @@ static const char INDEX_HTML[] =
     "  var mcs = v('mt_mcs');\n"
     "  runLinkctl('mcs-table', v('mt_variant')+(mcs ? ' '+mcs : ''));\n"
     "}\n"
+    "function ctlRfTemp(){ runLinkctl('rf-temp', '-c '+v('rt_ch')); }\n"
     "function ctlPowerMode(){ runLinkctl('power-mode', v('pm_mode')); }\n"
     "function ctlPower(){ runLinkctl('power', v('pw_dbm')+' -u '+v('pw_user')+' -w '+v('pw_wait')); }\n"
     "function ctlFreq(){\n"
@@ -661,6 +706,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_bandwidth(http, fd, query);
     } else if (strcmp(path, "/api/v1/retx-tuning") == 0 && strcmp(method, "POST") == 0) {
         handle_retx_tuning(http, fd, query);
+    } else if (strcmp(path, "/api/v1/rf-temp") == 0) {
+        handle_rf_temp(http, fd);
     } else if (strcmp(path, "/api/v1/linkctl") == 0) {
         handle_linkctl(fd, query);
     } else {

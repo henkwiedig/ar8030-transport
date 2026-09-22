@@ -27,6 +27,7 @@
 #include "ar8030.h"
 #include "bb_api.h"
 #include "bb_dev.h"
+#include "../common/ar8030_rftemp.h"
 
 #include <math.h>
 #include <signal.h>
@@ -115,6 +116,14 @@ static void usage(const char *argv0)
             "      0 auto, 1 memory, 2 flash). Prints total length + crc16 and,\n"
             "      with [file], writes the raw bytes there (else hex dump) --\n"
             "      for diffing stock vs ours.\n"
+            "\n"
+            "  rf-temp [-c channel] [-a]\n"
+            "      RF-board temperature from the AR8030's own ADC (default channel 4,\n"
+            "      the Caddx Ascent's thermistor): BB_GET_PRJ_DISPATCH 0x89, mapped\n"
+            "      through stock ar_ldyhs_sky's thermistor table. Arms the channel\n"
+            "      (0x8a, as stock's init does) first if it isn't yet, or always\n"
+            "      with -a. Unsmoothed -- ar8030-lifecycled --rf-temp-adc keeps a\n"
+            "      smoothed value (HTTP /api/v1/rf-temp).\n"
             "\n"
             "  prj-cmd <cmd> [byte ...]\n"
             "      Raw BB_SET_PRJ_DISPATCH: cmd id (dec/0x hex) + up to 252\n"
@@ -1475,6 +1484,48 @@ static int cmd_prj_cmd(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_rf_temp(int argc, char **argv)
+{
+    int channel = AR8030_RFTEMP_DEFAULT_ADC, force_arm = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "c:a");
+    while ((opt = getopt(argc, argv, "c:a")) != -1) {
+        if (opt == 'c') {
+            channel = atoi(optarg);
+        } else if (opt == 'a') {
+            force_arm = 1;
+        } else {
+            return 1;
+        }
+    }
+
+    int mv = 0, ret = force_arm ? -1 : ar8030_rftemp_read_mv(g_hbb, channel, &mv);
+    if (ret != 0 || mv <= 0) {
+        /* Not armed (fresh chip, or nothing else armed it) -- arm and
+         * wait out one measurement period before reading again. */
+        ret = ar8030_rftemp_arm(g_hbb, channel);
+        if (ret != 0) {
+            fprintf(stderr, "linkctl: arming ADC channel %d failed (ret=%d)\n", channel, ret);
+            return 1;
+        }
+        usleep((AR8030_RFTEMP_ARM_PERIOD + 200) * 1000);
+        ret = ar8030_rftemp_read_mv(g_hbb, channel, &mv);
+    }
+    if (ret != 0) {
+        fprintf(stderr, "linkctl: BB_GET_PRJ_DISPATCH(0x89) failed (ret=%d)\n", ret);
+        return 1;
+    }
+
+    int c10 = ar8030_rftemp_mv_to_c10(mv);
+    if (c10 == AR8030_RFTEMP_NONE) {
+        printf("rf_temp: channel=%d adc=%d mV temp=n/a (below the thermistor table -- no sensor on this "
+               "channel?)\n", channel, mv);
+        return 1;
+    }
+    printf("rf_temp: channel=%d adc=%d mV temp=%d.%d C\n", channel, mv, c10 / 10, c10 % 10);
+    return 0;
+}
+
 static int cmd_power_mode(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1644,6 +1695,8 @@ int main(int argc, char **argv)
         rc = cmd_frame_change(argc - 1, argv + 1);
     else if (!strcmp(cmd, "cfg-dump"))
         rc = cmd_cfg_dump(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "rf-temp"))
+        rc = cmd_rf_temp(argc - 1, argv + 1);
     else if (!strcmp(cmd, "prj-cmd"))
         rc = cmd_prj_cmd(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))

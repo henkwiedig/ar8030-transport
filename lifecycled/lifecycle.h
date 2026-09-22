@@ -73,6 +73,15 @@ typedef struct {
      * header comment), not just loopback. */
     char     http_bind[64];
     uint16_t http_port;
+
+    /* RF-board temperature via the AR8030's own ADC (see
+     * ../common/ar8030_rftemp.h), opt-in: rf_temp_adc < 0 (the default)
+     * means disabled, since the ADC channel and thermistor curve are
+     * board-specific (Caddx Ascent: channel 4). When enabled, the
+     * smoothed reading is also written to rf_temp_file (whole degC, one
+     * line) for consumers without an HTTP client, e.g. msposd. */
+    int  rf_temp_adc;
+    char rf_temp_file[256];
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;
@@ -94,6 +103,9 @@ typedef struct {
     int        connected_slot; /* -1 if not connected */
     int        bandwidth_mhz;  /* -1 if not yet known/applied */
     int        paired;         /* non-zero if lc_pair_has_been_paired() */
+    int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
+    int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
+    int        rf_temp_mv;     /* last raw ADC reading, mV */
 } lc_status_t;
 
 /*
