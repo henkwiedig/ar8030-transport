@@ -160,6 +160,10 @@ struct lifecycle_ctx {
 
     /* Link distance in metres, -1 without a link/result (status_lock). */
     int distance_m;
+    /* Last BB_GET_SOCK_INFO (lc_poll_sock_info()), status_lock. */
+    uint8_t  sock_port_bmp;
+    uint64_t sock_rx_bytes[LC_SOCK_PORTS];
+    uint64_t sock_tx_bytes[LC_SOCK_PORTS];
 
     /* The chip's channel table, read once at startup (status_lock). */
     int      chan_table_n;
@@ -615,6 +619,27 @@ static void lc_poll_power(lifecycle_ctx* ctx)
 /* Refreshes lifecycle_get_status()'s distance_m, every tick while
  * connected -- cheap, and an OSD wants it fresher than the 5 s fallback
  * poll. */
+/* Per-port byte counters, once per tick, for GET /api/v1/link. Read on
+ * the connected slot (slot 0 without a link -- the DEV's only one, and
+ * where the AP's counters live too) whether or not a link is up: the
+ * counters are cumulative, so a consumer tracking increments still wants
+ * them while idle. One ioctl, no linkctl fork. */
+static void lc_poll_sock_info(lifecycle_ctx* ctx)
+{
+    bb_get_sock_info_in_t  in = {.slot = (uint8_t)(ctx->connected_slot >= 0 ? ctx->connected_slot : 0), .port = -1};
+    bb_get_sock_info_out_t out;
+    memset(&out, 0, sizeof(out));
+    int ok = bb_ioctl(ctx->client.handle, BB_GET_SOCK_INFO, &in, &out) == 0;
+
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->sock_port_bmp = ok ? out.port_bmp : 0;
+    for (int p = 0; p < LC_SOCK_PORTS && p < BB_SOCK_INFO_NUM; p++) {
+        ctx->sock_rx_bytes[p] = ok ? out.sock_info[p].uni_info[BB_DIR_RX].total_size : 0;
+        ctx->sock_tx_bytes[p] = ok ? out.sock_info[p].uni_info[BB_DIR_TX].total_size : 0;
+    }
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
 static void lc_poll_distance(lifecycle_ctx* ctx)
 {
     int m = ctx->state == LC_STATE_CONNECTED ? lc_distance_read_m(ctx->client.handle) : -1;
@@ -894,6 +919,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_channel_request(ctx);
         lc_drain_power_request(ctx);
         lc_poll_distance(ctx);
+        lc_poll_sock_info(ctx);
         lc_poll_rf_temp(ctx);
         lc_poll_batt(ctx);
 
@@ -1043,6 +1069,9 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->power          = ctx->power;
     out->power_dbm      = ctx->power_dbm;
     out->distance_m     = ctx->distance_m;
+    out->sock_port_bmp  = ctx->sock_port_bmp;
+    memcpy(out->sock_rx_bytes, ctx->sock_rx_bytes, sizeof(out->sock_rx_bytes));
+    memcpy(out->sock_tx_bytes, ctx->sock_tx_bytes, sizeof(out->sock_tx_bytes));
     out->chan_table_n   = ctx->chan_table_n;
     memcpy(out->chan_table_khz, ctx->chan_table_khz, sizeof(out->chan_table_khz));
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */

@@ -429,6 +429,40 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     send_json(fd, 200, "OK", json);
 }
 
+/* GET /api/v1/link -- link state plus the chip's per-port byte counters,
+ * cheap (no linkctl fork, unlike /api/v1/status): meant for frequent
+ * polling, e.g. PixelPilot's drone detection. state is this daemon's own
+ * view ("connected" once the chip reports CONNECT), ports lists every open
+ * port with its cumulative rx/tx byte counters (BB_GET_SOCK_INFO, read
+ * every tick). */
+static void handle_link(lifecycle_http_ctx* http, int fd)
+{
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+
+    const char* role_str  = st.role == LC_ROLE_AP ? "ap" : "dev";
+    const char* state_str = st.state == LC_STATE_CONNECTED ? "connected" : st.state == LC_STATE_IDLE ? "idle" : "init";
+
+    char   ports[LC_SOCK_PORTS * 80 + 4];
+    size_t n = 0;
+    ports[n++] = '{';
+    ports[n]   = '\0';
+    for (int p = 0; p < LC_SOCK_PORTS; p++) {
+        if (!(st.sock_port_bmp & (1u << p))) {
+            continue;
+        }
+        n += (size_t)snprintf(ports + n, sizeof(ports) - n, "%s\"%d\":{\"rx_bytes\":%llu,\"tx_bytes\":%llu}",
+                              n > 1 ? "," : "", p, (unsigned long long)st.sock_rx_bytes[p],
+                              (unsigned long long)st.sock_tx_bytes[p]);
+    }
+    snprintf(ports + n, sizeof(ports) - n, "}");
+
+    char json[LC_SOCK_PORTS * 80 + 160];
+    snprintf(json, sizeof(json), "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"ports\":%s}",
+             role_str, state_str, st.connected_slot, ports);
+    send_json(fd, 200, "OK", json);
+}
+
 /* GET /api/v1/rf-temp -- just the RF-board temperature (lifecycle.c's
  * lc_poll_rf_temp(), enabled via --rf-temp-adc). Cheap, unlike
  * /api/v1/status, which forks ar8030-linkctl on every call: meant for
@@ -938,6 +972,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_power(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/channel") == 0) {
         handle_channel(http, fd, method, query);
+    } else if (strcmp(path, "/api/v1/link") == 0) {
+        handle_link(http, fd);
     } else if (strcmp(path, "/api/v1/rf-temp") == 0) {
         handle_rf_temp(http, fd);
     } else if (strcmp(path, "/api/v1/batt") == 0) {

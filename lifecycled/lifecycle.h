@@ -25,6 +25,7 @@ extern "C" {
 
 #define LC_MAX_RESET_GPIOS 8
 #define LC_MAX_CHANNELS    64 /* >= the SDK's BB_CONFIG_MAX_CHAN_NUM (60) */
+#define LC_SOCK_PORTS      8  /* == the SDK's BB_SOCK_INFO_NUM */
 
 typedef enum {
     LC_RESET_METHOD_NONE = 0,
@@ -133,6 +134,12 @@ typedef struct {
     int        distance_m;     /* link distance in metres, -1 without a link/result */
     int        chan_table_n;   /* channel table size, 0 until read at startup */
     uint32_t   chan_table_khz[LC_MAX_CHANNELS];
+    /* BB_GET_SOCK_INFO per-port byte counters (cumulative, what
+     * `ar8030-linkctl status` shows), refreshed every tick; port_bmp = the
+     * chip's open ports, 0 until read or on failure. */
+    uint8_t    sock_port_bmp;
+    uint64_t   sock_rx_bytes[LC_SOCK_PORTS];
+    uint64_t   sock_tx_bytes[LC_SOCK_PORTS];
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */

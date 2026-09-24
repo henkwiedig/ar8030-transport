@@ -1879,6 +1879,21 @@ design rationale):
   and clamps at 0, and stock shows the value unconverted (`ar_ldy_gnd`
   forwards it to `GlassesUI`, which renders `"%1m"`) -- so a bench link
   reads 0. `ar8030-linkctl distance` samples it repeatedly.
+- **`GET /api/v1/link`** -- link state plus the chip's per-port byte
+  counters, cheap (no `ar8030-linkctl` fork, unlike `/api/v1/status`), so
+  fine to poll often -- PixelPilot's Artosyn drone detection polls it every
+  500 ms on the ground:
+  ```
+  curl http://<host>:8899/api/v1/link
+  {"ok":true,"role":"dev","state":"connected","connected_slot":0,"ports":{"0":{"rx_bytes":0,"tx_bytes":0},"1":{"rx_bytes":0,"tx_bytes":0},"2":{"rx_bytes":5510340129,"tx_bytes":0},"3":{"rx_bytes":0,"tx_bytes":1541}}}
+  ```
+  `state` is this daemon's own view (`connected` once the chip reports
+  CONNECT, else `idle`/`init`). `ports` lists every open port with its
+  cumulative `BB_GET_SOCK_INFO` `total_size` counters, read once per tick on
+  the connected slot (slot 0 without a link) -- the same numbers
+  `ar8030-linkctl status`/`rate` show. On the ground an RX-only socket isn't
+  counted by the chip, which is why `ar8030-transport-rx` opens its port
+  TX|RX.
 - **`GET /api/v1/rf-temp`** -- RF-board temperature, polled once a second
   by the lifecycle thread when started with `--rf-temp-adc <ch>`
   (disabled by default; Caddx Ascent: channel 4). Cheap, unlike
