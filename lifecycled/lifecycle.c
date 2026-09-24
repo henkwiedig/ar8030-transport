@@ -755,12 +755,22 @@ static void lc_write_rf_temp_file(const lifecycle_ctx* ctx, int c10)
 }
 
 /* One RF-board temperature sample, once per main-loop tick -- stock polls
- * from its own temperature thread the same way. The ADC channel is armed
- * once up front (stock: fpv_bb_init) and re-armed whenever a read fails or
- * returns 0 mV (not armed, e.g. after a chip reset), at most every
- * LC_RFTEMP_REARM_TICKS. Smoothing matches stock's
- * fpv_bb_update_rf_board_temp(): new = 0.75*old + 0.25*sample. */
-#define LC_RFTEMP_REARM_TICKS 5
+ * from its own temperature thread the same way. Smoothing matches stock's
+ * fpv_bb_update_rf_board_temp(): new = 0.75*old + 0.25*sample.
+ *
+ * ADC arming (here and in lc_poll_batt()): once per session, like stock's
+ * fpv_bb_init, and again only after a read *ioctl* fails -- at most every
+ * LC_ADC_REARM_TICKS. Never because a reading is 0 mV: that is a real
+ * value (nothing on the channel -- the supply input on USB power), and
+ * re-arming on it turned into a PRJ_CMD_SET_ADC_TIMER every few seconds.
+ * Confirmed on the air unit: each "SDIO interrupt when tx not pending" /
+ * "_hal_sdio_send_pack: error s2m still pending" in the chip's log came
+ * right after one of those re-arms, and under full video load one ended
+ * in an SDIO write EIO and ar8030d detaching the chip (video and ar_net0
+ * dead, radio link still up). lifecycled only connects to ar8030d once,
+ * and a chip/daemon restart restarts it too (S65), so "once per session"
+ * is once per chip session. */
+#define LC_ADC_REARM_TICKS 30
 
 static void lc_poll_rf_temp(lifecycle_ctx* ctx)
 {
@@ -777,14 +787,17 @@ static void lc_poll_rf_temp(lifecycle_ctx* ctx)
         int ret = ar8030_rftemp_arm(ctx->client.handle, ch);
         lc_log("lifecycle: rf-temp: armed ADC channel %d (ret=%d)", ch, ret);
         ctx->rf_temp_armed      = ret == 0;
-        ctx->rf_temp_rearm_wait = LC_RFTEMP_REARM_TICKS;
+        ctx->rf_temp_rearm_wait = LC_ADC_REARM_TICKS;
         return; /* first measurement lands after the arm period */
     }
 
     int mv = 0;
-    if (ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) != 0 || mv <= 0) {
-        ctx->rf_temp_armed = 0;
+    if (ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) != 0) {
+        ctx->rf_temp_armed = 0; /* re-arm after LC_ADC_REARM_TICKS, see above */
         return;
+    }
+    if (mv <= 0) {
+        return; /* nothing measured (yet): stays armed, keeps the last state */
     }
 
     int sample = ar8030_rftemp_mv_to_c10(mv);
@@ -832,12 +845,11 @@ static void lc_write_batt_file(const lifecycle_ctx* ctx, int mv)
 }
 
 /* One supply-voltage sample per main-loop tick (stock: every 500 ms from
- * its temperature thread), mapped by ar8030_batt_mv(). Arming and re-arming
- * work like lc_poll_rf_temp(), except that 0 mV is also a real reading
- * here -- nothing on the power input, e.g. on USB power -- so a re-arm
- * that doesn't help just keeps reporting "no reading", logging only when
- * the arm result changes. Smoothing matches stock's
- * fpv_sys_update_batt_volt(): new = 0.75*old + 0.25*sample. */
+ * its temperature thread), mapped by ar8030_batt_mv(). Arming as in
+ * lc_poll_rf_temp() (see its comment -- once per session, never because a
+ * reading is 0 mV); 0 mV is reported as "no reading" (USB power alone).
+ * Smoothing matches stock's fpv_sys_update_batt_volt(): new = 0.75*old +
+ * 0.25*sample. */
 static void lc_poll_batt(lifecycle_ctx* ctx)
 {
     int ch = ctx->cfg.batt_adc;
@@ -856,13 +868,16 @@ static void lc_poll_batt(lifecycle_ctx* ctx)
             ctx->batt_arm_ret = ret;
         }
         ctx->batt_armed      = ret == 0;
-        ctx->batt_rearm_wait = LC_RFTEMP_REARM_TICKS;
+        ctx->batt_rearm_wait = LC_ADC_REARM_TICKS;
         return;
     }
 
     int mv = 0;
-    if (ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) != 0 || mv <= 0) {
-        ctx->batt_armed = 0;
+    int ok = ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) == 0;
+    if (!ok) {
+        ctx->batt_armed = 0; /* re-arm after LC_ADC_REARM_TICKS */
+    }
+    if (!ok || mv <= 0) {
         pthread_mutex_lock(&ctx->status_lock);
         ctx->batt_adc_mv = 0;
         pthread_mutex_unlock(&ctx->status_lock);
