@@ -26,7 +26,7 @@ INCLUDES := -I. -I$(AR8030_SDK_INC)
 ALL_CFLAGS := $(CFLAGS) $(INCLUDES) -D_GNU_SOURCE
 
 LDFLAGS += -L$(AR8030_SDK_LIB)
-LDLIBS := -lar8030_client -lcjson -lpthread
+LDLIBS := -lar8030_client -lcjson -lpthread -lm
 
 BUILD_DIR ?= build
 TARGET ?= ar8030-lifecycled

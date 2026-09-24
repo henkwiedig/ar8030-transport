@@ -164,6 +164,11 @@ struct lifecycle_ctx {
     uint8_t  sock_port_bmp;
     uint64_t sock_rx_bytes[LC_SOCK_PORTS];
     uint64_t sock_tx_bytes[LC_SOCK_PORTS];
+    /* Last BB_GET_1V1_INFO (lc_poll_quality()), status_lock. */
+    int            quality_valid;
+    int            signal_level;
+    lc_link_side_t quality_self;
+    lc_link_side_t quality_peer;
 
     /* The chip's channel table, read once at startup (status_lock). */
     int      chan_table_n;
@@ -640,6 +645,66 @@ static void lc_poll_sock_info(lifecycle_ctx* ctx)
     pthread_mutex_unlock(&ctx->status_lock);
 }
 
+static void lc_side_from_info(lc_link_side_t* out, const bb_info_t* in)
+{
+    out->snr         = in->snr;
+    out->ldpc_err    = in->ldpc_num_err_ratio;
+    out->gain_a      = in->gain_a;
+    out->gain_b      = in->gain_b;
+    out->tx_mcs      = in->tx_mcs;
+    out->tx_chan     = in->tx_chan;
+    out->tx_power    = in->tx_power;
+    out->tx_freq_khz = in->tx_freq_khz;
+}
+
+/* Stock's 0..4 signal bar level (ar_ldy_gnd's GUI status thread, Ghidra
+ * FUN_001997ac): from the video link's MCS -- the air side's TX MCS, which
+ * stock counts from 2 (it shows tx_mcs - 2) -- and whether the video
+ * receiver sees frame errors:
+ *   mcs < 3 -> 1, mcs 3..4 -> 2, mcs >= 5 -> 4, or 3 with frame errors.
+ * Stock counts error samples (ldpc_num_err_ratio > 1, i.e. > 0.01%) over
+ * ~1 s of its faster polling and drops to 3 at 6 or more; at this loop's
+ * one sample per tick that becomes "any errors this tick". */
+static int lc_signal_level(const lc_link_side_t* video_tx, const lc_link_side_t* video_rx)
+{
+    int mcs = (int)video_tx->tx_mcs - 2;
+    if (mcs < 3) {
+        return 1;
+    }
+    if (mcs < 5) {
+        return 2;
+    }
+    return video_rx->ldpc_err > 1 ? 3 : 4;
+}
+
+/* Link quality, once per tick while connected: BB_GET_1V1_INFO's self and
+ * peer blocks (needs the SDK's bb_info_t fix, BB_HAVE_1V1_INFO_76 -- with
+ * the old 72-byte struct every peer field reads 0). Video flows air ->
+ * ground, so the video TX side is self on the AP and peer on the DEV. */
+static void lc_poll_quality(lifecycle_ctx* ctx)
+{
+#ifdef BB_HAVE_1V1_INFO_76
+    bb_get_1v1_info_in_t  in = {.frame_num = 0};
+    bb_get_1v1_info_out_t out;
+    memset(&out, 0, sizeof(out));
+    int ok = ctx->state == LC_STATE_CONNECTED && bb_ioctl(ctx->client.handle, BB_GET_1V1_INFO, &in, &out) == 0;
+
+    lc_link_side_t self, peer;
+    lc_side_from_info(&self, &out.self);
+    lc_side_from_info(&peer, &out.peer);
+    int is_ap = ctx->cfg.role == LC_ROLE_AP;
+
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->quality_valid = ok;
+    ctx->quality_self  = self;
+    ctx->quality_peer  = peer;
+    ctx->signal_level  = ok ? (is_ap ? lc_signal_level(&self, &peer) : lc_signal_level(&peer, &self)) : 0;
+    pthread_mutex_unlock(&ctx->status_lock);
+#else
+    (void)ctx;
+#endif
+}
+
 static void lc_poll_distance(lifecycle_ctx* ctx)
 {
     int m = ctx->state == LC_STATE_CONNECTED ? lc_distance_read_m(ctx->client.handle) : -1;
@@ -920,6 +985,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_power_request(ctx);
         lc_poll_distance(ctx);
         lc_poll_sock_info(ctx);
+        lc_poll_quality(ctx);
         lc_poll_rf_temp(ctx);
         lc_poll_batt(ctx);
 
@@ -1072,6 +1138,10 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->sock_port_bmp  = ctx->sock_port_bmp;
     memcpy(out->sock_rx_bytes, ctx->sock_rx_bytes, sizeof(out->sock_rx_bytes));
     memcpy(out->sock_tx_bytes, ctx->sock_tx_bytes, sizeof(out->sock_tx_bytes));
+    out->quality_valid  = ctx->quality_valid;
+    out->signal_level   = ctx->signal_level;
+    out->quality_self   = ctx->quality_self;
+    out->quality_peer   = ctx->quality_peer;
     out->chan_table_n   = ctx->chan_table_n;
     memcpy(out->chan_table_khz, ctx->chan_table_khz, sizeof(out->chan_table_khz));
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */

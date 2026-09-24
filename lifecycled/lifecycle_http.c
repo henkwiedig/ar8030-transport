@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -429,12 +430,29 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     send_json(fd, 200, "OK", json);
 }
 
+/* One BB_GET_1V1_INFO side as JSON. snr_db = 10 * log10(snr / 36), the
+ * SDK's own conversion (stock shows it as S-SNR/G-SNR). */
+static void format_link_side(const lc_link_side_t* q, char* out, size_t out_sz)
+{
+    char snr_db[16];
+    if (q->snr > 0) {
+        snprintf(snr_db, sizeof(snr_db), "%.1f", 10.0 * log10(q->snr / 36.0));
+    } else {
+        snprintf(snr_db, sizeof(snr_db), "null");
+    }
+    snprintf(out, out_sz,
+             "{\"snr\":%u,\"snr_db\":%s,\"ldpc_err\":%u,\"gain\":[%u,%u],\"tx_mcs\":%u,\"tx_chan\":%u,"
+             "\"tx_power\":%u,\"tx_freq_khz\":%u}",
+             q->snr, snr_db, q->ldpc_err, q->gain_a, q->gain_b, q->tx_mcs, q->tx_chan, q->tx_power, q->tx_freq_khz);
+}
+
 /* GET /api/v1/link -- link state plus the chip's per-port byte counters,
  * cheap (no linkctl fork, unlike /api/v1/status): meant for frequent
  * polling, e.g. PixelPilot's drone detection. state is this daemon's own
  * view ("connected" once the chip reports CONNECT), ports lists every open
  * port with its cumulative rx/tx byte counters (BB_GET_SOCK_INFO, read
- * every tick). */
+ * every tick), quality is BB_GET_1V1_INFO's self/peer blocks plus stock's
+ * 0..4 signal_level while connected, else null. */
 static void handle_link(lifecycle_http_ctx* http, int fd)
 {
     lc_status_t st;
@@ -457,9 +475,21 @@ static void handle_link(lifecycle_http_ctx* http, int fd)
     }
     snprintf(ports + n, sizeof(ports) - n, "}");
 
-    char json[LC_SOCK_PORTS * 80 + 160];
-    snprintf(json, sizeof(json), "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"ports\":%s}",
-             role_str, state_str, st.connected_slot, ports);
+    char quality[640];
+    if (st.quality_valid) {
+        char self_j[288], peer_j[288];
+        format_link_side(&st.quality_self, self_j, sizeof(self_j));
+        format_link_side(&st.quality_peer, peer_j, sizeof(peer_j));
+        snprintf(quality, sizeof(quality), "{\"signal_level\":%d,\"self\":%s,\"peer\":%s}", st.signal_level, self_j,
+                 peer_j);
+    } else {
+        snprintf(quality, sizeof(quality), "null");
+    }
+
+    char json[LC_SOCK_PORTS * 80 + 800];
+    snprintf(json, sizeof(json),
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"ports\":%s,\"quality\":%s}",
+             role_str, state_str, st.connected_slot, ports, quality);
     send_json(fd, 200, "OK", json);
 }
 

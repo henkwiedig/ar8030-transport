@@ -1888,7 +1888,25 @@ design rationale):
   {"ok":true,"role":"dev","state":"connected","connected_slot":0,"ports":{"0":{"rx_bytes":0,"tx_bytes":0},"1":{"rx_bytes":0,"tx_bytes":0},"2":{"rx_bytes":5510340129,"tx_bytes":0},"3":{"rx_bytes":0,"tx_bytes":1541}}}
   ```
   `state` is this daemon's own view (`connected` once the chip reports
-  CONNECT, else `idle`/`init`). `ports` lists every open port with its
+  CONNECT, else `idle`/`init`). While connected, `quality` carries the
+  chip's `BB_GET_1V1_INFO` (read every tick; `null` without a link):
+  ```
+  "quality":{"signal_level":4,
+    "self":{"snr":7418,"snr_db":23.1,"ldpc_err":0,"gain":[33,35],"tx_mcs":9,"tx_chan":25,"tx_power":14,"tx_freq_khz":5805000},
+    "peer":{"snr":4164,"snr_db":20.6,"ldpc_err":0,"gain":[29,112],"tx_mcs":12,"tx_chan":25,"tx_power":13,"tx_freq_khz":5805000}}
+  ```
+  `self` is this radio, `peer` the other end as reported over the link:
+  receiver SNR (`snr_db` = `10 * log10(snr / 36)`), LDPC frame-error ratio
+  (x10000), AGC gain per antenna path (stock's "RSSI"), and the TX side's
+  MCS/channel/power/frequency. Only the ground (DEV) gets the peer's
+  receiver figures -- on the air the peer's `snr`/`gain` read 0. Needs the
+  ar8030 package's `bb_info_t` fix (`BB_HAVE_1V1_INFO_76`): the chip's
+  blocks are 76 bytes, and with the SDK's original 72 every peer field
+  read 0. `signal_level` is stock `ar_ldy_gnd`'s 0..4 bar level: from the
+  video MCS (the air's `tx_mcs` minus 2) `< 3` -> 1, `3..4` -> 2, `>= 5`
+  -> 4, or 3 while the video receiver reports frame errors (stock counts
+  error samples over ~1 s of faster polling; at one sample per tick this
+  is "any errors this tick"). `ports` lists every open port with its
   cumulative `BB_GET_SOCK_INFO` `total_size` counters, read once per tick on
   the connected slot (slot 0 without a link) -- the same numbers
   `ar8030-linkctl status`/`rate` show. On the ground an RX-only socket isn't

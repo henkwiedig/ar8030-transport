@@ -118,6 +118,18 @@ typedef enum {
     LC_STATE_CONNECTED,
 } lc_state_e;
 
+/* One side's BB_GET_1V1_INFO block, as lc_status_t exposes it. */
+typedef struct {
+    uint16_t snr;          /* raw; dB = 10 * log10(snr / 36) */
+    uint16_t ldpc_err;     /* ldpc_num_err_ratio: frames with decode errors, x10000 */
+    uint8_t  gain_a;       /* receiver AGC gain, path A / B (stock shows these as "RSSI") */
+    uint8_t  gain_b;
+    uint8_t  tx_mcs;       /* this side's TX MCS, raw (stock displays tx_mcs - 2) */
+    uint8_t  tx_chan;
+    uint8_t  tx_power;
+    uint32_t tx_freq_khz;
+} lc_link_side_t;
+
 /* Thread-safe snapshot of the lifecycle thread's own view of the link --
  * see lifecycle_get_status()'s own comment on what protects it. */
 typedef struct {
@@ -140,6 +152,15 @@ typedef struct {
     uint8_t    sock_port_bmp;
     uint64_t   sock_rx_bytes[LC_SOCK_PORTS];
     uint64_t   sock_tx_bytes[LC_SOCK_PORTS];
+    /* BB_GET_1V1_INFO, refreshed every tick while connected (see
+     * lc_poll_quality()): this radio's own receiver (self) and the peer's
+     * (peer, reported back over the link). quality_valid is 0 without a
+     * link or reading; signal_level is stock's 0..4 bar level (0 = no
+     * link). */
+    int            quality_valid;
+    int            signal_level;
+    lc_link_side_t quality_self;
+    lc_link_side_t quality_peer;
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */
