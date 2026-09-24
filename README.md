@@ -1937,6 +1937,42 @@ design rationale):
   or a raw `linkctl channel` passthrough on either side) is picked up and
   saved by the AP once the link had settled on the AP's channel. The DEV
   answers `409` while no link is up, since there is nothing to push to.
+- **`GET|POST /api/v1/power[?level=<mW|auto>]`** -- the *persisted*
+  output power. Levels per role: air (AP) `400`/`200`/`100`/`25` mW,
+  ground (DEV) `auto`/`500`/`200`/`100`/`25` mW; defaults 400 mW on air,
+  500 mW on ground (`--default-power <mW|auto|none>` overrides, `none`
+  leaves the chip's config-file power alone). GET:
+  ```
+  curl http://<host>:8899/api/v1/power
+  {"ok":true,"power":400,"power_dbm":26,"power_levels":[400,200,100,25]}
+  ```
+  Saved to an `ar8030.power` sidecar next to `cfg_path`, applied at
+  startup (before any link, so the power used while searching is right
+  too), on every connect and immediately on change. mW map to the chip's
+  dBm target the way the stock streamers do it (Ghidra: `ar_ldyhs_sky`
+  `fpv_bb_set_local_power()`, `ar_ldy_gnd` `do_bb_set_local_power()`) --
+  the chip's dBm is not antenna output, stock's own "500 mW" is 26 on the
+  Lite and 24 on the ground:
+
+  | level | air: chip dBm | ground: chip dBm |
+  |---|---|---|
+  | 400 / 500 mW | 26 | 24 (`BB_SET_POWER` 27) |
+  | 200 mW | 22 | 20 (23) |
+  | 100 mW | 19 | 17 (20) |
+  | 25 mW | 13 | 11 (14) |
+  | auto | -- | 24, adaptation within [14, 27] |
+
+  Air: `BB_SET_POWER_AUTO {2 (disconnected power), dBm, dBm}` then
+  `BB_SET_POWER` on the BR/CS user (8) -- setting user 0 was confirmed on
+  hardware to change only what `BB_GET_CUR_POWER` reports, not what the
+  ground receives. Ground: `BB_SET_POWER_AUTO {1, 27, 14}` (auto) or
+  `{0, 17, 14}`, then `{2, dBm, dBm}`, then `BB_SET_POWER` on user 0 at
+  dBm + 3 (stock's own offset when the air unit is a Lite).
+  **Needs the ar8030 package's `bb_api-fix-BB_SET_POWER_AUTO-input-size`
+  patch** (the SDK sent `BB_SET_POWER_AUTO` with 1 byte; the chip takes
+  3): built against an SDK without it (`BB_HAVE_PWR_AUTO_BOUNDS` unset)
+  lifecycled refuses to touch power instead of sending the truncated
+  payload.
 - **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
   -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
   the windowed retransmission controller's own tuning parameters

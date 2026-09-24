@@ -157,6 +157,15 @@ struct lifecycle_ctx {
     int pending_retx_conti_busy;
     int pending_retx_conti_idle;
 
+    /* lifecycle_request_power()'s mailbox, same cmd_lock. */
+    int pending_power_valid;
+    int pending_power;
+
+    /* Wanted output power (mW level, LC_POWER_AUTO or LC_POWER_NONE) and
+     * the chip's last-read dBm target (-1 until read), status_lock. */
+    int power;
+    int power_dbm;
+
     /* lifecycle_request_channel()'s mailbox, same cmd_lock. */
     int pending_channel_valid;
     int pending_channel;
@@ -182,6 +191,8 @@ struct lifecycle_ctx {
     int rf_temp_c10;
     int rf_temp_mv;
 };
+
+static void lc_apply_power(lifecycle_ctx* ctx);
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -256,10 +267,20 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->pending_bandwidth_mhz = -1;
     ctx->chan_auto            = -1;
     ctx->work_chan            = -1;
+    ctx->power_dbm            = -1;
     if (cfg->role != LC_ROLE_AP) {
         ctx->channel = LC_CHANNEL_NONE;
     } else if (!cfg->cfg_path[0] || lc_channel_load(cfg->cfg_path, &ctx->channel) != 0) {
         ctx->channel = cfg->default_channel;
+    }
+    int is_ap = cfg->role == LC_ROLE_AP;
+    if (!cfg->cfg_path[0] || lc_power_load(cfg->cfg_path, &ctx->power) != 0 || !lc_power_valid(is_ap, ctx->power)) {
+        ctx->power = cfg->default_power == LC_POWER_ROLE_DEFAULT ? lc_power_default(is_ap) : cfg->default_power;
+    }
+    if (ctx->power != LC_POWER_NONE && !lc_power_valid(is_ap, ctx->power)) {
+        lc_log("lifecycle: power level %d is not valid for this role, using %d mW", ctx->power,
+               lc_power_default(is_ap));
+        ctx->power = lc_power_default(is_ap);
     }
     pthread_mutex_init(&ctx->status_lock, NULL);
     pthread_mutex_init(&ctx->cmd_lock, NULL);
@@ -330,6 +351,10 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
         retx.conti_idle = LC_RETX_DEFAULT_CONTI_IDLE;
     }
     lc_retx_apply(ctx->client.handle, retx.win, retx.busy, retx.idle, retx.conti_busy, retx.conti_idle);
+
+    /* Re-assert output power: cheap and idempotent, and nothing guarantees
+     * the chip keeps it across a re-link. */
+    lc_apply_power(ctx);
 
     /* AP side only -- it is the controlling side of the 1V1 link (stock
      * gets ~40 Mbit/s at MCS 12 vs 25.9 without this). Chip-wide, needs an
@@ -542,6 +567,61 @@ static void lc_channel_on_connect(lifecycle_ctx* ctx)
     lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, ctx->channel);
 }
 
+static const char* lc_power_str(int level, char* buf, size_t buf_sz)
+{
+    if (level == LC_POWER_AUTO) {
+        return "auto";
+    }
+    if (level == LC_POWER_NONE) {
+        return "none";
+    }
+    snprintf(buf, buf_sz, "%d mW", level);
+    return buf;
+}
+
+static void lc_apply_power(lifecycle_ctx* ctx)
+{
+    if (ctx->power == LC_POWER_NONE) {
+        return;
+    }
+    lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, ctx->power);
+}
+
+/* Refreshes lifecycle_get_status()'s power_dbm, once per fallback poll. */
+static void lc_poll_power(lifecycle_ctx* ctx)
+{
+    int dbm = lc_power_read_dbm(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->power_dbm = dbm;
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
+/* Drains lifecycle_request_power()'s mailbox: persists, then applies right
+ * away (chip-wide, no link needed). */
+static void lc_drain_power_request(lifecycle_ctx* ctx)
+{
+    int valid, level;
+    pthread_mutex_lock(&ctx->cmd_lock);
+    valid                    = ctx->pending_power_valid;
+    level                    = ctx->pending_power;
+    ctx->pending_power_valid = 0;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (!valid) {
+        return;
+    }
+    char buf[16];
+    lc_log("lifecycle: http: power change requested: %s", lc_power_str(level, buf, sizeof(buf)));
+    if (ctx->cfg.cfg_path[0]) {
+        lc_power_save(ctx->cfg.cfg_path, level);
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->power = level;
+    pthread_mutex_unlock(&ctx->status_lock);
+    lc_apply_power(ctx);
+    lc_poll_power(ctx);
+}
+
 /* Writes whole degC to cfg.rf_temp_file via rename(), so a reader never
  * sees a half-written line. */
 static void lc_write_rf_temp_file(const lifecycle_ctx* ctx, int c10)
@@ -672,6 +752,15 @@ void* lifecycle_thread_main(void* arg)
         lc_channel_apply_local(ctx->client.handle, ctx->channel);
     }
 
+    /* Output power is chip-wide and needs no link: set it before the link
+     * comes up (so the disconnected/search power is already right too),
+     * and again on every connect -- see lc_apply_tuning_on_connect(). */
+    if (ctx->power != LC_POWER_NONE) {
+        char buf[16];
+        lc_log("lifecycle: startup power %s", lc_power_str(ctx->power, buf, sizeof(buf)));
+        lc_apply_power(ctx);
+    }
+
     ctx->state = LC_STATE_IDLE;
     lc_log("lifecycle: thread running (role=%d)", (int)ctx->cfg.role);
 
@@ -689,11 +778,13 @@ void* lifecycle_thread_main(void* arg)
             }
             last_fallback_poll = now;
             did_fallback_poll  = 1;
+            lc_poll_power(ctx);
         }
 
         lc_drain_bandwidth_request(ctx);
         lc_drain_retx_request(ctx);
         lc_drain_channel_request(ctx);
+        lc_drain_power_request(ctx);
         lc_poll_rf_temp(ctx);
 
         bb_link_state_e state;
@@ -839,6 +930,8 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->channel        = ctx->channel;
     out->chan_auto      = ctx->chan_auto;
     out->work_chan      = ctx->work_chan;
+    out->power          = ctx->power;
+    out->power_dbm      = ctx->power_dbm;
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
     out->rf_temp_c10    = ctx->rf_temp_c10;
     out->rf_temp_mv     = ctx->rf_temp_mv;
@@ -895,6 +988,18 @@ int lifecycle_request_channel(lifecycle_ctx* ctx, int chan)
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_channel       = chan;
     ctx->pending_channel_valid = 1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_power(lifecycle_ctx* ctx, int level)
+{
+    if (!lc_power_valid(ctx->cfg.role == LC_ROLE_AP, level)) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_power       = level;
+    ctx->pending_power_valid = 1;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }

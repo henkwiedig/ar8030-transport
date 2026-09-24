@@ -382,3 +382,217 @@ int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan)
     }
     return ret;
 }
+
+/* mW level -> chip dBm target, per role, from the stock streamers' own
+ * tables (Ghidra, see lifecycle_tuning.h): ar_ldyhs_sky's table for the
+ * Lite's board type (25->13, 100->19, 150->21, 200->22, 500->26) and
+ * ar_ldy_gnd's (25->11, 100->17, 200->20, 500->24). The air side's top
+ * level is stock's own "500 mW" entry, offered as 400 mW (26 dBm). */
+typedef struct {
+    int mw;
+    int dbm;
+} lc_power_level_t;
+
+static const lc_power_level_t AP_POWER_LEVELS[] = {{400, 26}, {200, 22}, {100, 19}, {25, 13}};
+static const lc_power_level_t DEV_POWER_LEVELS[] = {{500, 24}, {200, 20}, {100, 17}, {25, 11}};
+
+/* Ground "auto": stock's 501 mW (500 + auto bit): target 24, adaptation
+ * bounded to [14, 27] -- 14 is ar_ldy_gnd's floor when the air unit is a
+ * Lite (sky project type 4/7), 27 its auto ceiling for 501 mW. */
+#define DEV_AUTO_DBM     24
+#define DEV_AUTO_MIN_DBM 14
+#define DEV_AUTO_MAX_DBM 27
+
+/* ar_ldy_gnd adds +3 to the ground's own BB_SET_POWER target when the air
+ * unit is a type 4/6/7 board (the Lite is 4/7) -- +6 when a config flag we
+ * haven't decoded is clear; the smaller of the two is used here. */
+#define DEV_TARGET_OFFSET_DBM 3
+
+static const lc_power_level_t* power_levels(int is_ap, size_t* n)
+{
+    if (is_ap) {
+        *n = sizeof(AP_POWER_LEVELS) / sizeof(AP_POWER_LEVELS[0]);
+        return AP_POWER_LEVELS;
+    }
+    *n = sizeof(DEV_POWER_LEVELS) / sizeof(DEV_POWER_LEVELS[0]);
+    return DEV_POWER_LEVELS;
+}
+
+static int power_level_dbm(int is_ap, int level)
+{
+    if (level == LC_POWER_AUTO) {
+        return is_ap ? -1 : DEV_AUTO_DBM;
+    }
+    size_t                  n;
+    const lc_power_level_t* t = power_levels(is_ap, &n);
+    for (size_t i = 0; i < n; i++) {
+        if (t[i].mw == level) {
+            return t[i].dbm;
+        }
+    }
+    return -1;
+}
+
+int lc_power_parse(const char* s, int* out)
+{
+    if (!s || !*s) {
+        return -1;
+    }
+    if (strcmp(s, "auto") == 0) {
+        *out = LC_POWER_AUTO;
+        return 0;
+    }
+    if (strcmp(s, "none") == 0) {
+        *out = LC_POWER_NONE;
+        return 0;
+    }
+    char* end;
+    long  v = strtol(s, &end, 10);
+    if (end == s || (*end != '\0' && strcmp(end, "mw") != 0 && strcmp(end, "mW") != 0) || v <= 0 || v > 10000) {
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+int lc_power_valid(int is_ap, int level)
+{
+    return power_level_dbm(is_ap, level) >= 0;
+}
+
+int lc_power_default(int is_ap)
+{
+    return is_ap ? 400 : 500;
+}
+
+void lc_power_levels_json(int is_ap, char* out, size_t out_sz)
+{
+    size_t                  n;
+    const lc_power_level_t* t   = power_levels(is_ap, &n);
+    size_t                  len = 0;
+    out[0]                      = '\0';
+    if (!is_ap) {
+        len += (size_t)snprintf(out, out_sz, "\"auto\"");
+    }
+    for (size_t i = 0; i < n && len < out_sz; i++) {
+        len += (size_t)snprintf(out + len, out_sz - len, "%s%d", len ? "," : "", t[i].mw);
+    }
+}
+
+int lc_power_load(const char* cfg_path, int* out)
+{
+    char path[512];
+    sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    char buf[16] = {0};
+    int  ok      = fscanf(f, "%15s", buf) == 1;
+    fclose(f);
+    int level;
+    if (!ok || lc_power_parse(buf, &level) != 0 || level == LC_POWER_NONE) {
+        lc_log("lifecycle: tuning: %s has no valid power level, ignoring", path);
+        return -1;
+    }
+    *out = level;
+    return 0;
+}
+
+int lc_power_save(const char* cfg_path, int level)
+{
+    if (level != LC_POWER_AUTO && level <= 0) {
+        lc_log("lifecycle: tuning: refusing to persist invalid power level %d", level);
+        return -1;
+    }
+
+    char path[512];
+    sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    if (level == LC_POWER_AUTO) {
+        fprintf(f, "auto\n");
+    } else {
+        fprintf(f, "%d\n", level);
+    }
+    fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: tuning: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+#ifdef BB_HAVE_PWR_AUTO_BOUNDS
+static int power_auto_ioctl(bb_dev_handle_t* handle, int mode, int max, int min)
+{
+    bb_set_pwr_auto_in_t pa = {.pwr_auto = (uint8_t)mode, .max = (uint8_t)max, .min = (uint8_t)min};
+    int                  ret = bb_ioctl(handle, BB_SET_POWER_AUTO, &pa, NULL);
+    lc_log("lifecycle: tuning: BB_SET_POWER_AUTO(mode=%d, max=%d, min=%d) ret=%d", mode, max, min, ret);
+    return ret;
+}
+#endif
+
+/* Stock's sequences (see lifecycle_tuning.h):
+ *  air:    {DISCONNECT, dbm, dbm}, then BB_SET_POWER(BR/CS user, dbm) --
+ *          the AP's own power is set on the BR/CS user, not user 0
+ *          (confirmed on hardware: BB_SET_POWER on user 0 moves what
+ *          BB_GET_CUR_POWER reports, but not what the ground receives)
+ *  ground: {ON, 27, 14} for auto / {OFF, 17, 14} otherwise, then
+ *          {DISCONNECT, dbm, dbm}, then BB_SET_POWER(user 0, dbm + 3) */
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level)
+{
+#ifdef BB_HAVE_PWR_AUTO_BOUNDS
+    int dbm = power_level_dbm(is_ap, level);
+    if (dbm < 0) {
+        lc_log("lifecycle: tuning: power level %d is not valid for this role, not applying", level);
+        return -1;
+    }
+    int ret = 0;
+    int target;
+    int usr;
+    if (is_ap) {
+        usr    = BB_USER_BR_CS;
+        target = dbm;
+    } else {
+        usr    = BB_USER_0;
+        target = dbm + DEV_TARGET_OFFSET_DBM;
+        if (level == LC_POWER_AUTO) {
+            ret |= power_auto_ioctl(handle, BB_PWR_AUTO_ON, DEV_AUTO_MAX_DBM, DEV_AUTO_MIN_DBM);
+        } else {
+            ret |= power_auto_ioctl(handle, BB_PWR_AUTO_OFF, DEV_AUTO_MIN_DBM + 3, DEV_AUTO_MIN_DBM);
+        }
+    }
+    ret |= power_auto_ioctl(handle, BB_PWR_AUTO_DISCONNECT, dbm, dbm);
+
+    bb_set_pwr_in_t sp = {.usr = (uint8_t)usr, .pwr = (uint8_t)target};
+    int             r  = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
+    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", usr, target, r);
+    return ret | r;
+#else
+    (void)handle;
+    (void)is_ap;
+    (void)level;
+    lc_log("lifecycle: tuning: SDK lacks the BB_SET_POWER_AUTO size fix, not touching output power");
+    return -1;
+#endif
+}
+
+int lc_power_read_dbm(bb_dev_handle_t* handle, int is_ap)
+{
+    bb_get_cur_pwr_in_t  in = {.usr = (uint8_t)(is_ap ? BB_USER_BR_CS : BB_USER_0)};
+    bb_get_cur_pwr_out_t out;
+    memset(&out, 0, sizeof(out));
+    if (bb_ioctl(handle, BB_GET_CUR_POWER, &in, &out) != 0) {
+        return -1;
+    }
+    return out.pwr;
+}

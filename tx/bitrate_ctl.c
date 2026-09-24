@@ -79,8 +79,7 @@ static int read_tx_throughput_kbps(ar8030_link_t *link, bb_slot_e slot, uint32_t
 }
 
 /* Physical-user index hardcoded to 0, matching this project's own existing
- * single-user assumption elsewhere (e.g. linkctl/main.c's cmd_status
- * hardcoding BB_GET_CUR_POWER's usr=0) -- multi-user setups aren't this
+ * single-user assumption elsewhere -- multi-user setups aren't this
  * project's target configuration. Returns -1 (leave *out_ratio untouched)
  * on an RPC failure or an invalid reading (ldpc_num == 0, matching
  * bb_quality_t's own "all zero means invalid" doc comment in bb_api.h) so

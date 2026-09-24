@@ -724,11 +724,20 @@ static int cmd_status(int argc, char **argv)
     if (bb_ioctl(g_hbb, BB_GET_POWER_MODE, NULL, &pwr_mode_out) == 0)
         printf("BB_GET_POWER_MODE: %s\n", pwr_mode_name(pwr_mode_out.pwr_mode));
 
-    bb_get_cur_pwr_in_t pwr_in = { .usr = 0 };
+    /* The user whose power this side actually transmits with, the same one
+     * ar8030-lifecycled sets (lifecycle_tuning.c's lc_power_apply(), after
+     * the stock streamers): BR/CS on the AP, user 0 on the DEV. Confirmed
+     * on hardware that the AP's user 0 keeps reporting its config-file
+     * value no matter what the AP really transmits. No mW conversion: this
+     * is the chip's dBm scale, not antenna output (stock's own "500 mW" is
+     * 26 here on the Lite air unit, 24 on the ground). */
+    uint8_t pwr_usr = st_out.role == BB_ROLE_AP ? BB_USER_BR_CS : BB_USER_0;
+    bb_get_cur_pwr_in_t pwr_in = { .usr = pwr_usr };
     bb_get_cur_pwr_out_t pwr_out;
     memset(&pwr_out, 0, sizeof(pwr_out));
     if (bb_ioctl(g_hbb, BB_GET_CUR_POWER, &pwr_in, &pwr_out) == 0)
-        printf("BB_GET_CUR_POWER(usr=0): pwr=%udBm (%.1fmW)\n", pwr_out.pwr, dbm_to_mw(pwr_out.pwr));
+        printf("BB_GET_CUR_POWER(usr=%u%s): pwr=%u (chip dBm)\n", pwr_usr, pwr_usr == BB_USER_BR_CS ? " BR/CS" : "",
+               pwr_out.pwr);
 
     /* Per-port bb_socket usage for this same slot. Genuinely useful
      * beyond a nice-to-have: this session's own ar8030d-reconnect work

@@ -6,6 +6,7 @@ extern "C" {
 
 #include "ar8030.h"
 #include "bb_api.h"
+#include <stddef.h>
 
 /*
  * Bandwidth, retx and channel. Bandwidth mirrors the shell logic this
@@ -109,6 +110,53 @@ int lc_channel_apply_local(bb_dev_handle_t* handle, int chan);
  * one), confirmed on hardware to drive a synchronized "safe hop" without
  * dropping CONNECT. Returns 0 if every ioctl succeeded. */
 int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan);
+
+/*
+ * Output power, as a level in mW (the unit the settings UI offers) or
+ * LC_POWER_AUTO (ground only: the chip's own power adaptation). Each
+ * role has a fixed set of levels, mapped to the chip's dBm target the way
+ * the stock streamers do it (Ghidra: ar_ldyhs_sky fpv_bb_set_local_power()
+ * for the air side, ar_ldy_gnd do_bb_set_local_power() for the ground) --
+ * the chip's dBm scale is not the antenna output: stock's own "500 mW" is
+ * 26 on the Lite (air) and 24 on the ground. Needs the SDK's
+ * BB_SET_POWER_AUTO size fix (ar8030 package patch
+ * bb_api-fix-BB_SET_POWER_AUTO-input-size, BB_HAVE_PWR_AUTO_BOUNDS); built
+ * against an SDK without it, lc_power_apply() refuses rather than send the
+ * old truncated 1-byte payload.
+ */
+#define LC_POWER_AUTO         (-1)
+#define LC_POWER_NONE         (-2) /* don't touch the chip's power at all */
+#define LC_POWER_ROLE_DEFAULT (-3) /* --default-power not given: per role */
+
+/* Parses "auto", "none" or a level in mW. Returns 0 and fills *out on
+ * success, -1 otherwise. Whether the level exists for a role is
+ * lc_power_valid()'s job. */
+int lc_power_parse(const char* s, int* out);
+
+/* Non-zero if level is one of this role's levels (LC_POWER_AUTO: ground
+ * only). */
+int lc_power_valid(int is_ap, int level);
+
+/* The role's default level: 400 mW (26 dBm) on the air side, 500 mW on
+ * the ground. */
+int lc_power_default(int is_ap);
+
+/* Writes this role's levels, highest first, as a JSON array body (e.g.
+ * `"auto",500,200,100,25`) into out. */
+void lc_power_levels_json(int is_ap, char* out, size_t out_sz);
+
+/* Sidecar "ar8030.power" next to cfg_path ("auto" or mW). Load returns 0
+ * and fills *out, -1 if missing/unreadable; save returns 0 on success. */
+int lc_power_load(const char* cfg_path, int* out);
+int lc_power_save(const char* cfg_path, int level);
+
+/* Applies level (chip-wide, no link needed). Returns 0 if every ioctl
+ * succeeded. */
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level);
+
+/* BB_GET_CUR_POWER for the user this role sets (see lc_power_apply()).
+ * Returns the chip's dBm target, or -1. */
+int lc_power_read_dbm(bb_dev_handle_t* handle, int is_ap);
 
 /* Non-zero if every one of the 5 values fits a uint8_t (0-255) -- the
  * only constraint currently known; unlike lc_tuning_valid_mhz() there is

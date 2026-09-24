@@ -58,6 +58,11 @@ static void print_help(const char* argv0)
     printf("                            AP only: channel while none is persisted yet: a channel-table\n");
     printf("                            index, auto (chip's channel adaptation) or none (leave\n");
     printf("                            the chip's own startup channel alone) (default 32)\n");
+    printf("  --default-power <mw|auto|none>\n");
+    printf("                            output power while none is persisted yet: air 400/\n");
+    printf("                            200/100/25 mW, ground auto/500/200/100/25 mW, or none\n");
+    printf("                            (leave the chip's config-file power alone)\n");
+    printf("                            (default: air 400 mW = 26 dBm, ground 500 mW)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (default: none -- no physical button on this board)\n");
     printf("  --http-port <n>           start the HTTP control API on this port\n");
@@ -97,6 +102,7 @@ enum {
     OPT_CFG_PATH,
     OPT_DEFAULT_BANDWIDTH,
     OPT_DEFAULT_CHANNEL,
+    OPT_DEFAULT_POWER,
     OPT_BIND_GPIO,
     OPT_HTTP_PORT,
     OPT_HTTP_BIND,
@@ -124,6 +130,7 @@ int main(int argc, char** argv)
         .default_bandwidth = 20,
         .frame_change      = 1,
         .default_channel   = 32,
+        .default_power     = LC_POWER_ROLE_DEFAULT,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
         .http_bind         = "0.0.0.0",
@@ -142,6 +149,7 @@ int main(int argc, char** argv)
         {"cfg-path",          required_argument, 0, OPT_CFG_PATH         },
         {"default-bandwidth", required_argument, 0, OPT_DEFAULT_BANDWIDTH},
         {"default-channel",   required_argument, 0, OPT_DEFAULT_CHANNEL  },
+        {"default-power",     required_argument, 0, OPT_DEFAULT_POWER    },
         {"bind-gpio",         required_argument, 0, OPT_BIND_GPIO        },
         {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
         {"http-bind",         required_argument, 0, OPT_HTTP_BIND        },
@@ -188,6 +196,12 @@ int main(int argc, char** argv)
         case OPT_DEFAULT_CHANNEL:
             if (lc_channel_parse(optarg, &cfg.default_channel) != 0) {
                 fprintf(stderr, "invalid --default-channel '%s' (index, auto or none)\n", optarg);
+                return 1;
+            }
+            break;
+        case OPT_DEFAULT_POWER:
+            if (lc_power_parse(optarg, &cfg.default_power) != 0) {
+                fprintf(stderr, "invalid --default-power '%s' (mW level, auto or none)\n", optarg);
                 return 1;
             }
             break;

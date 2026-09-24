@@ -355,6 +355,28 @@ static void format_channel_fields(const lc_status_t* st, char* out, size_t out_s
              st->chan_auto < 0 ? "null" : st->chan_auto ? "\"auto\"" : "\"manual\"", work);
 }
 
+/* "power" (wanted: mW, "auto" or null for LC_POWER_NONE), "power_dbm"
+ * (chip's dBm target, null until read) and "power_levels" (this role's
+ * choices, highest first). */
+static void format_power_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz)
+{
+    char level[16], dbm[16], levels[96];
+    if (st->power == LC_POWER_AUTO) {
+        snprintf(level, sizeof(level), "\"auto\"");
+    } else if (st->power == LC_POWER_NONE) {
+        snprintf(level, sizeof(level), "null");
+    } else {
+        snprintf(level, sizeof(level), "%d", st->power);
+    }
+    if (st->power_dbm >= 0) {
+        snprintf(dbm, sizeof(dbm), "%d", st->power_dbm);
+    } else {
+        snprintf(dbm, sizeof(dbm), "null");
+    }
+    lc_power_levels_json(lifecycle_get_config(http->lc)->role == LC_ROLE_AP, levels, sizeof(levels));
+    snprintf(out, out_sz, "\"power\":%s,\"power_dbm\":%s,\"power_levels\":[%s]", level, dbm, levels);
+}
+
 static void handle_status(lifecycle_http_ctx* http, int fd)
 {
     lc_status_t st;
@@ -375,13 +397,15 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
 
     char chan[96];
     format_channel_fields(&st, chan, sizeof(chan));
+    char power[192];
+    format_power_fields(http, &st, power, sizeof(power));
 
-    char json[8700];
+    char json[8900];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,"
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,"
               "\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, st.paired ? "true" : "false", rf_temp,
-             rc, escaped);
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, st.paired ? "true" : "false",
+             rf_temp, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
 
@@ -478,6 +502,42 @@ static void handle_channel(lifecycle_http_ctx* http, int fd, const char* method,
     send_json(fd, 200, "OK", json);
 }
 
+/* GET /api/v1/power -- wanted level, chip dBm target and this role's
+ * levels (cheap, no linkctl fork). POST /api/v1/power?level=<mW|auto> --
+ * persisted and applied on the lifecycle thread's next tick, like
+ * /api/v1/bandwidth. */
+static void handle_power(lifecycle_http_ctx* http, int fd, const char* method, const char* query)
+{
+    if (strcmp(method, "POST") == 0) {
+        char arg[16];
+        int  level;
+        if (query_param(query, "level", arg, sizeof(arg)) != 0 || lc_power_parse(arg, &level) != 0 ||
+            lifecycle_request_power(http->lc, level) != 0) {
+            char levels[96], json[200];
+            lc_power_levels_json(lifecycle_get_config(http->lc)->role == LC_ROLE_AP, levels, sizeof(levels));
+            snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"'level' must be one of\",\"power_levels\":[%s]}",
+                     levels);
+            send_json(fd, 400, "Bad Request", json);
+            return;
+        }
+        char json[64];
+        if (level == LC_POWER_AUTO) {
+            snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":\"auto\"}");
+        } else {
+            snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":%d}", level);
+        }
+        send_json(fd, 202, "Accepted", json);
+        return;
+    }
+
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    char fields[192], json[220];
+    format_power_fields(http, &st, fields, sizeof(fields));
+    snprintf(json, sizeof(json), "{\"ok\":true,%s}", fields);
+    send_json(fd, 200, "OK", json);
+}
+
 /* POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle= --
  * same mailbox pattern as handle_bandwidth() above, for the windowed
  * retransmission controller's own tuning parameters (see
@@ -558,6 +618,13 @@ static const char INDEX_HTML[] =
     "<input id='chan' class='n' value='32' title='channel-table index, or auto'>\n"
     "<button onclick='setChannel()'>Apply</button>\n"
     "<button onclick=\"document.getElementById('chan').value='auto';setChannel()\">Auto</button>\n"
+    "</div>\n"
+    "\n"
+    "<h2>Output power (persisted, survives reboots)</h2>\n"
+    "<div class='row'>\n"
+    "<select id='pwr'></select>\n"
+    "<button onclick='setPower()'>Apply</button>\n"
+    "<span id='pwr_cur'></span>\n"
     "</div>\n"
     "\n"
     "<h2>Advanced (ar8030-linkctl, one-shot -- not persisted)</h2>\n"
@@ -670,6 +737,23 @@ static const char INDEX_HTML[] =
     "    msg(d.ok ? 'bandwidth queued: '+d.queued_mhz+' MHz' : 'failed: '+d.error, d.ok);\n"
     "  }).catch(e=>msg('error: '+e, false));\n"
     "}\n"
+    "function loadPower(){\n"
+    "  fetch('/api/v1/power').then(r=>r.json()).then(d=>{\n"
+    "    var s = document.getElementById('pwr'); s.innerHTML = '';\n"
+    "    d.power_levels.forEach(function(l){\n"
+    "      var o = document.createElement('option'); o.value = l;\n"
+    "      o.textContent = l === 'auto' ? 'Auto' : l+' mW'; if (l === d.power) o.selected = true;\n"
+    "      s.appendChild(o);\n"
+    "    });\n"
+    "    document.getElementById('pwr_cur').textContent = d.power_dbm === null ? '' : 'chip target '+d.power_dbm+' dBm';\n"
+    "  });\n"
+    "}\n"
+    "function setPower(){\n"
+    "  fetch('/api/v1/power?level='+encodeURIComponent(v('pwr')), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
+    "    msg(d.ok ? 'power queued: '+d.queued : 'failed: '+d.error, d.ok);\n"
+    "    setTimeout(loadPower, 1500);\n"
+    "  }).catch(e=>msg('error: '+e, false));\n"
+    "}\n"
     "function setChannel(){\n"
     "  var ch = v('chan');\n"
     "  fetch('/api/v1/channel?chan='+encodeURIComponent(ch), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
@@ -713,6 +797,7 @@ static const char INDEX_HTML[] =
     "  runLinkctl('bandwidth', v('bwo_mhz')+' -d '+v('bwo_dir')+' -s '+v('bwo_slot')+' -w '+v('bwo_wait'));\n"
     "}\n"
     "refresh();\n"
+    "loadPower();\n"
     "setInterval(refresh, 2000);\n"
     "</script>\n"
     "</body></html>\n";
@@ -793,6 +878,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_bandwidth(http, fd, query);
     } else if (strcmp(path, "/api/v1/retx-tuning") == 0 && strcmp(method, "POST") == 0) {
         handle_retx_tuning(http, fd, query);
+    } else if (strcmp(path, "/api/v1/power") == 0) {
+        handle_power(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/channel") == 0) {
         handle_channel(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/rf-temp") == 0) {

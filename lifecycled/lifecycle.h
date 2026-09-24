@@ -61,6 +61,11 @@ typedef struct {
      * lifecycle_tuning.h. Ignored on the DEV, which finds the AP's channel
      * with its own idle search. */
     int default_channel;
+    /* Output power while none is persisted yet (no ar8030.power sidecar):
+     * a level in mW, LC_POWER_AUTO (ground only), LC_POWER_NONE (leave the
+     * chip's config-file power alone) or LC_POWER_ROLE_DEFAULT -- see
+     * lifecycle_tuning.h. */
+    int default_power;
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */
 
@@ -111,6 +116,8 @@ typedef struct {
     int        channel;        /* wanted (AP): index, LC_CHANNEL_AUTO; LC_CHANNEL_NONE on the DEV */
     int        chan_auto;      /* chip-reported channel mode, -1 if not read yet */
     int        work_chan;      /* chip-reported working channel, -1 if not read yet */
+    int        power;          /* wanted: mW level, LC_POWER_AUTO or LC_POWER_NONE */
+    int        power_dbm;      /* chip-reported dBm target, -1 if not read yet */
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */
@@ -206,6 +213,12 @@ int lifecycle_request_retx(lifecycle_ctx* ctx, int win, int busy, int idle, int 
  * AP's own lc_channel_track(). Returns 0 if queued, -1 for an invalid
  * value, -2 on the DEV side while no link is up (nothing to push to). */
 int lifecycle_request_channel(lifecycle_ctx* ctx, int chan);
+
+/* Same mailbox pattern, for the output power level (mW or LC_POWER_AUTO,
+ * see lifecycle_tuning.h). Persisted and applied right away -- power is
+ * chip-wide and needs no link. Returns 0 if queued, -1 if level is not
+ * one of this role's levels. */
+int lifecycle_request_power(lifecycle_ctx* ctx, int level);
 
 #ifdef __cplusplus
 }
