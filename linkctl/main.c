@@ -27,6 +27,7 @@
 #include "ar8030.h"
 #include "bb_api.h"
 #include "bb_dev.h"
+#include "../common/ar8030_batt.h"
 #include "../common/ar8030_rftemp.h"
 
 #include <math.h>
@@ -131,6 +132,14 @@ static void usage(const char *argv0)
             "      (0x8a, as stock's init does) first if it isn't yet, or always\n"
             "      with -a. Unsmoothed -- ar8030-lifecycled --rf-temp-adc keeps a\n"
             "      smoothed value (HTTP /api/v1/rf-temp).\n"
+            "\n"
+            "  batt [-c channel] [-k scale] [-o offset_mv] [-n count] [-a]\n"
+            "      Supply voltage from the AR8030's own ADC (default channel 0,\n"
+            "      scale 16, offset 1200 mV -- measured on the Ascent Lite, see\n"
+            "      common/ar8030_batt.h): supply = adc * scale + offset. Averages\n"
+            "      count reads (default 10, 250 ms apart) and prints the raw ADC\n"
+            "      value too, for recalibrating. Arms the ADC first if it reads\n"
+            "      0 mV, or always with -a. 0 mV = nothing on the power input.\n"
             "\n"
             "  prj-cmd <cmd> [byte ...]\n"
             "      Raw BB_SET_PRJ_DISPATCH: cmd id (dec/0x hex) + up to 252\n"
@@ -1546,6 +1555,68 @@ static int cmd_rf_temp(int argc, char **argv)
     return 0;
 }
 
+static int cmd_batt(int argc, char **argv)
+{
+    int channel = AR8030_BATT_DEFAULT_ADC, scale = AR8030_BATT_DEFAULT_SCALE;
+    int offset = AR8030_BATT_DEFAULT_OFFSET_MV, count = 10, force_arm = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "c:k:o:n:a");
+    while ((opt = getopt(argc, argv, "c:k:o:n:a")) != -1) {
+        if (opt == 'c') {
+            channel = atoi(optarg);
+        } else if (opt == 'k') {
+            scale = atoi(optarg);
+        } else if (opt == 'o') {
+            offset = atoi(optarg);
+        } else if (opt == 'n') {
+            count = atoi(optarg);
+        } else if (opt == 'a') {
+            force_arm = 1;
+        } else {
+            return 1;
+        }
+    }
+    if (count < 1)
+        count = 1;
+
+    int mv = 0, ret = force_arm ? -1 : ar8030_rftemp_read_mv(g_hbb, channel, &mv);
+    if (ret != 0 || mv <= 0) {
+        /* Not armed yet (fresh chip) -- or really 0 V, which re-arming
+         * can't tell apart; the read below settles it either way. */
+        ret = ar8030_rftemp_arm(g_hbb, channel);
+        if (ret != 0) {
+            fprintf(stderr, "linkctl: arming ADC channel %d failed (ret=%d)\n", channel, ret);
+            return 1;
+        }
+        usleep((AR8030_RFTEMP_ARM_PERIOD + 200) * 1000);
+    }
+
+    int sum = 0, n = 0, lo = 0, hi = 0;
+    for (int i = 0; i < count; i++) {
+        if (i)
+            usleep(250 * 1000);
+        ret = ar8030_rftemp_read_mv(g_hbb, channel, &mv);
+        if (ret != 0) {
+            fprintf(stderr, "linkctl: BB_GET_PRJ_DISPATCH(0x89) failed (ret=%d)\n", ret);
+            return 1;
+        }
+        if (!n || mv < lo)
+            lo = mv;
+        if (!n || mv > hi)
+            hi = mv;
+        sum += mv;
+        n++;
+    }
+    int avg = sum / n, batt = ar8030_batt_mv(avg, scale, offset);
+    if (batt < 0) {
+        printf("batt: channel=%d adc=%d mV supply=n/a (nothing on the power input?)\n", channel, avg);
+        return 1;
+    }
+    printf("batt: channel=%d adc=%d mV (%d..%d, n=%d) supply=%d.%02d V (x%d %+d mV)\n", channel, avg, lo, hi, n,
+           batt / 1000, (batt % 1000) / 10, scale, offset);
+    return 0;
+}
+
 static int cmd_power_mode(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1719,6 +1790,8 @@ int main(int argc, char **argv)
         rc = cmd_distance(argc - 1, argv + 1);
     else if (!strcmp(cmd, "rf-temp"))
         rc = cmd_rf_temp(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "batt"))
+        rc = cmd_batt(argc - 1, argv + 1);
     else if (!strcmp(cmd, "prj-cmd"))
         rc = cmd_prj_cmd(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))

@@ -30,8 +30,9 @@
  * (482 -> 4, 4861 -> 5, 492 -> 6, 472 -> 7, 4862 -> 8), which stock's
  * fpv_run_by_type.sh picks from the SoC's own LSADC channel 1. So only
  * the CX4861/CX4862 boards (separate RF board, --rf_board) have it; the
- * Ascent Lite is CX482/CX472 (type 4/7), where channel 3 is battery
- * voltage and channel 4 floats at a few hundred mV.
+ * Ascent Lite is CX472 (type 7), where channel 0 is the supply voltage
+ * (see ar8030_batt.h), channel 3 a ~860 mV reference and channel 4 floats
+ * at a few hundred mV.
  *
  * The table is the Ascent's own thermistor curve. Another AR8030 board
  * may use a different channel (hence lifecycled's --rf-temp-adc) and

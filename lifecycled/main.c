@@ -34,6 +34,7 @@
 #include "lifecycle_client.h"
 #include "lifecycle_http.h"
 #include "lifecycle_tuning.h"
+#include "../common/ar8030_batt.h"
 #include <getopt.h>
 #include <pthread.h>
 #include <signal.h>
@@ -76,6 +77,12 @@ static void print_help(const char* argv0)
     printf("                            (default: none -- board-specific; Caddx Ascent: 4)\n");
     printf("  --rf-temp-file <path>     also write it there in whole degC, \"\" = don't\n");
     printf("                            (default /tmp/rf_temperature.msg)\n");
+    printf("  --batt-adc <ch>           poll the supply voltage on this AR8030 ADC channel\n");
+    printf("                            (default: none -- board-specific; Ascent Lite: 0)\n");
+    printf("  --batt-scale <n>          supply mV = ADC mV * n + offset (default 16)\n");
+    printf("  --batt-offset-mv <mv>     ... + this (default 1200; both measured on the Lite)\n");
+    printf("  --batt-file <path>        also write it there as volts (\"11.98\"), \"\" = don't\n");
+    printf("                            (default: \"\")\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -109,6 +116,10 @@ enum {
     OPT_FRAME_CHANGE,
     OPT_RF_TEMP_ADC,
     OPT_RF_TEMP_FILE,
+    OPT_BATT_ADC,
+    OPT_BATT_SCALE,
+    OPT_BATT_OFFSET_MV,
+    OPT_BATT_FILE,
 };
 
 static void handle_sigterm(int sig)
@@ -137,6 +148,10 @@ int main(int argc, char** argv)
         .http_port         = 0,
         .rf_temp_adc       = -1,
         .rf_temp_file      = "/tmp/rf_temperature.msg",
+        .batt_adc          = -1,
+        .batt_scale        = AR8030_BATT_DEFAULT_SCALE,
+        .batt_offset_mv    = AR8030_BATT_DEFAULT_OFFSET_MV,
+        .batt_file         = "",
     };
 
     static struct option long_options[] = {
@@ -156,6 +171,10 @@ int main(int argc, char** argv)
         {"frame-change",      required_argument, 0, OPT_FRAME_CHANGE     },
         {"rf-temp-adc",       required_argument, 0, OPT_RF_TEMP_ADC      },
         {"rf-temp-file",      required_argument, 0, OPT_RF_TEMP_FILE     },
+        {"batt-adc",          required_argument, 0, OPT_BATT_ADC         },
+        {"batt-scale",        required_argument, 0, OPT_BATT_SCALE       },
+        {"batt-offset-mv",    required_argument, 0, OPT_BATT_OFFSET_MV   },
+        {"batt-file",         required_argument, 0, OPT_BATT_FILE        },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -222,6 +241,18 @@ int main(int argc, char** argv)
             break;
         case OPT_RF_TEMP_FILE:
             snprintf(cfg.rf_temp_file, sizeof(cfg.rf_temp_file), "%s", optarg);
+            break;
+        case OPT_BATT_ADC:
+            cfg.batt_adc = (int)strtol(optarg, NULL, 10);
+            break;
+        case OPT_BATT_SCALE:
+            cfg.batt_scale = (int)strtol(optarg, NULL, 10);
+            break;
+        case OPT_BATT_OFFSET_MV:
+            cfg.batt_offset_mv = (int)strtol(optarg, NULL, 10);
+            break;
+        case OPT_BATT_FILE:
+            snprintf(cfg.batt_file, sizeof(cfg.batt_file), "%s", optarg);
             break;
         case 'h':
             print_help(argv[0]);

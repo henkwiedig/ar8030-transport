@@ -1870,8 +1870,15 @@ design rationale):
   curl http://<host>:8899/api/v1/status
   {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"channel":32,"chan_mode":"manual","work_chan":32,"paired":true}
   ```
-  `rf_temp_c` (one decimal, `null` without a reading) is included too,
-  see `/api/v1/rf-temp` below.
+  `rf_temp_c` (one decimal, `null` without a reading) and `batt_v`
+  (supply voltage, two decimals, `null` without a reading) are included
+  too, see `/api/v1/rf-temp` and `/api/v1/batt` below. `distance_m` is the link distance in
+  metres (`BB_GET_DISTC_RESULT`, refreshed every second while connected,
+  `null` without a link or ranging result): the chip already subtracts
+  `dist_calc.offset` from the chip config (the vendor's calibration, 20)
+  and clamps at 0, and stock shows the value unconverted (`ar_ldy_gnd`
+  forwards it to `GlassesUI`, which renders `"%1m"`) -- so a bench link
+  reads 0. `ar8030-linkctl distance` samples it repeatedly.
 - **`GET /api/v1/rf-temp`** -- RF-board temperature, polled once a second
   by the lifecycle thread when started with `--rf-temp-adc <ch>`
   (disabled by default; Caddx Ascent: channel 4). Cheap, unlike
@@ -1893,9 +1900,32 @@ design rationale):
   mean no thermistor on that channel: `rf_temp_c` is `null` and the file
   is removed. Stock only has one on its CX4861/CX4862 boards (project
   type 5/8, separate RF board); the Ascent Lite (CX482/CX472, type 4/7)
-  has none -- channel 4 floats at ~230 mV there. The web panel shows it at
-  the top. One-shot, unsmoothed CLI equivalent:
+  (CX472, type 7) has none -- channel 4 floats at ~230 mV there. The web
+  panel shows it at the top. One-shot, unsmoothed CLI equivalent:
   `ar8030-linkctl rf-temp [-c ch] [-a]`.
+- **`GET /api/v1/batt`** -- supply (battery) voltage at the board's power
+  input, polled once a second when started with `--batt-adc <ch>`
+  (disabled by default; Ascent Lite: channel 0, enabled in its overlay).
+  Cheap like `/api/v1/rf-temp`:
+  ```
+  curl http://<host>:8899/api/v1/batt
+  {"ok":true,"enabled":true,"adc_channel":0,"scale":16,"offset_mv":1200,"batt_v":8.98,"batt_mv":8976,"adc_mv":486}
+  ```
+  Same AR8030 ADC access as rf-temp (arming any channel starts the whole
+  ADC, so both can run at once), smoothed 0.75/0.25 like stock's
+  `fpv_sys_update_batt_volt()`, then `supply_mv = adc_mv * scale +
+  offset_mv` (`--batt-scale`, default 16; `--batt-offset-mv`, default
+  1200). Those defaults are a least-squares fit measured with a lab PSU on
+  the Lite at 6/9/12 V (within +/-25 mV) -- not stock's formula: stock
+  (`fpv_sys_get_batt_volt_mv()`, type 7: `(ch0 * (1800 - ch3) / 900 + 25)
+  * 16`) scales by a channel-3 "reference" that reads ~860 mV instead of
+  900 and reads 0.4-0.6 V low; see `common/ar8030_batt.h`. `batt_v` is
+  `null` (and `batt_mv` -1) when the ADC reads 0 mV -- nothing on the
+  power input, e.g. powered over USB alone. `adc_mv` is the smoothed raw
+  reading, for recalibrating another board. `--batt-file <path>` also
+  writes it as volts (`11.98`) for consumers without HTTP (default off).
+  One-shot CLI equivalent, averaging 10 reads:
+  `ar8030-linkctl batt [-c ch] [-k scale] [-o offset_mv] [-n count] [-a]`.
 - **`POST /api/v1/pair`** -- runs the exact same fork+exec
   `ar8030-pair`+hook-dispatch sequence the physical bind button already
   runs (`lifecycle_pair.c`'s `lc_pair_run()`), for boards with no
@@ -2001,7 +2031,7 @@ design rationale):
   `ar8030-linkctl` binary, covering every one of its own subcommands
   (`status`, `channel-mode`, `channel`, `mcs-mode`, `mcs`, `mcs-range`,
   `mcs-table`, `power-mode`, `power`, `freq`, `force-close-socket`,
-  `force-close-all`, `rf-temp`, and `bandwidth` for one-shot use) -- effectively
+  `force-close-all`, `rf-temp`, `batt`, and `bandwidth` for one-shot use) -- effectively
   `linkctl -h`'s whole command surface, reachable over HTTP the same way
   `curl` would invoke the CLI directly:
   ```

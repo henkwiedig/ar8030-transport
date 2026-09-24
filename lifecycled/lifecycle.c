@@ -7,6 +7,7 @@
 #include "lifecycle_hooks.h"
 #include "lifecycle_pair.h"
 #include "lifecycle_tuning.h"
+#include "../common/ar8030_batt.h"
 #include "../common/ar8030_rftemp.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -197,6 +198,12 @@ struct lifecycle_ctx {
     int rf_temp_valid;
     int rf_temp_c10;
     int rf_temp_mv;
+
+    /* Supply voltage (lc_poll_batt()), same locking as rf-temp. */
+    int batt_armed;
+    int batt_rearm_wait;
+    int batt_arm_ret; /* last arm result, to log only changes */
+    int batt_adc_mv;  /* smoothed ADC reading, 0 = none */
 };
 
 static void lc_apply_power(lifecycle_ctx* ctx);
@@ -276,6 +283,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
     ctx->distance_m           = -1;
+    ctx->batt_arm_ret         = 1; /* not an ioctl result: logs the first arm */
     if (cfg->role != LC_ROLE_AP) {
         ctx->channel = LC_CHANNEL_NONE;
     } else if (!cfg->cfg_path[0] || lc_channel_load(cfg->cfg_path, &ctx->channel) != 0) {
@@ -717,6 +725,73 @@ static void lc_poll_rf_temp(lifecycle_ctx* ctx)
     }
 }
 
+/* Writes the supply voltage to cfg.batt_file as volts with two decimals
+ * ("11.98"), via rename() like the rf-temp file. */
+static void lc_write_batt_file(const lifecycle_ctx* ctx, int mv)
+{
+    char tmp[272];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", ctx->cfg.batt_file);
+    FILE* f = fopen(tmp, "w");
+    if (!f) {
+        return;
+    }
+    int cv = (mv + 5) / 10; /* centivolts, rounded */
+    fprintf(f, "%d.%02d\n", cv / 100, cv % 100);
+    fclose(f);
+    rename(tmp, ctx->cfg.batt_file);
+}
+
+/* One supply-voltage sample per main-loop tick (stock: every 500 ms from
+ * its temperature thread), mapped by ar8030_batt_mv(). Arming and re-arming
+ * work like lc_poll_rf_temp(), except that 0 mV is also a real reading
+ * here -- nothing on the power input, e.g. on USB power -- so a re-arm
+ * that doesn't help just keeps reporting "no reading", logging only when
+ * the arm result changes. Smoothing matches stock's
+ * fpv_sys_update_batt_volt(): new = 0.75*old + 0.25*sample. */
+static void lc_poll_batt(lifecycle_ctx* ctx)
+{
+    int ch = ctx->cfg.batt_adc;
+    if (ch < 0) {
+        return;
+    }
+
+    if (!ctx->batt_armed) {
+        if (ctx->batt_rearm_wait > 0) {
+            ctx->batt_rearm_wait--;
+            return;
+        }
+        int ret = ar8030_rftemp_arm(ctx->client.handle, ch);
+        if (ret != ctx->batt_arm_ret) {
+            lc_log("lifecycle: batt: armed ADC channel %d (ret=%d)", ch, ret);
+            ctx->batt_arm_ret = ret;
+        }
+        ctx->batt_armed      = ret == 0;
+        ctx->batt_rearm_wait = LC_RFTEMP_REARM_TICKS;
+        return;
+    }
+
+    int mv = 0;
+    if (ar8030_rftemp_read_mv(ctx->client.handle, ch, &mv) != 0 || mv <= 0) {
+        ctx->batt_armed = 0;
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->batt_adc_mv = 0;
+        pthread_mutex_unlock(&ctx->status_lock);
+        if (ctx->cfg.batt_file[0]) {
+            unlink(ctx->cfg.batt_file);
+        }
+        return;
+    }
+
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->batt_adc_mv = ctx->batt_adc_mv > 0 ? (ctx->batt_adc_mv * 3 + mv) / 4 : mv;
+    int batt_mv      = ar8030_batt_mv(ctx->batt_adc_mv, ctx->cfg.batt_scale, ctx->cfg.batt_offset_mv);
+    pthread_mutex_unlock(&ctx->status_lock);
+
+    if (ctx->cfg.batt_file[0]) {
+        lc_write_batt_file(ctx, batt_mv);
+    }
+}
+
 void* lifecycle_thread_main(void* arg)
 {
     lifecycle_ctx* ctx = (lifecycle_ctx*)arg;
@@ -820,6 +895,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_power_request(ctx);
         lc_poll_distance(ctx);
         lc_poll_rf_temp(ctx);
+        lc_poll_batt(ctx);
 
         bb_link_state_e state;
         int              have_state = lc_get_link_state(&state);
@@ -972,6 +1048,8 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
     out->rf_temp_c10    = ctx->rf_temp_c10;
     out->rf_temp_mv     = ctx->rf_temp_mv;
+    out->batt_adc_mv    = ctx->batt_adc_mv;
+    out->batt_mv        = ar8030_batt_mv(ctx->batt_adc_mv, ctx->cfg.batt_scale, ctx->cfg.batt_offset_mv);
     pthread_mutex_unlock(&ctx->status_lock);
 
     out->paired = ctx->cfg.cfg_path[0] ? lc_pair_has_been_paired(ctx->cfg.cfg_path) : 0;

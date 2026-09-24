@@ -199,7 +199,7 @@ static void send_html(int fd, const char* html)
  * command" buried in linkctl's own captured stderr. */
 static const char* const LINKCTL_COMMANDS[] = {
     "status", "bandwidth", "channel-mode", "channel", "mcs-mode", "mcs", "mcs-range", "mcs-table",
-    "power-mode", "power", "freq", "force-close-socket", "force-close-all", "rf-temp", NULL,
+    "power-mode", "power", "freq", "force-close-socket", "force-close-all", "rf-temp", "batt", NULL,
 };
 
 static int linkctl_command_valid(const char* cmd)
@@ -327,6 +327,17 @@ static void format_rf_temp(const lc_status_t* st, char* out, size_t out_sz)
     snprintf(out, out_sz, "%d.%d", st->rf_temp_c10 / 10, st->rf_temp_c10 % 10);
 }
 
+/* JSON number with two decimals ("11.98"), or "null" without a reading. */
+static void format_batt_v(const lc_status_t* st, char* out, size_t out_sz)
+{
+    if (st->batt_mv < 0) {
+        snprintf(out, out_sz, "null");
+        return;
+    }
+    int cv = (st->batt_mv + 5) / 10;
+    snprintf(out, out_sz, "%d.%02d", cv / 100, cv % 100);
+}
+
 /* JSON value for a wanted channel: "auto", null (LC_CHANNEL_NONE) or the
  * index. */
 static void format_channel(int chan, char* out, size_t out_sz)
@@ -394,6 +405,8 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
 
     char rf_temp[48];
     format_rf_temp(&st, rf_temp, sizeof(rf_temp));
+    char batt_v[24];
+    format_batt_v(&st, batt_v, sizeof(batt_v));
 
     char chan[96];
     format_channel_fields(&st, chan, sizeof(chan));
@@ -409,9 +422,10 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     char json[8950];
     snprintf(json, sizeof(json),
              "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,"
-              "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
+              "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"batt_v\":%s,\"linkctl_exit_code\":%d,"
+              "\"linkctl_status\":\"%s\"}",
              role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, dist,
-             st.paired ? "true" : "false", rf_temp, rc, escaped);
+             st.paired ? "true" : "false", rf_temp, batt_v, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
 
@@ -432,6 +446,29 @@ static void handle_rf_temp(lifecycle_http_ctx* http, int fd)
     char json[160];
     snprintf(json, sizeof(json), "{\"ok\":true,\"enabled\":%s,\"adc_channel\":%d,\"rf_temp_c\":%s,\"adc_mv\":%d}",
              cfg->rf_temp_adc >= 0 ? "true" : "false", cfg->rf_temp_adc, rf_temp, st.rf_temp_mv);
+    send_json(fd, 200, "OK", json);
+}
+
+/* GET /api/v1/batt -- just the supply voltage (lifecycle.c's
+ * lc_poll_batt(), enabled via --batt-adc), cheap like /api/v1/rf-temp.
+ * batt_v is null until a reading arrives, when nothing is on the power
+ * input (USB power alone reads 0 mV), or always when polling is disabled.
+ * adc_mv is the smoothed raw reading, for recalibrating scale/offset. */
+static void handle_batt(lifecycle_http_ctx* http, int fd)
+{
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+
+    char batt_v[24];
+    format_batt_v(&st, batt_v, sizeof(batt_v));
+
+    char json[224];
+    snprintf(json, sizeof(json),
+             "{\"ok\":true,\"enabled\":%s,\"adc_channel\":%d,\"scale\":%d,\"offset_mv\":%d,\"batt_v\":%s,"
+             "\"batt_mv\":%d,\"adc_mv\":%d}",
+             cfg->batt_adc >= 0 ? "true" : "false", cfg->batt_adc, cfg->batt_scale, cfg->batt_offset_mv, batt_v,
+             st.batt_mv, st.batt_adc_mv);
     send_json(fd, 200, "OK", json);
 }
 
@@ -613,7 +650,8 @@ static const char INDEX_HTML[] =
     "</style></head>\n"
     "<body>\n"
     "<h1>ar8030-lifecycled</h1>\n"
-    "<div class='row'>RF board: <span id='rftemp' class='temp'>--</span></div>\n"
+    "<div class='row'>RF board: <span id='rftemp' class='temp'>--</span>"
+    " &nbsp; Supply: <span id='batt' class='temp'>--</span></div>\n"
     "<div class='row' id='status'>loading...</div>\n"
     "\n"
     "<h2>Pairing</h2>\n"
@@ -733,6 +771,8 @@ static const char INDEX_HTML[] =
     "    if (d.rf_temp_c === null || d.rf_temp_c === undefined) { t.textContent = 'n/a'; t.className = 'temp'; }\n"
     "    else { t.textContent = d.rf_temp_c.toFixed(1)+' \\u00b0C';\n"
     "      t.className = 'temp'+(d.rf_temp_c >= 90 ? ' hot' : d.rf_temp_c >= 70 ? ' warm' : ''); }\n"
+    "    document.getElementById('batt').textContent =\n"
+    "      (d.batt_v === null || d.batt_v === undefined) ? 'n/a' : d.batt_v.toFixed(2)+' V';\n"
     "  }).catch(e=>{ document.getElementById('status').textContent = 'unreachable: '+e; });\n"
     "}\n"
     "function msg(text, ok){\n"
@@ -900,6 +940,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_channel(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/rf-temp") == 0) {
         handle_rf_temp(http, fd);
+    } else if (strcmp(path, "/api/v1/batt") == 0) {
+        handle_batt(http, fd);
     } else if (strcmp(path, "/api/v1/linkctl") == 0) {
         handle_linkctl(fd, query);
     } else {

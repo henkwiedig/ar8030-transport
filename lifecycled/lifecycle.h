@@ -93,6 +93,17 @@ typedef struct {
      * line) for consumers without an HTTP client, e.g. msposd. */
     int  rf_temp_adc;
     char rf_temp_file[256];
+
+    /* Supply voltage via the AR8030's own ADC (see
+     * ../common/ar8030_batt.h), opt-in like rf-temp: batt_adc < 0 (the
+     * default) means disabled. supply_mv = adc_mv * batt_scale +
+     * batt_offset_mv, both board-specific (Caddx Ascent Lite: channel 0,
+     * 16, 1200 -- measured). batt_file, if set, gets the smoothed value
+     * as volts ("11.98"), for consumers without an HTTP client. */
+    int  batt_adc;
+    int  batt_scale;
+    int  batt_offset_mv;
+    char batt_file[256];
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;
@@ -125,6 +136,8 @@ typedef struct {
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */
+    int        batt_adc_mv;    /* smoothed supply ADC reading, mV; 0 = none */
+    int        batt_mv;        /* supply voltage, mV; -1 = none */
 } lc_status_t;
 
 /*
