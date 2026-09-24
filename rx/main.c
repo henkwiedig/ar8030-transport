@@ -276,9 +276,18 @@ int main(int argc, char **argv)
     if (ar8030_link_connect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS, &g_stop) != 0)
         return 0;
 
+    /* TX|RX like stock ar_ldy_gnd's fpv_bb_init() opens its video port --
+     * the chip's per-port byte counters (BB_GET_SOCK_INFO total_size, what
+     * `ar8030-linkctl status`/`rate` show) stay at 0 for an RX-only socket
+     * on the ground: confirmed live, 8.6 MB read on a BB_SOCK_FLAG_RX
+     * socket left rx total_size at 0. Nothing is ever written on the TX
+     * half. Buffer sizes are NOT stock's (2 KiB tx / 512 KiB rx):
+     * a 512 KiB rx buffer wedged this project's ar8030d on the ground
+     * (every client RPC blocked, even from a fresh boot). */
     bb_sock_opt_t sock_opt;
     sock_opt.tx_buf_size = 1024;
     sock_opt.rx_buf_size = 64 * 1024;
+    const uint32_t sock_flags = BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX;
     /* Ground is DEV role: bb_socket_open()'s slot parameter is ignored by
      * the SDK for a DEV and always addresses its one AP peer -- see
      * bb_api.h's bb_socket_open doc comment ("If DEV, target SLOT is
@@ -303,7 +312,7 @@ int main(int argc, char **argv)
     for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
          startup_open_attempt++) {
         startup_open_ret =
-            ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port, BB_SOCK_FLAG_RX, &sock_opt);
+            ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port, sock_flags, &sock_opt);
         if (startup_open_ret == 0)
             break;
         usleep(SOCKET_REOPEN_RETRY_MS * 1000);
@@ -412,7 +421,7 @@ int main(int argc, char **argv)
                 int attempt;
                 for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
                     open_ret = ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.port,
-                                                        BB_SOCK_FLAG_RX, &sock_opt);
+                                                        sock_flags, &sock_opt);
                     if (open_ret == 0)
                         break;
                     usleep(SOCKET_REOPEN_RETRY_MS * 1000);

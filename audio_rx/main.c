@@ -242,9 +242,14 @@ int main(int argc, char **argv)
     if (ar8030_link_connect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS, &g_stop) != 0)
         return 0;
 
+    /* TX|RX, not RX-only, for the same reason as rx/main.c's video socket:
+     * the chip doesn't count an RX-only socket's bytes on the ground
+     * (BB_GET_SOCK_INFO total_size stays 0). Nothing is ever written on
+     * the TX half. */
     bb_sock_opt_t sock_opt;
     sock_opt.tx_buf_size = 1024;
     sock_opt.rx_buf_size = 8 * 1024;
+    const uint32_t sock_flags = BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX;
     /* Ground is DEV role: same BB_SLOT_AP fixed target as rx/main.c -- see
      * that file's own comment on why the slot parameter is ignored by the
      * SDK on this side.
@@ -259,7 +264,7 @@ int main(int argc, char **argv)
     int open_ret = -1;
     for (int attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
         open_ret = ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.bb_port,
-                                            BB_SOCK_FLAG_RX, &sock_opt);
+                                            sock_flags, &sock_opt);
         if (open_ret == 0)
             break;
         usleep(SOCKET_REOPEN_RETRY_MS * 1000);
@@ -336,7 +341,7 @@ int main(int argc, char **argv)
                 int attempt, ret2 = -1;
                 for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
                     ret2 = ar8030_link_open_socket(&link, BB_SLOT_AP, (uint32_t)args.bb_port,
-                                                    BB_SOCK_FLAG_RX, &sock_opt);
+                                                    sock_flags, &sock_opt);
                     if (ret2 == 0)
                         break;
                     usleep(SOCKET_REOPEN_RETRY_MS * 1000);
