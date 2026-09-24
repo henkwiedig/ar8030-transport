@@ -1,6 +1,7 @@
 #include "lifecycle_http.h"
 #include "lc_log.h"
 #include "lifecycle_pair.h"
+#include "lifecycle_tuning.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
@@ -326,6 +327,34 @@ static void format_rf_temp(const lc_status_t* st, char* out, size_t out_sz)
     snprintf(out, out_sz, "%d.%d", st->rf_temp_c10 / 10, st->rf_temp_c10 % 10);
 }
 
+/* JSON value for a wanted channel: "auto", null (LC_CHANNEL_NONE) or the
+ * index. */
+static void format_channel(int chan, char* out, size_t out_sz)
+{
+    if (chan == LC_CHANNEL_AUTO) {
+        snprintf(out, out_sz, "\"auto\"");
+    } else if (chan == LC_CHANNEL_NONE) {
+        snprintf(out, out_sz, "null");
+    } else {
+        snprintf(out, out_sz, "%d", chan);
+    }
+}
+
+/* "channel" (wanted/persisted), "chan_mode"/"work_chan" (what the chip
+ * last reported on a live link, null otherwise). */
+static void format_channel_fields(const lc_status_t* st, char* out, size_t out_sz)
+{
+    char chan[16], work[16];
+    format_channel(st->channel, chan, sizeof(chan));
+    if (st->work_chan >= 0) {
+        snprintf(work, sizeof(work), "%d", st->work_chan);
+    } else {
+        snprintf(work, sizeof(work), "null");
+    }
+    snprintf(out, out_sz, "\"channel\":%s,\"chan_mode\":%s,\"work_chan\":%s", chan,
+             st->chan_auto < 0 ? "null" : st->chan_auto ? "\"auto\"" : "\"manual\"", work);
+}
+
 static void handle_status(lifecycle_http_ctx* http, int fd)
 {
     lc_status_t st;
@@ -344,12 +373,15 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     char rf_temp[48];
     format_rf_temp(&st, rf_temp, sizeof(rf_temp));
 
-    char json[8600];
+    char chan[96];
+    format_channel_fields(&st, chan, sizeof(chan));
+
+    char json[8700];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,"
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,"
               "\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, st.paired ? "true" : "false", rf_temp, rc,
-             escaped);
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, st.paired ? "true" : "false", rf_temp,
+             rc, escaped);
     send_json(fd, 200, "OK", json);
 }
 
@@ -403,6 +435,47 @@ static void handle_bandwidth(lifecycle_http_ctx* http, int fd, const char* query
     char json[96];
     snprintf(json, sizeof(json), "{\"ok\":true,\"queued_mhz\":%d}", mhz);
     send_json(fd, 202, "Accepted", json);
+}
+
+/* GET /api/v1/channel -- wanted vs. chip-reported channel, cheap (no
+ * linkctl fork). POST /api/v1/channel?chan=<index|auto> -- the persisted
+ * way to change it, queued like /api/v1/bandwidth (see
+ * lifecycle_request_channel() for the DEV-while-idle refusal). */
+static void handle_channel(lifecycle_http_ctx* http, int fd, const char* method, const char* query)
+{
+    if (strcmp(method, "POST") == 0) {
+        char arg[16];
+        int  chan;
+        if (query_param(query, "chan", arg, sizeof(arg)) != 0 || lc_channel_parse(arg, &chan) != 0 ||
+            chan == LC_CHANNEL_NONE) {
+            send_json(fd, 400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"'chan' must be a channel index or 'auto'\"}");
+            return;
+        }
+        int rc = lifecycle_request_channel(http->lc, chan);
+        if (rc == -2) {
+            send_json(fd, 409, "Conflict",
+                      "{\"ok\":false,\"error\":\"no link: on the dev side a channel change needs a connected "
+                      "peer to retune with (the ap owns the channel on reconnect)\"}");
+            return;
+        }
+        if (rc != 0) {
+            send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"invalid channel\"}");
+            return;
+        }
+        char queued[16], json[64];
+        format_channel(chan, queued, sizeof(queued));
+        snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":%s}", queued);
+        send_json(fd, 202, "Accepted", json);
+        return;
+    }
+
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    char fields[96], json[128];
+    format_channel_fields(&st, fields, sizeof(fields));
+    snprintf(json, sizeof(json), "{\"ok\":true,%s}", fields);
+    send_json(fd, 200, "OK", json);
 }
 
 /* POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle= --
@@ -478,6 +551,13 @@ static const char INDEX_HTML[] =
     "<option value='10'>10 MHz</option><option value='20' selected>20 MHz</option><option value='40'>40 MHz</option>\n"
     "</select>\n"
     "<button onclick='setBandwidth()'>Apply</button>\n"
+    "</div>\n"
+    "\n"
+    "<h2>Channel (persisted, survives reboots)</h2>\n"
+    "<div class='row'>\n"
+    "<input id='chan' class='n' value='32' title='channel-table index, or auto'>\n"
+    "<button onclick='setChannel()'>Apply</button>\n"
+    "<button onclick=\"document.getElementById('chan').value='auto';setChannel()\">Auto</button>\n"
     "</div>\n"
     "\n"
     "<h2>Advanced (ar8030-linkctl, one-shot -- not persisted)</h2>\n"
@@ -563,7 +643,8 @@ static const char INDEX_HTML[] =
     "function refresh(){\n"
     "  fetch('/api/v1/status').then(r=>r.json()).then(d=>{\n"
     "    var summary = 'role='+d.role+' state='+d.state+' connected_slot='+d.connected_slot+\n"
-    "      ' bandwidth_mhz='+d.bandwidth_mhz+' paired='+d.paired+' (linkctl exit '+d.linkctl_exit_code+')';\n"
+    "      ' bandwidth_mhz='+d.bandwidth_mhz+' channel='+d.channel+' (chip: '+d.chan_mode+' '+d.work_chan+')'+\n"
+    "      ' paired='+d.paired+' (linkctl exit '+d.linkctl_exit_code+')';\n"
     "    document.getElementById('status').textContent = summary+'\\n\\n'+(d.linkctl_status||'');\n"
     "    var t = document.getElementById('rftemp');\n"
     "    if (d.rf_temp_c === null || d.rf_temp_c === undefined) { t.textContent = 'n/a'; t.className = 'temp'; }\n"
@@ -587,6 +668,12 @@ static const char INDEX_HTML[] =
     "  var mhz = v('bw');\n"
     "  fetch('/api/v1/bandwidth?mhz='+encodeURIComponent(mhz), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
     "    msg(d.ok ? 'bandwidth queued: '+d.queued_mhz+' MHz' : 'failed: '+d.error, d.ok);\n"
+    "  }).catch(e=>msg('error: '+e, false));\n"
+    "}\n"
+    "function setChannel(){\n"
+    "  var ch = v('chan');\n"
+    "  fetch('/api/v1/channel?chan='+encodeURIComponent(ch), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
+    "    msg(d.ok ? 'channel queued: '+d.queued : 'failed: '+d.error, d.ok);\n"
     "  }).catch(e=>msg('error: '+e, false));\n"
     "}\n"
     "function runLinkctl(cmd, args){\n"
@@ -706,6 +793,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_bandwidth(http, fd, query);
     } else if (strcmp(path, "/api/v1/retx-tuning") == 0 && strcmp(method, "POST") == 0) {
         handle_retx_tuning(http, fd, query);
+    } else if (strcmp(path, "/api/v1/channel") == 0) {
+        handle_channel(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/rf-temp") == 0) {
         handle_rf_temp(http, fd);
     } else if (strcmp(path, "/api/v1/linkctl") == 0) {

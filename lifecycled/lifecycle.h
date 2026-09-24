@@ -55,7 +55,12 @@ typedef struct {
     /* BB_SET_FRAME_CHANGE(mode=1) on the AP after every connect, 0 = leave
      * the chip's own frame structure alone. See lc_frame_change_apply(). */
     int frame_change;
-    int default_channel; /* -1 = unset, no channel override at connect time */
+    /* AP only: channel used while nothing is persisted yet (no
+     * ar8030.channel sidecar): an index, LC_CHANNEL_AUTO or LC_CHANNEL_NONE
+     * (leave the chip's own startup channel alone) -- see
+     * lifecycle_tuning.h. Ignored on the DEV, which finds the AP's channel
+     * with its own idle search. */
+    int default_channel;
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */
 
@@ -103,6 +108,9 @@ typedef struct {
     int        connected_slot; /* -1 if not connected */
     int        bandwidth_mhz;  /* -1 if not yet known/applied */
     int        paired;         /* non-zero if lc_pair_has_been_paired() */
+    int        channel;        /* wanted (AP): index, LC_CHANNEL_AUTO; LC_CHANNEL_NONE on the DEV */
+    int        chan_auto;      /* chip-reported channel mode, -1 if not read yet */
+    int        work_chan;      /* chip-reported working channel, -1 if not read yet */
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */
@@ -189,6 +197,15 @@ int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz);
  * connected. Returns 0 if all 5 values are in range (0-255) and the
  * request was queued, -1 otherwise. */
 int lifecycle_request_retx(lifecycle_ctx* ctx, int win, int busy, int idle, int conti_busy, int conti_idle);
+
+/* Same mailbox pattern again, for the channel (an index or
+ * LC_CHANNEL_AUTO -- see lifecycle_tuning.h). While connected, applied
+ * to both ends at once via lc_channel_apply_linked(), otherwise (AP
+ * only) to this radio. The AP owns the channel and is the only side that
+ * persists it; a DEV-side change reaches the AP's sidecar through the
+ * AP's own lc_channel_track(). Returns 0 if queued, -1 for an invalid
+ * value, -2 on the DEV side while no link is up (nothing to push to). */
+int lifecycle_request_channel(lifecycle_ctx* ctx, int chan);
 
 #ifdef __cplusplus
 }

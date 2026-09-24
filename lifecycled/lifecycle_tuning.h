@@ -8,19 +8,13 @@ extern "C" {
 #include "bb_api.h"
 
 /*
- * Bandwidth-only, deliberately: the shell logic this replaces
- * (S65ar8030-transport-tx's own apply_link_tuning()) only ever managed
- * bandwidth, never channel -- this matches that scope rather than
- * growing it. Channel is additionally a harder no for now: this
- * project's own ar8030-linkctl found BB_GET_CHAN_INFO segfaults
- * deterministically on this device's 42-channel config (its output
- * struct's fixed 32-slot arrays overflow), so there is no safe way to
- * read the chip's current channel at all right now -- and reading the
- * current value is exactly what re-persisting a live operator change
- * needs. Setting a channel blind (no readback) also means coordinating
- * a live push to the connected peer to keep both sides in sync, real
- * complexity with no working way to verify it landed -- not something
- * to take on without dedicated hardware time.
+ * Bandwidth, retx and channel. Bandwidth mirrors the shell logic this
+ * replaced (S65ar8030-transport-tx's own apply_link_tuning()). Channel
+ * came later, once BB_GET_CHAN_INFO became readable: it used to segfault
+ * on this device's 42-channel table (the output struct's fixed 32-slot
+ * arrays overflowed) until the ar8030 package raised
+ * BB_CONFIG_MAX_CHAN_NUM to 60 (patch 0022/0029) -- see
+ * ar8030-linkctl's own cmd_status() comment.
  */
 
 /* Non-zero if mhz is one of the AR8030's actual bandwidth gears
@@ -70,6 +64,51 @@ int lc_tuning_resolve_connected_slot(bb_dev_handle_t* handle);
  * (win/busy/idle/conti_busy/conti_idle); this file only ever reads/
  * writes those 5, leaving the rest zeroed on SET and ignored on GET.
  */
+
+/*
+ * Channel: either an index into the chip's pre-configured channel table
+ * (ar8030.json's baseband.basic.channel.freq[]) in manual mode, or the
+ * chip's own channel adaptation (auto mode). Stored as one int:
+ * LC_CHANNEL_AUTO, LC_CHANNEL_NONE ("don't touch the chip's channel at
+ * all", --default-channel none) or an index >= 0.
+ */
+#define LC_CHANNEL_AUTO (-1)
+#define LC_CHANNEL_NONE (-2)
+
+/* Parses "auto", "none" or a channel index (0..BB_CONFIG_MAX_CHAN_NUM-1).
+ * Returns 0 and fills *out on success, -1 on anything else. */
+int lc_channel_parse(const char* s, int* out);
+
+/* Reads the persisted channel (LC_CHANNEL_AUTO or an index) from the
+ * sidecar file next to cfg_path (fixed name "ar8030.channel"). Returns 0
+ * and fills *out on success, -1 if no sidecar exists yet or it's
+ * unreadable/invalid. */
+int lc_channel_load(const char* cfg_path, int* out);
+
+/* Atomically persists chan (LC_CHANNEL_AUTO or an index) to the sidecar
+ * file next to cfg_path. Returns 0 on success. */
+int lc_channel_save(const char* cfg_path, int chan);
+
+/* BB_GET_CHAN_INFO: fills auto_mode (1 = adaptive), work_chan and
+ * chan_num (size of the chip's channel table). Returns 0 on success. */
+int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num);
+
+/* Non-zero if the chip's reported (auto_mode, work_chan) is what chan
+ * asks for -- in auto mode any working channel counts. */
+int lc_channel_matches(int chan, int auto_mode, int work_chan);
+
+/* Retunes this radio only: BB_SET_CHAN_MODE, plus BB_SET_CHAN(rx, index)
+ * in manual mode. Meant for before a link exists, so both ends (each
+ * applying its own persisted value at startup) meet on the same channel.
+ * Returns 0 if every ioctl succeeded. */
+int lc_channel_apply_local(bb_dev_handle_t* handle, int chan);
+
+/* Retunes both ends of a live link: the local change above, then
+ * BB_SET_REMOTE to push the same mode/channel to the peer on `slot` --
+ * ar8030-linkctl's own cmd_channel() sequence (the vendor's bb_test.c
+ * one), confirmed on hardware to drive a synchronized "safe hop" without
+ * dropping CONNECT. Returns 0 if every ioctl succeeded. */
+int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan);
 
 /* Non-zero if every one of the 5 values fits a uint8_t (0-255) -- the
  * only constraint currently known; unlike lc_tuning_valid_mhz() there is

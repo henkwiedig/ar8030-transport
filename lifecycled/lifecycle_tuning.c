@@ -34,7 +34,9 @@ int lc_tuning_valid_mhz(int mhz)
     return mhz_to_bw_enum(mhz) >= 0;
 }
 
-static void tuning_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
+/* <dir of cfg_path>/<name> -- every sidecar this file owns lives next to
+ * the baseband JSON it tunes. */
+static void sidecar_path(const char* cfg_path, const char* name, char* out, size_t out_sz)
 {
     const char* slash = strrchr(cfg_path, '/');
     if (slash) {
@@ -43,10 +45,15 @@ static void tuning_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
             dirlen = out_sz - 1;
         }
         memcpy(out, cfg_path, dirlen);
-        snprintf(out + dirlen, out_sz - dirlen, "ar8030.tuning");
+        snprintf(out + dirlen, out_sz - dirlen, "%s", name);
     } else {
-        snprintf(out, out_sz, "ar8030.tuning");
+        snprintf(out, out_sz, "%s", name);
     }
+}
+
+static void tuning_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
+{
+    sidecar_path(cfg_path, "ar8030.tuning", out, out_sz);
 }
 
 int lc_tuning_load(const char* cfg_path)
@@ -156,17 +163,7 @@ int lc_retx_valid(int win, int busy, int idle, int conti_busy, int conti_idle)
 
 static void retx_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
 {
-    const char* slash = strrchr(cfg_path, '/');
-    if (slash) {
-        size_t dirlen = (size_t)(slash - cfg_path) + 1;
-        if (dirlen >= out_sz) {
-            dirlen = out_sz - 1;
-        }
-        memcpy(out, cfg_path, dirlen);
-        snprintf(out + dirlen, out_sz - dirlen, "ar8030.retx");
-    } else {
-        snprintf(out, out_sz, "ar8030.retx");
-    }
+    sidecar_path(cfg_path, "ar8030.retx", out, out_sz);
 }
 
 int lc_retx_load(const char* cfg_path, bb_retx_cfg_t* out)
@@ -247,5 +244,141 @@ int lc_frame_change_apply(bb_dev_handle_t* handle, int mode)
     fc.mode = mode ? 1 : 0;
     int ret = bb_ioctl(handle, BB_SET_FRAME_CHANGE, &fc, NULL);
     lc_log("lifecycle: tuning: BB_SET_FRAME_CHANGE(mode=%u) ret=%d", fc.mode, ret);
+    return ret;
+}
+
+int lc_channel_parse(const char* s, int* out)
+{
+    if (!s || !*s) {
+        return -1;
+    }
+    if (strcmp(s, "auto") == 0) {
+        *out = LC_CHANNEL_AUTO;
+        return 0;
+    }
+    if (strcmp(s, "none") == 0) {
+        *out = LC_CHANNEL_NONE;
+        return 0;
+    }
+    char* end;
+    long  v = strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v < 0 || v >= BB_CONFIG_MAX_CHAN_NUM) {
+        return -1;
+    }
+    *out = (int)v;
+    return 0;
+}
+
+int lc_channel_load(const char* cfg_path, int* out)
+{
+    char path[512];
+    sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    char buf[16] = {0};
+    int  ok      = fscanf(f, "%15s", buf) == 1;
+    fclose(f);
+    int chan;
+    if (!ok || lc_channel_parse(buf, &chan) != 0 || chan == LC_CHANNEL_NONE) {
+        lc_log("lifecycle: tuning: %s has no valid channel, ignoring", path);
+        return -1;
+    }
+    *out = chan;
+    return 0;
+}
+
+int lc_channel_save(const char* cfg_path, int chan)
+{
+    if (chan != LC_CHANNEL_AUTO && (chan < 0 || chan >= BB_CONFIG_MAX_CHAN_NUM)) {
+        lc_log("lifecycle: tuning: refusing to persist invalid channel %d", chan);
+        return -1;
+    }
+
+    char path[512];
+    sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    if (chan == LC_CHANNEL_AUTO) {
+        fprintf(f, "auto\n");
+    } else {
+        fprintf(f, "%d\n", chan);
+    }
+    fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: tuning: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num)
+{
+    bb_get_chan_info_out_t out;
+    memset(&out, 0, sizeof(out));
+    if (bb_ioctl(handle, BB_GET_CHAN_INFO, NULL, &out) != 0) {
+        return -1;
+    }
+    *auto_mode = out.auto_mode ? 1 : 0;
+    *work_chan = out.work_chan;
+    *chan_num  = out.chan_num;
+    return 0;
+}
+
+int lc_channel_matches(int chan, int auto_mode, int work_chan)
+{
+    if (chan == LC_CHANNEL_AUTO) {
+        return auto_mode;
+    }
+    return !auto_mode && work_chan == chan;
+}
+
+int lc_channel_apply_local(bb_dev_handle_t* handle, int chan)
+{
+    bb_set_chan_mode_t cm = {.auto_mode = (uint8_t)(chan == LC_CHANNEL_AUTO)};
+    int                ret = bb_ioctl(handle, BB_SET_CHAN_MODE, &cm, NULL);
+    lc_log("lifecycle: tuning: BB_SET_CHAN_MODE(auto_mode=%u) ret=%d", cm.auto_mode, ret);
+    if (ret != 0 || chan == LC_CHANNEL_AUTO) {
+        return ret;
+    }
+    /* RX only: TX-direction channel control is director mode only (see
+     * bb_set_chan_t), and an RX change applies to every slot at once. */
+    bb_set_chan_t sc = {.chan_dir = BB_DIR_RX, .chan_index = (uint8_t)chan};
+    ret              = bb_ioctl(handle, BB_SET_CHAN, &sc, NULL);
+    lc_log("lifecycle: tuning: BB_SET_CHAN(rx, index=%d) ret=%d", chan, ret);
+    return ret;
+}
+
+int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan)
+{
+    int ret = lc_channel_apply_local(handle, chan);
+    if (ret != 0) {
+        lc_log("lifecycle: tuning: local channel change failed, not pushing to peer");
+        return ret;
+    }
+    bb_set_remote_t sr;
+    memset(&sr, 0, sizeof(sr));
+    sr.slot     = (uint8_t)slot;
+    sr.type_bmp = 1u << BB_REMOTE_TYPE_CHAN_MODE;
+    sr.setting.auto_chan = (uint8_t)(chan == LC_CHANNEL_AUTO);
+    if (chan != LC_CHANNEL_AUTO) {
+        sr.type_bmp |= 1u << BB_REMOTE_TYPE_TARGET_CHAN;
+        sr.setting.target_chan = (uint8_t)chan;
+    }
+    ret = bb_ioctl(handle, BB_SET_REMOTE, &sr, NULL);
+    lc_log("lifecycle: tuning: BB_SET_REMOTE(slot=%d, auto_chan=%u, target_chan=%d) ret=%d", slot,
+           sr.setting.auto_chan, chan, ret);
+    if (ret != 0) {
+        lc_log("lifecycle: tuning: channel changed locally but the peer push failed -- link likely desynced");
+    }
     return ret;
 }

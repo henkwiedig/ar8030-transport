@@ -31,7 +31,8 @@ extern "C" {
  *
  * Two families of endpoint:
  *
- *  - /api/v1/status and /api/v1/pair and /api/v1/bandwidth are owned by
+ *  - /api/v1/status, /api/v1/pair, /api/v1/bandwidth and /api/v1/channel
+ *    (queued like bandwidth, see lifecycle_request_channel()) are owned by
  *    this daemon's own lifecycle state -- status is a snapshot of
  *    lifecycle.c's own state machine (lifecycle_get_status()), pair
  *    triggers the exact same fork+exec+hook-dispatch sequence the

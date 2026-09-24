@@ -1868,7 +1868,7 @@ design rationale):
 - **`GET /api/v1/status`** -- this daemon's own view of the link:
   ```
   curl http://<host>:8899/api/v1/status
-  {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"paired":true}
+  {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"channel":32,"chan_mode":"manual","work_chan":32,"paired":true}
   ```
   `rf_temp_c` (one decimal, `null` without a reading) is included too,
   see `/api/v1/rf-temp` below.
@@ -1912,6 +1912,31 @@ design rationale):
   the same reasoning rules out a second thread in *this* process making
   concurrent `bb_ioctl` calls on the same handle).
   `curl -X POST 'http://<host>:8899/api/v1/bandwidth?mhz=20'`.
+- **`GET|POST /api/v1/channel[?chan=<index|auto>]`** -- the *persisted*
+  channel, owned by the AP. GET returns the wanted channel (AP; `null`
+  on the DEV) plus what the chip last reported on a live link:
+  ```
+  curl http://<host>:8899/api/v1/channel
+  {"ok":true,"channel":32,"chan_mode":"manual","work_chan":32}
+  ```
+  POST queues a change the same way `/api/v1/bandwidth` does, applied to
+  both ends at once while connected (`BB_SET_CHAN_MODE` + `BB_SET_CHAN`
+  + `BB_SET_REMOTE`, i.e. `linkctl channel`'s own synchronized hop), or
+  on the AP while idle to its own radio only.
+  `curl -X POST 'http://<host>:8899/api/v1/channel?chan=32'`,
+  `...?chan=auto` for the chip's own channel adaptation.
+  Only the AP keeps a channel: it saves it to an `ar8030.channel`
+  sidecar next to `cfg_path` (`auto` or the index; without one,
+  `--default-channel` applies -- default `32`, or `auto`, or `none` for
+  "leave the chip's startup channel alone"), puts its own radio there at
+  startup, and pushes it once on connect if the link came up elsewhere.
+  The DEV never pins a channel: while idle its chip hops through the
+  whole channel table looking for the AP (`ar8030d` log:
+  `bb_link_node_br_idle_proc`), and that search is what finds the AP's
+  channel. A change made from the DEV side (its own `/api/v1/channel`,
+  or a raw `linkctl channel` passthrough on either side) is picked up and
+  saved by the AP once the link had settled on the AP's channel. The DEV
+  answers `409` while no link is up, since there is nothing to push to.
 - **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
   -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
   the windowed retransmission controller's own tuning parameters

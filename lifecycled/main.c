@@ -33,6 +33,7 @@
 #include "lifecycle_bind.h"
 #include "lifecycle_client.h"
 #include "lifecycle_http.h"
+#include "lifecycle_tuning.h"
 #include <getopt.h>
 #include <pthread.h>
 #include <signal.h>
@@ -53,7 +54,10 @@ static void print_help(const char* argv0)
     printf("  --hook-dir <path>         hook script root (default /etc/ar8030/hooks.d)\n");
     printf("  --cfg-path <path>         baseband JSON to persist pairing/tuning against\n");
     printf("  --default-bandwidth <n>   fallback bandwidth if no tuning state yet (default 20)\n");
-    printf("  --default-channel <n>     fallback channel if no tuning state yet (default: none)\n");
+    printf("  --default-channel <n|auto|none>\n");
+    printf("                            AP only: channel while none is persisted yet: a channel-table\n");
+    printf("                            index, auto (chip's channel adaptation) or none (leave\n");
+    printf("                            the chip's own startup channel alone) (default 32)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (default: none -- no physical button on this board)\n");
     printf("  --http-port <n>           start the HTTP control API on this port\n");
@@ -119,7 +123,7 @@ int main(int argc, char** argv)
         .cfg_path          = "",
         .default_bandwidth = 20,
         .frame_change      = 1,
-        .default_channel   = -1,
+        .default_channel   = 32,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
         .http_bind         = "0.0.0.0",
@@ -182,7 +186,10 @@ int main(int argc, char** argv)
             cfg.default_bandwidth = (int)strtoul(optarg, NULL, 10);
             break;
         case OPT_DEFAULT_CHANNEL:
-            cfg.default_channel = (int)strtoul(optarg, NULL, 10);
+            if (lc_channel_parse(optarg, &cfg.default_channel) != 0) {
+                fprintf(stderr, "invalid --default-channel '%s' (index, auto or none)\n", optarg);
+                return 1;
+            }
             break;
         case OPT_BIND_GPIO:
             cfg.bind_gpio = (int)strtol(optarg, NULL, 10);

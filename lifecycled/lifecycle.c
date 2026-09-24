@@ -90,6 +90,7 @@
 #define LC_CONNECT_CONFIRM_TICKS 3
 #define LC_DROP_CONFIRM_TICKS    6
 
+
 struct lifecycle_ctx {
     lc_config_t cfg;
     lc_client_t client;
@@ -155,6 +156,23 @@ struct lifecycle_ctx {
     int pending_retx_idle;
     int pending_retx_conti_busy;
     int pending_retx_conti_idle;
+
+    /* lifecycle_request_channel()'s mailbox, same cmd_lock. */
+    int pending_channel_valid;
+    int pending_channel;
+
+    /* Wanted channel (index, LC_CHANNEL_AUTO or LC_CHANNEL_NONE): the
+     * persisted one, else cfg.default_channel -- AP only, always
+     * LC_CHANNEL_NONE on the DEV (see lc_channel_track()). Written only by
+     * the lifecycle thread, under status_lock (lifecycle_get_status()). */
+    int channel;
+    /* Last BB_GET_CHAN_INFO reading, -1 until read (status_lock). */
+    int chan_auto;
+    int work_chan;
+    /* Whether the chip has matched ctx->channel since the last change we
+     * made on this connection -- only then does a divergence mean the
+     * peer moved the link (lc_channel_track()). */
+    int chan_settled;
 
     /* RF-board temperature (lc_poll_rf_temp()), guarded by status_lock
      * like the rest of what lifecycle_get_status() exposes. */
@@ -236,6 +254,13 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->connected_slot       = -1;
     ctx->last_bandwidth       = -1;
     ctx->pending_bandwidth_mhz = -1;
+    ctx->chan_auto            = -1;
+    ctx->work_chan            = -1;
+    if (cfg->role != LC_ROLE_AP) {
+        ctx->channel = LC_CHANNEL_NONE;
+    } else if (!cfg->cfg_path[0] || lc_channel_load(cfg->cfg_path, &ctx->channel) != 0) {
+        ctx->channel = cfg->default_channel;
+    }
     pthread_mutex_init(&ctx->status_lock, NULL);
     pthread_mutex_init(&ctx->cmd_lock, NULL);
 
@@ -386,6 +411,137 @@ static void lc_drain_retx_request(lifecycle_ctx* ctx)
     lc_retx_apply(ctx->client.handle, win, busy, idle, conti_busy, conti_idle);
 }
 
+/* "auto", "none" or the index, for log lines. */
+static const char* lc_channel_str(int chan, char* buf, size_t buf_sz)
+{
+    if (chan == LC_CHANNEL_AUTO) {
+        return "auto";
+    }
+    if (chan == LC_CHANNEL_NONE) {
+        return "none";
+    }
+    snprintf(buf, buf_sz, "%d", chan);
+    return buf;
+}
+
+static void lc_set_channel(lifecycle_ctx* ctx, int chan)
+{
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->channel = chan;
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
+/* Drains lifecycle_request_channel()'s mailbox -- same shape as
+ * lc_drain_bandwidth_request(). Applies to both ends if connected,
+ * otherwise to this radio only (AP only: the DEV never gets here while
+ * idle, see lifecycle_request_channel()). Persisted on the AP only; a
+ * DEV-initiated change reaches the AP's sidecar through the AP's own
+ * lc_channel_track(). */
+static void lc_drain_channel_request(lifecycle_ctx* ctx)
+{
+    int valid, chan;
+    pthread_mutex_lock(&ctx->cmd_lock);
+    valid                      = ctx->pending_channel_valid;
+    chan                       = ctx->pending_channel;
+    ctx->pending_channel_valid = 0;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (!valid) {
+        return;
+    }
+    char buf[16];
+    lc_log("lifecycle: http: channel change requested: %s", lc_channel_str(chan, buf, sizeof(buf)));
+
+    /* The HTTP side can only bound-check against BB_CONFIG_MAX_CHAN_NUM;
+     * the chip's real table size is only readable from here. */
+    int auto_mode, work_chan, chan_num;
+    if (chan >= 0 && lc_channel_read(ctx->client.handle, &auto_mode, &work_chan, &chan_num) == 0 &&
+        chan >= chan_num) {
+        lc_log("lifecycle: channel %d is outside the chip's %d-entry table, ignoring", chan, chan_num);
+        return;
+    }
+
+    if (ctx->cfg.role == LC_ROLE_AP) {
+        if (ctx->cfg.cfg_path[0]) {
+            lc_channel_save(ctx->cfg.cfg_path, chan);
+        }
+        lc_set_channel(ctx, chan);
+        ctx->chan_settled = 0;
+    }
+    if (ctx->state == LC_STATE_CONNECTED) {
+        lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, chan);
+    } else {
+        lc_channel_apply_local(ctx->client.handle, chan);
+    }
+}
+
+/* Once per fallback poll on a live link: publishes the chip's channel
+ * for lifecycle_get_status(), and on the AP picks up a change the other
+ * end made (its own /api/v1/channel, or a raw `linkctl channel`
+ * passthrough on either side) so it sticks across reboots.
+ *
+ * AP only, and only after the chip has matched ctx->channel at least
+ * once on this connection. Confirmed on hardware that the DEV's reading
+ * is useless for this: while idle the DEV chip hops through the whole
+ * channel table looking for the AP (ar8030d log:
+ * bb_link_node_br_idle_proc), so right after a reconnect it reports
+ * wherever that search left it -- an earlier version adopted those
+ * readings on the DEV and saved channels nobody asked for. The AP is the
+ * one whose channel the DEV searches for, so it is the only side that
+ * keeps one. No re-pushing on a mismatch either: the AP pushes once per
+ * connect (lc_channel_on_connect()) and otherwise leaves the link alone. */
+static void lc_channel_track(lifecycle_ctx* ctx)
+{
+    int auto_mode, work_chan, chan_num;
+    if (lc_channel_read(ctx->client.handle, &auto_mode, &work_chan, &chan_num) != 0) {
+        return;
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->chan_auto = auto_mode;
+    ctx->work_chan = work_chan;
+    pthread_mutex_unlock(&ctx->status_lock);
+
+    if (ctx->channel == LC_CHANNEL_NONE) {
+        return;
+    }
+    if (lc_channel_matches(ctx->channel, auto_mode, work_chan)) {
+        ctx->chan_settled = 1;
+        return;
+    }
+    if (!ctx->chan_settled) {
+        return;
+    }
+
+    int  observed = auto_mode ? LC_CHANNEL_AUTO : work_chan;
+    char buf[16];
+    lc_log("lifecycle: link moved to channel %s by the peer, saving", lc_channel_str(observed, buf, sizeof(buf)));
+    if (ctx->cfg.cfg_path[0]) {
+        lc_channel_save(ctx->cfg.cfg_path, observed);
+    }
+    lc_set_channel(ctx, observed);
+}
+
+/* IDLE -> CONNECTED, AP only: pushes ctx->channel once if the link came
+ * up anywhere else (e.g. the pre-link lc_channel_apply_local() didn't
+ * take). */
+static void lc_channel_on_connect(lifecycle_ctx* ctx)
+{
+    ctx->chan_settled = 0;
+    if (ctx->channel == LC_CHANNEL_NONE) {
+        return;
+    }
+    int auto_mode, work_chan, chan_num = 0;
+    if (lc_channel_read(ctx->client.handle, &auto_mode, &work_chan, &chan_num) == 0 &&
+        lc_channel_matches(ctx->channel, auto_mode, work_chan)) {
+        return;
+    }
+    if (ctx->channel >= 0 && chan_num > 0 && ctx->channel >= chan_num) {
+        lc_log("lifecycle: channel %d is outside the chip's %d-entry table, not applying", ctx->channel, chan_num);
+        return;
+    }
+    lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, ctx->channel);
+}
+
 /* Writes whole degC to cfg.rf_temp_file via rename(), so a reader never
  * sees a half-written line. */
 static void lc_write_rf_temp_file(const lifecycle_ctx* ctx, int c10)
@@ -504,6 +660,18 @@ void* lifecycle_thread_main(void* arg)
         lc_pair_apply_known_candidate(ctx->client.handle, ctx->cfg.cfg_path, ctx->cfg.role);
     }
 
+    /* The chip boots on whatever ar8030.json says (currently manual mode
+     * on the table's first channel). Only the AP moves itself to its
+     * persisted/default channel before any link exists -- the DEV finds
+     * it there with its own idle channel search (see lc_channel_track()),
+     * which pinning the DEV to a fixed channel would only get in the way
+     * of. ctx->channel is always LC_CHANNEL_NONE on the DEV. */
+    if (ctx->channel != LC_CHANNEL_NONE) {
+        char buf[16];
+        lc_log("lifecycle: startup channel %s", lc_channel_str(ctx->channel, buf, sizeof(buf)));
+        lc_channel_apply_local(ctx->client.handle, ctx->channel);
+    }
+
     ctx->state = LC_STATE_IDLE;
     lc_log("lifecycle: thread running (role=%d)", (int)ctx->cfg.role);
 
@@ -525,6 +693,7 @@ void* lifecycle_thread_main(void* arg)
 
         lc_drain_bandwidth_request(ctx);
         lc_drain_retx_request(ctx);
+        lc_drain_channel_request(ctx);
         lc_poll_rf_temp(ctx);
 
         bb_link_state_e state;
@@ -554,6 +723,7 @@ void* lifecycle_thread_main(void* arg)
                 pthread_mutex_unlock(&ctx->status_lock);
                 lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, ctx->connected_slot, NULL);
                 lc_apply_tuning_on_connect(ctx, ctx->connected_slot);
+                lc_channel_on_connect(ctx);
                 break;
             }
             ctx->connect_confirm_count = 0;
@@ -601,6 +771,8 @@ void* lifecycle_thread_main(void* arg)
                 ctx->state          = LC_STATE_IDLE;
                 ctx->connected_slot = -1;
                 ctx->last_bandwidth = -1;
+                ctx->chan_auto      = -1;
+                ctx->work_chan      = -1;
                 pthread_mutex_unlock(&ctx->status_lock);
                 ctx->drop_miss_count = 0;
                 break;
@@ -634,6 +806,9 @@ void* lifecycle_thread_main(void* arg)
                     lc_frame_change_apply(ctx->client.handle, 1);
                 }
             }
+            if (did_fallback_poll) {
+                lc_channel_track(ctx);
+            }
             break;
 
         case LC_STATE_INIT:
@@ -661,6 +836,9 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->state          = ctx->state;
     out->connected_slot = ctx->connected_slot;
     out->bandwidth_mhz  = ctx->last_bandwidth;
+    out->channel        = ctx->channel;
+    out->chan_auto      = ctx->chan_auto;
+    out->work_chan      = ctx->work_chan;
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
     out->rf_temp_c10    = ctx->rf_temp_c10;
     out->rf_temp_mv     = ctx->rf_temp_mv;
@@ -697,6 +875,26 @@ int lifecycle_request_retx(lifecycle_ctx* ctx, int win, int busy, int idle, int 
     ctx->pending_retx_conti_busy  = conti_busy;
     ctx->pending_retx_conti_idle  = conti_idle;
     ctx->pending_retx_valid       = 1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_channel(lifecycle_ctx* ctx, int chan)
+{
+    if (chan != LC_CHANNEL_AUTO && (chan < 0 || chan >= BB_CONFIG_MAX_CHAN_NUM)) {
+        return -1;
+    }
+    if (ctx->cfg.role == LC_ROLE_DEV) {
+        pthread_mutex_lock(&ctx->status_lock);
+        int connected = ctx->state == LC_STATE_CONNECTED;
+        pthread_mutex_unlock(&ctx->status_lock);
+        if (!connected) {
+            return -2;
+        }
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_channel       = chan;
+    ctx->pending_channel_valid = 1;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }
