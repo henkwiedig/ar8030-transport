@@ -1921,7 +1921,8 @@ design rationale):
   {"ok":true,"role":"dev","state":"connected","connected_slot":0,"ports":{"0":{"rx_bytes":0,"tx_bytes":0},"1":{"rx_bytes":0,"tx_bytes":0},"2":{"rx_bytes":5510340129,"tx_bytes":0},"3":{"rx_bytes":0,"tx_bytes":1541}}}
   ```
   `state` is this daemon's own view (`connected` once the chip reports
-  CONNECT, else `idle`/`init`). While connected, `quality` carries the
+  CONNECT, else `idle`/`init`). `distance_m` is the link distance in
+  metres, same as in `/api/v1/status` (`null` without a link). While connected, `quality` carries the
   chip's `BB_GET_1V1_INFO` (read every tick; `null` without a link):
   ```
   "quality":{"signal_level":4,

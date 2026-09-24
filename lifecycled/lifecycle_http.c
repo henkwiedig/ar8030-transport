@@ -452,7 +452,8 @@ static void format_link_side(const lc_link_side_t* q, char* out, size_t out_sz)
  * view ("connected" once the chip reports CONNECT), ports lists every open
  * port with its cumulative rx/tx byte counters (BB_GET_SOCK_INFO, read
  * every tick), quality is BB_GET_1V1_INFO's self/peer blocks plus stock's
- * 0..4 signal_level while connected, else null. */
+ * 0..4 signal_level while connected, else null. distance_m is the link
+ * distance in metres (as in /api/v1/status), null without a link. */
 static void handle_link(lifecycle_http_ctx* http, int fd)
 {
     lc_status_t st;
@@ -486,10 +487,18 @@ static void handle_link(lifecycle_http_ctx* http, int fd)
         snprintf(quality, sizeof(quality), "null");
     }
 
-    char json[LC_SOCK_PORTS * 80 + 800];
+    char dist[16];
+    if (st.distance_m >= 0) {
+        snprintf(dist, sizeof(dist), "%d", st.distance_m);
+    } else {
+        snprintf(dist, sizeof(dist), "null");
+    }
+
+    char json[LC_SOCK_PORTS * 80 + 832];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"ports\":%s,\"quality\":%s}",
-             role_str, state_str, st.connected_slot, ports, quality);
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"distance_m\":%s,\"ports\":%s,"
+             "\"quality\":%s}",
+             role_str, state_str, st.connected_slot, dist, ports, quality);
     send_json(fd, 200, "OK", json);
 }
 
