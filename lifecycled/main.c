@@ -57,7 +57,7 @@ static void print_help(const char* argv0)
     printf("  --default-channel <n|auto|none>\n");
     printf("                            AP only: channel while none is persisted yet: a channel-table\n");
     printf("                            index, auto (chip's channel adaptation) or none (leave\n");
-    printf("                            the chip's own startup channel alone) (default 32)\n");
+    printf("                            the chip's own startup channel alone) (default 25 = 5805 MHz)\n");
     printf("  --default-power <mw|auto|none>\n");
     printf("                            output power while none is persisted yet: air 400/\n");
     printf("                            200/100/25 mW, ground auto/500/200/100/25 mW, or none\n");
@@ -129,7 +129,7 @@ int main(int argc, char** argv)
         .cfg_path          = "",
         .default_bandwidth = 20,
         .frame_change      = 1,
-        .default_channel   = 32,
+        .default_channel   = 25, /* 5805 MHz in ar8030.json's channel table */
         .default_power     = LC_POWER_ROLE_DEFAULT,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
