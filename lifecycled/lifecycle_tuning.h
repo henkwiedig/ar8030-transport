@@ -162,6 +162,14 @@ int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level);
  * Returns the chip's dBm target, or -1. */
 int lc_power_read_dbm(bb_dev_handle_t* handle, int is_ap);
 
+/* Link distance in metres from BB_GET_DISTC_RESULT (slot 0, the only
+ * one this project uses), or -1 without a ranging result or on failure.
+ * Already metres: the chip subtracts ar8030.json's dist_calc.offset (the
+ * vendor's calibration) and clamps at 0, and stock displays the value
+ * unconverted -- ar_ldy_gnd hands distance[0] to GlassesUI, which shows
+ * QString("%1m").arg(distance). So a bench link reads 0. */
+int lc_distance_read_m(bb_dev_handle_t* handle);
+
 /* Non-zero if every one of the 5 values fits a uint8_t (0-255) -- the
  * only constraint currently known; unlike lc_tuning_valid_mhz() there is
  * no fixed set of legal values to check against since the real units

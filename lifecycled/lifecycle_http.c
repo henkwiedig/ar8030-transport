@@ -399,13 +399,19 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     format_channel_fields(&st, chan, sizeof(chan));
     char power[192];
     format_power_fields(http, &st, power, sizeof(power));
+    char dist[16];
+    if (st.distance_m >= 0) {
+        snprintf(dist, sizeof(dist), "%d", st.distance_m);
+    } else {
+        snprintf(dist, sizeof(dist), "null");
+    }
 
-    char json[8900];
+    char json[8950];
     snprintf(json, sizeof(json),
              "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,"
-              "\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, st.paired ? "true" : "false",
-             rf_temp, rc, escaped);
+              "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"linkctl_exit_code\":%d,\"linkctl_status\":\"%s\"}",
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, dist,
+             st.paired ? "true" : "false", rf_temp, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
 
@@ -719,7 +725,8 @@ static const char INDEX_HTML[] =
     "function refresh(){\n"
     "  fetch('/api/v1/status').then(r=>r.json()).then(d=>{\n"
     "    var summary = 'role='+d.role+' state='+d.state+' connected_slot='+d.connected_slot+\n"
-    "      ' bandwidth_mhz='+d.bandwidth_mhz+' channel='+d.channel+' (chip: '+d.chan_mode+' '+d.work_chan+')'+\n"
+    "      ' bandwidth_mhz='+d.bandwidth_mhz+' distance='+(d.distance_m === null ? '--' : d.distance_m+' m')+\n"
+    "      ' channel='+d.channel+' (chip: '+d.chan_mode+' '+d.work_chan+')'+\n"
     "      ' paired='+d.paired+' (linkctl exit '+d.linkctl_exit_code+')';\n"
     "    document.getElementById('status').textContent = summary+'\\n\\n'+(d.linkctl_status||'');\n"
     "    var t = document.getElementById('rftemp');\n"

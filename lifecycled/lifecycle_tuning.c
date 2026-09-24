@@ -616,3 +616,14 @@ int lc_power_read_dbm(bb_dev_handle_t* handle, int is_ap)
     }
     return out.pwr;
 }
+
+int lc_distance_read_m(bb_dev_handle_t* handle)
+{
+    bb_get_distc_result_in_t  in = {.slot_bmp = 1u << BB_SLOT_0};
+    bb_get_distc_result_out_t out;
+    memset(&out, 0, sizeof(out));
+    if (bb_ioctl(handle, BB_GET_DISTC_RESULT, &in, &out) != 0) {
+        return -1;
+    }
+    return out.distance[BB_SLOT_0] >= 0 ? out.distance[BB_SLOT_0] : -1;
+}

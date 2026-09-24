@@ -119,9 +119,10 @@ static void usage(const char *argv0)
             "\n"
             "  distance [-n count] [-i ms]\n"
             "      Reads BB_GET_DISTC_RESULT for every slot, count times (default\n"
-            "      10) every ms milliseconds (default 500). Raw units: -1 = no\n"
-            "      ranging result, >= 0 = result after the chip subtracts\n"
-            "      ar8030.json's dist_calc.offset.\n"
+            "      10) every ms milliseconds (default 500). Metres (-1 = no\n"
+            "      ranging result): the chip subtracts ar8030.json's\n"
+            "      dist_calc.offset and clamps at 0, and stock displays the value\n"
+            "      unconverted as \"<n>m\".\n"
             "\n"
             "  rf-temp [-c channel] [-a]\n"
             "      RF-board temperature from the AR8030's own ADC (default channel 4,\n"
@@ -682,10 +683,11 @@ static int cmd_status(int argc, char **argv)
     /* Ranging result for every configured slot (same cfg_sbmp filter as the
      * link_status loop above). Configured only by ar8030.json's dist_calc
      * at chip load -- BB_CFG_DISTC at runtime is rejected (ret=-2), and the
-     * stock streamers never send it either. The chip subtracts
-     * dist_calc.offset and clamps at 0, so a short-range link can read 0.
-     * Raw units: no calibrated scale is known (the SDK only says -1 = no
-     * result). `ar8030-linkctl distance` samples it repeatedly. */
+     * stock streamers never send it either. The value is metres: the chip
+     * subtracts dist_calc.offset (the vendor's calibration) and clamps at 0,
+     * and stock shows it unconverted -- ar_ldy_gnd forwards distance[0] to
+     * GlassesUI, which renders QString("%1m").arg(distance). A bench link
+     * reads 0 m. `ar8030-linkctl distance` samples it repeatedly. */
     bb_get_distc_result_in_t dist_in = { .slot_bmp = st_out.cfg_sbmp };
     bb_get_distc_result_out_t dist_out;
     memset(&dist_out, 0, sizeof(dist_out));
@@ -696,7 +698,7 @@ static int cmd_status(int argc, char **argv)
             if (dist_out.distance[s] < 0)
                 printf("BB_GET_DISTC_RESULT(slot=%d): no ranging result\n", s);
             else
-                printf("BB_GET_DISTC_RESULT(slot=%d): distance=%d (raw units)\n", s, dist_out.distance[s]);
+                printf("BB_GET_DISTC_RESULT(slot=%d): distance=%d m\n", s, dist_out.distance[s]);
         }
     }
 
@@ -1493,7 +1495,7 @@ static int cmd_distance(int argc, char **argv)
         int ret = bb_ioctl(g_hbb, BB_GET_DISTC_RESULT, &in, &out);
         printf("ret=%d", ret);
         for (int s = 0; s < BB_SLOT_MAX; s++)
-            printf(" s%d=%d", s, out.distance[s]);
+            printf(out.distance[s] >= 0 ? " s%d=%dm" : " s%d=%d", s, out.distance[s]);
         printf("\n");
         fflush(stdout);
         if (i + 1 < count)

@@ -119,6 +119,7 @@ typedef struct {
     int        work_chan;      /* chip-reported working channel, -1 if not read yet */
     int        power;          /* wanted: mW level, LC_POWER_AUTO or LC_POWER_NONE */
     int        power_dbm;      /* chip-reported dBm target, -1 if not read yet */
+    int        distance_m;     /* link distance in metres, -1 without a link/result */
     int        chan_table_n;   /* channel table size, 0 until read at startup */
     uint32_t   chan_table_khz[LC_MAX_CHANNELS];
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */

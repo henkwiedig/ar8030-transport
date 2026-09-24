@@ -157,6 +157,9 @@ struct lifecycle_ctx {
     int pending_retx_conti_busy;
     int pending_retx_conti_idle;
 
+    /* Link distance in metres, -1 without a link/result (status_lock). */
+    int distance_m;
+
     /* The chip's channel table, read once at startup (status_lock). */
     int      chan_table_n;
     uint32_t chan_table_khz[LC_MAX_CHANNELS];
@@ -272,6 +275,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->chan_auto            = -1;
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
+    ctx->distance_m           = -1;
     if (cfg->role != LC_ROLE_AP) {
         ctx->channel = LC_CHANNEL_NONE;
     } else if (!cfg->cfg_path[0] || lc_channel_load(cfg->cfg_path, &ctx->channel) != 0) {
@@ -600,6 +604,17 @@ static void lc_poll_power(lifecycle_ctx* ctx)
     pthread_mutex_unlock(&ctx->status_lock);
 }
 
+/* Refreshes lifecycle_get_status()'s distance_m, every tick while
+ * connected -- cheap, and an OSD wants it fresher than the 5 s fallback
+ * poll. */
+static void lc_poll_distance(lifecycle_ctx* ctx)
+{
+    int m = ctx->state == LC_STATE_CONNECTED ? lc_distance_read_m(ctx->client.handle) : -1;
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->distance_m = m;
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
 /* Drains lifecycle_request_power()'s mailbox: persists, then applies right
  * away (chip-wide, no link needed). */
 static void lc_drain_power_request(lifecycle_ctx* ctx)
@@ -803,6 +818,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_retx_request(ctx);
         lc_drain_channel_request(ctx);
         lc_drain_power_request(ctx);
+        lc_poll_distance(ctx);
         lc_poll_rf_temp(ctx);
 
         bb_link_state_e state;
@@ -950,6 +966,7 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->work_chan      = ctx->work_chan;
     out->power          = ctx->power;
     out->power_dbm      = ctx->power_dbm;
+    out->distance_m     = ctx->distance_m;
     out->chan_table_n   = ctx->chan_table_n;
     memcpy(out->chan_table_khz, ctx->chan_table_khz, sizeof(out->chan_table_khz));
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
