@@ -157,6 +157,10 @@ struct lifecycle_ctx {
     int pending_retx_conti_busy;
     int pending_retx_conti_idle;
 
+    /* The chip's channel table, read once at startup (status_lock). */
+    int      chan_table_n;
+    uint32_t chan_table_khz[LC_MAX_CHANNELS];
+
     /* lifecycle_request_power()'s mailbox, same cmd_lock. */
     int pending_power_valid;
     int pending_power;
@@ -740,6 +744,20 @@ void* lifecycle_thread_main(void* arg)
         lc_pair_apply_known_candidate(ctx->client.handle, ctx->cfg.cfg_path, ctx->cfg.role);
     }
 
+    /* Fixed for the chip's lifetime (it comes from ar8030.json), so one
+     * read is enough -- served by GET /api/v1/channel for channel pickers. */
+    {
+        uint32_t khz[LC_MAX_CHANNELS];
+        int      n = lc_channel_read_table(ctx->client.handle, khz, LC_MAX_CHANNELS);
+        if (n > 0) {
+            pthread_mutex_lock(&ctx->status_lock);
+            memcpy(ctx->chan_table_khz, khz, (size_t)n * sizeof(khz[0]));
+            ctx->chan_table_n = n;
+            pthread_mutex_unlock(&ctx->status_lock);
+        }
+        lc_log("lifecycle: channel table: %d entries", n);
+    }
+
     /* The chip boots on whatever ar8030.json says (currently manual mode
      * on the table's first channel). Only the AP moves itself to its
      * persisted/default channel before any link exists -- the DEV finds
@@ -932,6 +950,8 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->work_chan      = ctx->work_chan;
     out->power          = ctx->power;
     out->power_dbm      = ctx->power_dbm;
+    out->chan_table_n   = ctx->chan_table_n;
+    memcpy(out->chan_table_khz, ctx->chan_table_khz, sizeof(out->chan_table_khz));
     out->rf_temp_valid  = ctx->rf_temp_valid;  /* rf_temp_mv is set either way */
     out->rf_temp_c10    = ctx->rf_temp_c10;
     out->rf_temp_mv     = ctx->rf_temp_mv;

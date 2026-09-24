@@ -334,6 +334,26 @@ int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int
     return 0;
 }
 
+int lc_channel_read_table(bb_dev_handle_t* handle, uint32_t* khz, int max)
+{
+    bb_get_chan_info_out_t out;
+    memset(&out, 0, sizeof(out));
+    if (bb_ioctl(handle, BB_GET_CHAN_INFO, NULL, &out) != 0) {
+        return -1;
+    }
+    int n = out.chan_num;
+    if (n > BB_CONFIG_MAX_CHAN_NUM) {
+        n = BB_CONFIG_MAX_CHAN_NUM;
+    }
+    if (n > max) {
+        n = max;
+    }
+    for (int i = 0; i < n; i++) {
+        khz[i] = out.freq[i];
+    }
+    return n;
+}
+
 int lc_channel_matches(int chan, int auto_mode, int work_chan)
 {
     if (chan == LC_CHANNEL_AUTO) {

@@ -94,6 +94,10 @@ int lc_channel_save(const char* cfg_path, int chan);
  * chan_num (size of the chip's channel table). Returns 0 on success. */
 int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num);
 
+/* The chip's channel table (BB_GET_CHAN_INFO freq[], kHz): fills up to
+ * max entries of khz and returns how many, or -1 on failure. */
+int lc_channel_read_table(bb_dev_handle_t* handle, uint32_t* khz, int max);
+
 /* Non-zero if the chip's reported (auto_mode, work_chan) is what chan
  * asks for -- in auto mode any working channel counts. */
 int lc_channel_matches(int chan, int auto_mode, int work_chan);

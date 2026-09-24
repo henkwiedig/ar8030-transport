@@ -496,9 +496,18 @@ static void handle_channel(lifecycle_http_ctx* http, int fd, const char* method,
 
     lc_status_t st;
     lifecycle_get_status(http->lc, &st);
-    char fields[96], json[128];
+    char fields[96];
     format_channel_fields(&st, fields, sizeof(fields));
-    snprintf(json, sizeof(json), "{\"ok\":true,%s}", fields);
+    /* table_mhz: the chip's channel table, index -> MHz, for pickers */
+    char   table[LC_MAX_CHANNELS * 6 + 1];
+    size_t len = 0;
+    table[0]   = '\0';
+    for (int i = 0; i < st.chan_table_n && len < sizeof(table); i++) {
+        len += (size_t)snprintf(table + len, sizeof(table) - len, "%s%u", i ? "," : "",
+                                (unsigned)(st.chan_table_khz[i] / 1000));
+    }
+    char json[sizeof(fields) + sizeof(table) + 64];
+    snprintf(json, sizeof(json), "{\"ok\":true,%s,\"table_mhz\":[%s]}", fields, table);
     send_json(fd, 200, "OK", json);
 }
 

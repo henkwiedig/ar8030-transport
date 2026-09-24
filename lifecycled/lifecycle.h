@@ -24,6 +24,7 @@ extern "C" {
  */
 
 #define LC_MAX_RESET_GPIOS 8
+#define LC_MAX_CHANNELS    64 /* >= the SDK's BB_CONFIG_MAX_CHAN_NUM (60) */
 
 typedef enum {
     LC_RESET_METHOD_NONE = 0,
@@ -118,6 +119,8 @@ typedef struct {
     int        work_chan;      /* chip-reported working channel, -1 if not read yet */
     int        power;          /* wanted: mW level, LC_POWER_AUTO or LC_POWER_NONE */
     int        power_dbm;      /* chip-reported dBm target, -1 if not read yet */
+    int        chan_table_n;   /* channel table size, 0 until read at startup */
+    uint32_t   chan_table_khz[LC_MAX_CHANNELS];
     int        rf_temp_valid;  /* non-zero once a real RF-board reading has arrived */
     int        rf_temp_c10;    /* smoothed RF-board temperature, 0.1 degC */
     int        rf_temp_mv;     /* last raw ADC reading, mV */
