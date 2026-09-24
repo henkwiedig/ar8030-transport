@@ -76,7 +76,7 @@ int ar8030_link_open_socket(ar8030_link_t *link, bb_slot_e slot, uint32_t port, 
         return -1;
     }
 
-    link->sockfd = fd;
+    __atomic_store_n(&link->sockfd, fd, __ATOMIC_RELEASE); /* read by the IDR control threads */
     return 0;
 }
 
@@ -106,7 +106,7 @@ void ar8030_link_close(ar8030_link_t *link)
 
     if (link->sockfd >= 0) {
         bb_socket_close(link->sockfd);
-        link->sockfd = -1;
+        __atomic_store_n(&link->sockfd, -1, __ATOMIC_RELEASE);
     }
 
     /* Atomic exchange, not a plain read-then-close: publishes NULL to any

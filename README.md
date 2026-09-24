@@ -377,6 +377,39 @@ full investigation); every other index reads zero.
 (plus `BB_GET_PEER_QUALITY` for the connected peer's own slot) for
 visibility outside the control loop.
 
+## Keyframe requests: PixelPilot -> waybeam over the video socket
+
+PixelPilot asks for an IDR (on an RTP gap, a decoder problem, or a
+recording start) by sending a random 3-letter token (`abc\n`) to UDP
+port 11223 on the address its RTP came from -- in bursts of 3, 100 ms
+apart, repeated while no IDR shows up in the stream. On WFB that was
+`alink_idr` on the air unit ([sickgreg/aalink_idr5](https://github.com/sickgreg/aalink_idr5)):
+it answered `ACK:<token>`, dropped repeated tokens for 2 s and called
+waybeam's `GET /request/idr`. On an Artosyn ground the RTP comes from
+`ar8030-transport-rx`, so the request now crosses the radio instead:
+
+- **rx** (`rx/idr_relay.c`, `-I <port>`, default 11223, 0 = off) answers
+  each token with the same `ACK:<token>` (PixelPilot doesn't wait for it
+  -- it only stops retrying once an IDR arrives) and writes it as one
+  `AR8030_CHUNK_CODEC_CTRL` chunk, payload `IDR <token>`, into the
+  reverse direction of the video socket. Both ends already open it TX|RX
+  (rx for the ground's byte counters, tx by default like stock).
+- **tx** (`tx/idr_ctrl.c`) reads that direction with the same
+  `chunk_stream` reader rx uses for video, and calls `GET /request/idr` on
+  the waybeam host/port it already uses for bitrate control. Repeated
+  tokens are ignored for 2 s (alink_idr's `--keep-ms`), and a new token
+  within `-i <ms>` (default 250) of the last honored request is
+  coalesced: waybeam's own IDR rate limit only merges requests under
+  100 ms apart, so a 3-token burst would otherwise force up to three
+  keyframes. `-N` (TX-only socket) turns the feature off on the air side.
+
+Measured end to end on the bench (waybeam's `/api/v1/idr/stats`): a
+3-token burst at 100 ms -> 1 honored IDR, the same token again -> 0, a
+new token a second later -> 1. The control chunk is tiny (22-byte header
++ `IDR xyz`) and needs no other channel -- no IP tunnel, no extra port.
+Unknown control commands are ignored, so the same path can carry more
+ground -> air commands later.
+
 ## Frame-shm ring: surviving a waybeam restart
 
 `ar8030-transport-tx` attaches to waybeam's frame-shm ring

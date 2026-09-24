@@ -19,6 +19,7 @@
 #include "ar8030_chunk.h"
 #include "ar8030_link.h"
 #include "bitrate_ctl.h"
+#include "idr_ctrl.h"
 #include "chunker.h"
 #include "venc_frame_ring.h"
 
@@ -39,6 +40,7 @@
 #define DEFAULT_DAEMON_IP "127.0.0.1"
 #define DEFAULT_WAYBEAM_HOST "127.0.0.1"
 #define DEFAULT_WAYBEAM_PORT 80
+#define DEFAULT_IDR_COALESCE_MS 250 /* see idr_ctrl.h */
 /* BB_CONFIG_MAX_TRANSPORT_PER_SLOT is 4 (ports 0..3). ar8030d reserves
  * ports 0 and 1 for the ar_net0 IP bridge on this project's devices --
  * confirmed on bench hardware that bb_socket_open() on either fails
@@ -140,6 +142,7 @@ struct tx_args {
     uint32_t sock_tx_buf;
     uint32_t sock_rx_buf;
     int sock_bidir;
+    int idr_coalesce_ms;
     uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
     double ring_backoff;         /* bitrate multiplier per URGENT cut */
     int verbose;
@@ -167,13 +170,16 @@ static void usage(const char *argv0)
             "  -B <bytes>     socket tx_buf_size option (default 65536)\n"
             "  -R <bytes>     socket rx_buf_size option (default 1024)\n"
             "  -N             open the socket TX only (default is RX|TX like stock, which also\n"
-            "                 makes the daemon count it for `ar8030-linkctl rate`)\n"
+            "                 makes the daemon count it for `ar8030-linkctl rate`; RX also carries\n"
+            "                 the ground's keyframe requests -- -N disables those)\n"
+            "  -i <ms>        coalesce keyframe requests within this window (default %d, 0 = honor\n"
+            "                 every one; PixelPilot sends 3 per request, 100 ms apart)\n"
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
             argv0, DEFAULT_RING_NAME, DEFAULT_DAEMON_IP, DEFAULT_VIDEO_PORT,
             AR8030_CHUNK_DEFAULT_PAYLOAD, DEFAULT_WRITE_TIMEOUT_MS, DEFAULT_WAYBEAM_HOST,
-            DEFAULT_WAYBEAM_PORT);
+            DEFAULT_WAYBEAM_PORT, DEFAULT_IDR_COALESCE_MS);
 }
 
 static int parse_args(int argc, char **argv, struct tx_args *a)
@@ -194,12 +200,16 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->sock_tx_buf = 64 * 1024;
     a->sock_rx_buf = 1024;
     a->sock_bidir = 1;
+    a->idr_coalesce_ms = DEFAULT_IDR_COALESCE_MS;
     a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
     a->ring_backoff = 0.92;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:XNvh")) != -1) {
         switch (opt) {
+        case 'i':
+            a->idr_coalesce_ms = atoi(optarg);
+            break;
         case 'r':
             a->ring_name = optarg;
             break;
@@ -597,6 +607,14 @@ int main(int argc, char **argv)
                                         * Ghidra, not in the SDK's own bb_event_e) */
     bc_cfg.stop_flag = &g_stop;
 
+    idr_ctrl_cfg_t idr_cfg = {
+        .link = &link, .waybeam_host = args.waybeam_host, .waybeam_port = args.waybeam_port,
+        .coalesce_ms = args.idr_coalesce_ms, .dedup_ms = 2000 /* alink_idr's --keep-ms default */,
+        .verbose = args.verbose, .stop_flag = &g_stop
+    };
+    pthread_t idr_thread;
+    int idr_thread_ok = args.sock_bidir && pthread_create(&idr_thread, NULL, idr_ctrl_thread_main, &idr_cfg) == 0;
+
     pthread_t bc_thread;
     int bc_thread_ok = (pthread_create(&bc_thread, NULL, bitrate_thread_main, &bc_cfg) == 0);
     if (!bc_thread_ok)
@@ -822,8 +840,11 @@ int main(int argc, char **argv)
         }
     }
 
+    g_stop = 1; /* every path out of the loop above; both threads exit on it */
     if (bc_thread_ok)
         pthread_join(bc_thread, NULL);
+    if (idr_thread_ok)
+        pthread_join(idr_thread, NULL);
 
     free(chunk_scratch);
     free(ring_buf);

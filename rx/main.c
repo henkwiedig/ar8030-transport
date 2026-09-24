@@ -33,6 +33,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "idr_relay.h"
+#include <pthread.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -57,6 +59,7 @@
  * chunk_stream.h's init() comment for the hard minimum (one chunk). */
 #define STREAM_BUF_CHUNKS 4
 #define STATS_INTERVAL_S 1.0
+#define DEFAULT_IDR_PORT 11223 /* PixelPilot's kIdrUdpPort, formerly alink_idr's */
 /* How often the main loop asks the daemon directly whether it's still
  * there (ar8030_link_is_alive(), a single BB_GET_STATUS round trip) --
  * see that function's own comment (common/ar8030_link.h) for why this
@@ -90,6 +93,7 @@ struct rx_args {
     int target_port;
     uint16_t rtp_max_payload;
     uint32_t reassembly_max;
+    int idr_port; /* PixelPilot keyframe requests, 0 = off -- see idr_relay.h */
     int verbose;
 };
 
@@ -103,6 +107,8 @@ static void usage(const char *argv0)
             "  -p <port>      PixelPilot UDP target port (default %d)\n"
             "  -M <bytes>     max RTP payload before FU fragmentation (default %d)\n"
             "  -b <bytes>     max reassembled frame size (default %d)\n"
+            "  -I <port>      UDP port for PixelPilot's keyframe requests, relayed to the air\n"
+            "                 unit (alink_idr's 11223 by default, 0 = off)\n"
             "  -v             print periodic in/out stats to stderr (chunks, resyncs, frames, "
             "bytes, RTP output)\n"
             "  -h             this help\n",
@@ -119,11 +125,15 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
     a->target_port = DEFAULT_TARGET_PORT;
     a->rtp_max_payload = DEFAULT_MAX_RTP_PAYLOAD;
     a->reassembly_max = DEFAULT_REASSEMBLY_MAX;
+    a->idr_port = DEFAULT_IDR_PORT;
     a->verbose = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:vh")) != -1) {
         switch (opt) {
+        case 'I':
+            a->idr_port = atoi(optarg);
+            break;
         case 'd':
             a->daemon_ip = optarg;
             break;
@@ -359,6 +369,12 @@ int main(int argc, char **argv)
     ar8030_chunk_stream_init(&stream, read_from_bb_socket, &link.sockfd, stream_buf, stream_buf_cap,
                               STREAM_READ_TIMEOUT_MS, &g_stop);
 
+    idr_relay_cfg_t idr_cfg = {
+        .link = &link, .udp_port = args.idr_port, .verbose = args.verbose, .stop_flag = &g_stop
+    };
+    pthread_t idr_thread;
+    int idr_thread_ok = args.idr_port > 0 && pthread_create(&idr_thread, NULL, idr_relay_thread_main, &idr_cfg) == 0;
+
     uint64_t rtp_packets_sent = 0;
     uint64_t rtp_bytes_sent = 0;
     struct rx_stats_snapshot stats_prev = rx_stats_snapshot_take(&stream, &reasm, 0, 0);
@@ -445,6 +461,8 @@ int main(int argc, char **argv)
             continue; /* timeout, stop requested, or (ret<0) a misconfigured buffer -- either way,
                         * loop back and re-check g_stop */
 
+        if (hdr.codec == AR8030_CHUNK_CODEC_CTRL)
+            continue; /* control traffic goes ground -> air only; never video */
         if (!ar8030_reassembly_feed(&reasm, &hdr, payload_buf, payload_len))
             continue;
 
@@ -461,6 +479,9 @@ int main(int argc, char **argv)
     free(payload_buf);
     free(reasm_buf);
     close(udp_fd);
+    g_stop = 1;
+    if (idr_thread_ok)
+        pthread_join(idr_thread, NULL); /* before the link it writes to goes away */
     ar8030_link_close(&link);
     return 0;
 }

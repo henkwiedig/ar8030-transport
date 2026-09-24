@@ -40,6 +40,8 @@ BUILD_DIR := build
 SRCS := \
 	main.c \
 	bitrate_ctl.c \
+	idr_ctrl.c \
+	$(COMMON)/chunk_stream.c \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/http_get.c \
 	$(COMMON)/chunker.c \

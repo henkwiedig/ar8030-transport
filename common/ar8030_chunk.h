@@ -82,6 +82,18 @@
  * `send()` on the ground side. */
 #define AR8030_CHUNK_CODEC_OPUS 0x02u
 
+/* A control message, ground -> air, on the reverse direction of the same
+ * video socket (both ends open it TX|RX). One single-chunk frame whose
+ * payload is one ASCII command line, no terminator:
+ *   "IDR <token>"  request a keyframe -- PixelPilot's IDR token (formerly
+ *                  sent to alink_idr on UDP 11223), relayed by
+ *                  rx/idr_relay.c and handled by tx/idr_ctrl.c, which
+ *                  calls waybeam's GET /request/idr.
+ * Unknown commands are ignored, so new ones can be added later. frame_pts
+ * and flags are 0; frame_seq counts control messages on their own. */
+#define AR8030_CHUNK_CODEC_CTRL 0x03u
+#define AR8030_CTRL_MAX_PAYLOAD 64u
+
 #pragma pack(push, 1)
 struct ar8030_chunk_hdr {
     uint32_t magic;       /* AR8030_CHUNK_MAGIC */

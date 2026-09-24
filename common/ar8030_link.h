@@ -31,10 +31,12 @@ typedef struct {
      * own bb_ioctl() call must load it atomically first if it runs
      * anywhere near a concurrent reconnect. */
     bb_dev_handle_t *dev;
-    int sockfd; /* -1 until ar8030_link_open_socket() succeeds. Not shared
-                 * with another thread anywhere in this codebase (only
-                 * bitrate_ctl.c runs concurrently with a link owner, and
-                 * it never touches sockfd), so no atomic access needed. */
+    int sockfd; /* -1 until ar8030_link_open_socket() succeeds. The link
+                 * owner's own thread uses it directly; the IDR control
+                 * threads (rx/idr_relay.c writes, tx/idr_ctrl.c reads the
+                 * reverse direction) load it with __atomic_load_n, since
+                 * the owner reopens it after a daemon reconnect -- an
+                 * operation on the stale fd just fails and is retried. */
 } ar8030_link_t;
 
 /* One-shot connect attempt: bb_host_connect -> bb_dev_getlist ->

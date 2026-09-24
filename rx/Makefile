@@ -38,6 +38,8 @@ BUILD_DIR := build
 SRCS := \
 	main.c \
 	rtp_h265.c \
+	idr_relay.c \
+	$(COMMON)/chunker.c \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/reassembly.c \
 	$(COMMON)/chunk_stream.c \
