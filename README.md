@@ -1927,7 +1927,7 @@ design rationale):
   `...?chan=auto` for the chip's own channel adaptation.
   Only the AP keeps a channel: it saves it to an `ar8030.channel`
   sidecar next to `cfg_path` (`auto` or the index; without one,
-  `--default-channel` applies -- default `32`, or `auto`, or `none` for
+  `--default-channel` applies -- default `25` (5805 MHz), or `auto`, or `none` for
   "leave the chip's startup channel alone"), puts its own radio there at
   startup, and pushes it once on connect if the link came up elsewhere.
   The DEV never pins a channel: while idle its chip hops through the
