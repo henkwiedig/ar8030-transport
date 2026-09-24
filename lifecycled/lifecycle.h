@@ -265,6 +265,13 @@ int lifecycle_request_channel(lifecycle_ctx* ctx, int chan);
  * one of this role's levels. */
 int lifecycle_request_power(lifecycle_ctx* ctx, int level);
 
+/* Same mailbox pattern, for forgetting remembered air units on the DEV
+ * (multi-bind, see lifecycle_pair.h): one by MAC (8 hex digits), or with
+ * mac_hex NULL every one but the current ap_mac. Returns 0 if queued, -1
+ * bad MAC, -2 mac is the current ap_mac (a re-bind replaces it), -3 not
+ * a remembered air unit, -4 not the DEV side / no config. */
+int lifecycle_request_forget_peer(lifecycle_ctx* ctx, const char* mac_hex);
+
 #ifdef __cplusplus
 }
 #endif

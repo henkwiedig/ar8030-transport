@@ -7,6 +7,7 @@ extern "C" {
 #include "ar8030.h"
 #include "bb_api.h"
 #include "lifecycle.h"
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -60,6 +61,26 @@ int lc_pair_apply_known_candidate(bb_dev_handle_t* handle, const char* cfg_path,
  * pattern (fork-per-call, no shared mutable state). Returns 0 if
  * ar8030-pair exited successfully, -1 otherwise. */
 int lc_pair_run(const lc_config_t* cfg, int* out_slot, bb_mac_t* out_mac);
+
+/* DEV multi-bind (see lifecycle_pair.c): the ground remembers every air
+ * unit it was paired with in the ar8030.peers sidecar and hands them to
+ * the chip as candidates, next to the JSON's ap_mac (the latest pair). */
+
+/* The JSON's baseband.basic.dev.ap_mac. 0 on success. */
+int lc_pair_read_ap_mac(const char* cfg_path, bb_mac_t* out);
+/* The remembered air units, newest first. Returns the count. */
+int lc_peers_load(const char* cfg_path, bb_mac_t* out, int max);
+/* BB_SET_CANDIDATES with ap_mac + the remembered ones (nothing if none). */
+int lc_peers_push(bb_dev_handle_t* handle, const char* cfg_path);
+/* On CONNECT: remembers ap_mac if it is new (a fresh pair) and re-pushes. */
+int lc_peers_note_ap_mac(bb_dev_handle_t* handle, const char* cfg_path);
+/* Forgets one remembered air unit, or all but ap_mac with mac_hex NULL.
+ * Returns the number forgotten, -1 bad MAC, -2 mac is the current ap_mac
+ * (re-bind replaces that one), -3 not known, -4 write failed. The caller
+ * pushes the new list (lc_peers_push()). */
+int lc_peers_forget(const char* cfg_path, const char* mac_hex);
+/* {"ok":true,"current":"<ap_mac>"|null,"max":N,"peers":[ap_mac, ...]} */
+int lc_peers_json(const char* cfg_path, char* out, size_t out_sz);
 
 #ifdef __cplusplus
 }

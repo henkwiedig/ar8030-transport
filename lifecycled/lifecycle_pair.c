@@ -1,6 +1,7 @@
 #include "lifecycle_pair.h"
 #include "lc_log.h"
 #include "lifecycle_hooks.h"
+#include "lifecycle_tuning.h"
 #include <cjson/cJSON.h>
 #include <errno.h>
 #include <stdint.h>
@@ -284,6 +285,8 @@ int lc_pair_apply_known_candidate(bb_dev_handle_t* handle, const char* cfg_path,
             bb_set_ap_mac_t ap_mac;
             memcpy(&ap_mac.mac, &mac, sizeof(bb_mac_t));
             ret = bb_ioctl(handle, BB_SET_AP_MAC, &ap_mac, NULL);
+            /* Plus every earlier air unit, for multi-bind (lc_peers_push()). */
+            lc_peers_push(handle, cfg_path);
         }
 
         if (ret == 0) {
@@ -409,4 +412,248 @@ int lc_pair_run(const lc_config_t* cfg, int* out_slot, bb_mac_t* out_mac)
         *out_mac = mac;
     }
     return rc == 0 ? 0 : -1;
+}
+
+/*
+ * Multi-bind on the DEV (ground) side.
+ *
+ * The DEV links to its ap_mac OR to any MAC in its candidate list
+ * (BB_SET_CANDIDATES, slot 0) -- confirmed live: with ap_mac pointed at a
+ * nonexistent AP it relinks within ~2 s as soon as the real air unit's MAC
+ * is in the list, and stays down with only unknown MACs in it or with an
+ * empty list (no "accept anyone" fallback). Stock ar_ldy_gnd keeps every
+ * air unit it ever paired in a 100-entry ring (/factory/user_cfg.json
+ * bb_mac_addr_N) and pushes it this same way at boot and after each pair.
+ *
+ * Here: ap_mac in the baseband JSON stays the most recently paired air
+ * unit (ar8030-pair rewrites it on every bind), and the sidecar
+ * ar8030.peers holds every earlier one, newest first, one 8-hex-digit MAC
+ * per line. lc_peers_note_ap_mac() records a freshly paired ap_mac on the
+ * next CONNECT -- the connected MAC itself is not readable on the DEV,
+ * BB_GET_STATUS reports the configured ap_mac as the peer -- and
+ * lc_peers_push() hands the union to the chip. The air side stays single
+ * bind: its pair replaces its one candidate.
+ */
+
+#define LC_PEERS_FILE "ar8030.peers"
+
+static int mac_parse(const char* hex, bb_mac_t* mac)
+{
+    unsigned int b[BB_MAC_LEN];
+    if (strlen(hex) != 2 * BB_MAC_LEN || sscanf(hex, "%2x%2x%2x%2x", &b[0], &b[1], &b[2], &b[3]) != BB_MAC_LEN) {
+        return -1;
+    }
+    for (int i = 0; i < BB_MAC_LEN; i++) {
+        mac->addr[i] = (uint8_t)b[i];
+    }
+    return 0;
+}
+
+static void mac_hex(const bb_mac_t* mac, char out[2 * BB_MAC_LEN + 1])
+{
+    for (int i = 0; i < BB_MAC_LEN; i++) {
+        sprintf(out + i * 2, "%02x", mac->addr[i]);
+    }
+}
+
+static int mac_in(const bb_mac_t* mac, const bb_mac_t* tab, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (memcmp(mac, &tab[i], sizeof(*mac)) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int lc_pair_read_ap_mac(const char* cfg_path, bb_mac_t* out)
+{
+    FILE* f = fopen(cfg_path, "rb");
+    if (!f) {
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = (char*)malloc(len + 1);
+    if (!buf || fread(buf, 1, len, f) != (size_t)len) {
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    buf[len] = 0;
+    fclose(f);
+
+    cJSON* root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        return -1;
+    }
+    cJSON* baseband = cJSON_GetObjectItem(root, "baseband");
+    cJSON* basic    = baseband ? cJSON_GetObjectItem(baseband, "basic") : NULL;
+    cJSON* dev      = basic ? cJSON_GetObjectItem(basic, "dev") : NULL;
+    cJSON* apmac    = dev ? cJSON_GetObjectItem(dev, "ap_mac") : NULL;
+    int    ret      = -1;
+    if (apmac && cJSON_IsString(apmac) && mac_parse(apmac->valuestring, out) == 0) {
+        ret = 0;
+    }
+    cJSON_Delete(root);
+    return ret;
+}
+
+int lc_peers_load(const char* cfg_path, bb_mac_t* out, int max)
+{
+    char path[512];
+    lc_sidecar_path(cfg_path, LC_PEERS_FILE, path, sizeof(path));
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    int  n = 0;
+    char line[32];
+    while (n < max && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n \t")] = '\0';
+        bb_mac_t mac;
+        if (mac_parse(line, &mac) == 0 && !mac_in(&mac, out, n)) {
+            out[n++] = mac;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
+static int peers_save(const char* cfg_path, const bb_mac_t* tab, int n)
+{
+    char path[512], tmp_path[520];
+    lc_sidecar_path(cfg_path, LC_PEERS_FILE, path, sizeof(path));
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: peers: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        char hex[2 * BB_MAC_LEN + 1];
+        mac_hex(&tab[i], hex);
+        fprintf(f, "%s\n", hex);
+    }
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: peers: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    sync();
+    return 0;
+}
+
+/* ap_mac first, then the remembered ones, deduplicated. */
+static int peers_effective(const char* cfg_path, bb_mac_t* out, int max)
+{
+    int n = 0;
+    if (max > 0 && lc_pair_read_ap_mac(cfg_path, &out[0]) == 0) {
+        n = 1;
+    }
+    bb_mac_t known[BB_CONFIG_MAX_SLOT_CANDIDATE];
+    int      k = lc_peers_load(cfg_path, known, BB_CONFIG_MAX_SLOT_CANDIDATE);
+    for (int i = 0; i < k && n < max; i++) {
+        if (!mac_in(&known[i], out, n)) {
+            out[n++] = known[i];
+        }
+    }
+    return n;
+}
+
+int lc_peers_push(bb_dev_handle_t* handle, const char* cfg_path)
+{
+    bb_set_candidate_t candi;
+    memset(&candi, 0, sizeof(candi));
+    candi.slot    = 0;
+    candi.mac_num = (uint8_t)peers_effective(cfg_path, candi.mac_tab, BB_CONFIG_MAX_SLOT_CANDIDATE);
+    if (candi.mac_num == 0) {
+        return 0;
+    }
+    int ret = bb_ioctl(handle, BB_SET_CANDIDATES, &candi, NULL);
+    lc_log("lifecycle: peers: pushed %d known air unit(s) as candidates (ret=%d)", candi.mac_num, ret);
+    return ret;
+}
+
+int lc_peers_note_ap_mac(bb_dev_handle_t* handle, const char* cfg_path)
+{
+    bb_mac_t ap;
+    if (lc_pair_read_ap_mac(cfg_path, &ap) != 0) {
+        return -1;
+    }
+    bb_mac_t known[BB_CONFIG_MAX_SLOT_CANDIDATE];
+    int      n = lc_peers_load(cfg_path, known, BB_CONFIG_MAX_SLOT_CANDIDATE);
+    if (mac_in(&ap, known, n)) {
+        return 0;
+    }
+    /* Newest first; the oldest falls off a full list. */
+    if (n == BB_CONFIG_MAX_SLOT_CANDIDATE) {
+        n--;
+    }
+    memmove(&known[1], &known[0], (size_t)n * sizeof(known[0]));
+    known[0] = ap;
+    n++;
+    char hex[2 * BB_MAC_LEN + 1];
+    mac_hex(&ap, hex);
+    lc_log("lifecycle: peers: remembering air unit %s (%d known)", hex, n);
+    if (peers_save(cfg_path, known, n) != 0) {
+        return -1;
+    }
+    return lc_peers_push(handle, cfg_path);
+}
+
+int lc_peers_forget(const char* cfg_path, const char* mac_hex_in)
+{
+    bb_mac_t ap, target;
+    int      have_ap = lc_pair_read_ap_mac(cfg_path, &ap) == 0;
+    if (mac_hex_in && mac_parse(mac_hex_in, &target) != 0) {
+        return -1;
+    }
+    if (mac_hex_in && have_ap && memcmp(&target, &ap, sizeof(ap)) == 0) {
+        return -2;
+    }
+    bb_mac_t known[BB_CONFIG_MAX_SLOT_CANDIDATE];
+    int      n = lc_peers_load(cfg_path, known, BB_CONFIG_MAX_SLOT_CANDIDATE);
+    int      kept = 0;
+    for (int i = 0; i < n; i++) {
+        int is_ap = have_ap && memcmp(&known[i], &ap, sizeof(ap)) == 0;
+        int drop  = mac_hex_in ? memcmp(&known[i], &target, sizeof(target)) == 0 : !is_ap;
+        if (!drop) {
+            known[kept++] = known[i];
+        }
+    }
+    if (kept == n) {
+        return mac_hex_in ? -3 : 0;
+    }
+    lc_log("lifecycle: peers: forgot %d air unit(s), %d left", n - kept, kept);
+    return peers_save(cfg_path, known, kept) == 0 ? n - kept : -4;
+}
+
+int lc_peers_json(const char* cfg_path, char* out, size_t out_sz)
+{
+    bb_mac_t ap;
+    int      have_ap = lc_pair_read_ap_mac(cfg_path, &ap) == 0;
+    bb_mac_t tab[BB_CONFIG_MAX_SLOT_CANDIDATE];
+    int      n = peers_effective(cfg_path, tab, BB_CONFIG_MAX_SLOT_CANDIDATE);
+
+    char   hex[2 * BB_MAC_LEN + 1];
+    size_t len = 0;
+    if (have_ap) {
+        mac_hex(&ap, hex);
+    }
+    len += (size_t)snprintf(out + len, out_sz - len, "{\"ok\":true,\"current\":%s%s%s,\"max\":%d,\"peers\":[",
+                            have_ap ? "\"" : "", have_ap ? hex : "null", have_ap ? "\"" : "",
+                            BB_CONFIG_MAX_SLOT_CANDIDATE);
+    for (int i = 0; i < n && len < out_sz; i++) {
+        mac_hex(&tab[i], hex);
+        len += (size_t)snprintf(out + len, out_sz - len, "%s\"%s\"", i ? "," : "", hex);
+    }
+    if (len < out_sz) {
+        snprintf(out + len, out_sz - len, "]}");
+    }
+    return len < out_sz - 2 ? 0 : -1;
 }

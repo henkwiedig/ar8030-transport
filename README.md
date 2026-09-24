@@ -1998,6 +1998,26 @@ design rationale):
   runs (`lifecycle_pair.c`'s `lc_pair_run()`), for boards with no
   physical button or for triggering a rebind remotely:
   `curl -X POST http://<host>:8899/api/v1/pair`.
+- **`GET /api/v1/peers`** (ground only) -- multi-bind: every air unit this
+  ground accepts. The ground (DEV) links to its `ap_mac` *or* to any MAC in
+  its candidate list (`BB_SET_CANDIDATES`, up to 100 -- needs the SDK's
+  `BB_HAVE_CANDIDATES_100` patch; with an empty list and a wrong `ap_mac`
+  it does not link, there is no "accept anyone" fallback). `ap_mac` in the
+  baseband JSON stays the latest pair (`ar8030-pair` rewrites it); every
+  air unit ever paired is remembered in the `ar8030.peers` sidecar next to
+  it, newest first, recorded on the first CONNECT after a pair (the DEV
+  can't read the connected AP's MAC -- `BB_GET_STATUS` echoes `ap_mac`).
+  Both go to the chip at every start and after every change, so the ground
+  relinks to whichever known air unit is powered. Same scheme as stock
+  `ar_ldy_gnd`'s 100-entry `bb_mac_addr_N` ring. The air side stays single
+  bind: its pair replaces its one candidate.
+  ```
+  {"ok":true,"current":"e664e39d","max":100,"peers":["e664e39d","cafebabe"]}
+  ```
+- **`POST /api/v1/peers/forget?mac=<8 hex digits>`** / **`?all=1`** --
+  stop accepting one remembered air unit, or all but the current one;
+  applied on the lifecycle thread's next tick (202). The current one can't
+  be forgotten (409) -- binding another replaces it.
 - **`POST /api/v1/bandwidth?mhz=<1|2|5|10|20|40>`** -- the *persisted*
   way to change bandwidth: queues the request for the lifecycle thread
   to persist (`lc_tuning_save()`, sticks across the next reconnect) and

@@ -187,6 +187,11 @@ struct lifecycle_ctx {
     int pending_channel_valid;
     int pending_channel;
 
+    /* lifecycle_request_forget_peer()'s mailbox, same cmd_lock. */
+    int  pending_forget_valid;
+    int  pending_forget_all;
+    char pending_forget_mac[2 * BB_MAC_LEN + 1];
+
     /* Wanted channel (index, LC_CHANNEL_AUTO or LC_CHANNEL_NONE): the
      * persisted one, else cfg.default_channel -- AP only, always
      * LC_CHANNEL_NONE on the DEV (see lc_channel_track()). Written only by
@@ -713,6 +718,28 @@ static void lc_poll_distance(lifecycle_ctx* ctx)
     pthread_mutex_unlock(&ctx->status_lock);
 }
 
+/* Drains lifecycle_request_forget_peer()'s mailbox: drops the air unit(s)
+ * from ar8030.peers and hands the chip the shorter candidate list. */
+static void lc_drain_forget_request(lifecycle_ctx* ctx)
+{
+    int  valid, all;
+    char mac[2 * BB_MAC_LEN + 1];
+    pthread_mutex_lock(&ctx->cmd_lock);
+    valid                     = ctx->pending_forget_valid;
+    all                       = ctx->pending_forget_all;
+    memcpy(mac, ctx->pending_forget_mac, sizeof(mac));
+    ctx->pending_forget_valid = 0;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (!valid) {
+        return;
+    }
+    lc_log("lifecycle: http: forget %s requested", all ? "all earlier air units" : mac);
+    if (lc_peers_forget(ctx->cfg.cfg_path, all ? NULL : mac) > 0) {
+        lc_peers_push(ctx->client.handle, ctx->cfg.cfg_path);
+    }
+}
+
 /* Drains lifecycle_request_power()'s mailbox: persists, then applies right
  * away (chip-wide, no link needed). */
 static void lc_drain_power_request(lifecycle_ctx* ctx)
@@ -998,6 +1025,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_retx_request(ctx);
         lc_drain_channel_request(ctx);
         lc_drain_power_request(ctx);
+        lc_drain_forget_request(ctx);
         lc_poll_distance(ctx);
         lc_poll_sock_info(ctx);
         lc_poll_quality(ctx);
@@ -1032,6 +1060,10 @@ void* lifecycle_thread_main(void* arg)
                 lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, ctx->connected_slot, NULL);
                 lc_apply_tuning_on_connect(ctx, ctx->connected_slot);
                 lc_channel_on_connect(ctx);
+                /* A fresh pair rewrote ap_mac: remember it for multi-bind. */
+                if (ctx->cfg.role == LC_ROLE_DEV && ctx->cfg.cfg_path[0]) {
+                    lc_peers_note_ap_mac(ctx->client.handle, ctx->cfg.cfg_path);
+                }
                 break;
             }
             ctx->connect_confirm_count = 0;
@@ -1229,6 +1261,45 @@ int lifecycle_request_power(lifecycle_ctx* ctx, int level)
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_power       = level;
     ctx->pending_power_valid = 1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_forget_peer(lifecycle_ctx* ctx, const char* mac_hex)
+{
+    if (ctx->cfg.role != LC_ROLE_DEV || !ctx->cfg.cfg_path[0]) {
+        return -4;
+    }
+    if (mac_hex) {
+        bb_mac_t mac, ap, known[BB_CONFIG_MAX_SLOT_CANDIDATE];
+        unsigned b[BB_MAC_LEN];
+        if (strlen(mac_hex) != 2 * BB_MAC_LEN ||
+            sscanf(mac_hex, "%2x%2x%2x%2x", &b[0], &b[1], &b[2], &b[3]) != BB_MAC_LEN) {
+            return -1;
+        }
+        for (int i = 0; i < BB_MAC_LEN; i++) {
+            mac.addr[i] = (uint8_t)b[i];
+        }
+        if (lc_pair_read_ap_mac(ctx->cfg.cfg_path, &ap) == 0 && memcmp(&ap, &mac, sizeof(mac)) == 0) {
+            return -2;
+        }
+        int n = lc_peers_load(ctx->cfg.cfg_path, known, BB_CONFIG_MAX_SLOT_CANDIDATE), found = 0;
+        for (int i = 0; i < n && !found; i++) {
+            found = memcmp(&known[i], &mac, sizeof(mac)) == 0;
+        }
+        if (!found) {
+            return -3;
+        }
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_forget_all = mac_hex == NULL;
+    snprintf(ctx->pending_forget_mac, sizeof(ctx->pending_forget_mac), "%s", mac_hex ? mac_hex : "");
+    for (char* c = ctx->pending_forget_mac; *c; c++) {
+        if (*c >= 'A' && *c <= 'F') {
+            *c = (char)(*c - 'A' + 'a');
+        }
+    }
+    ctx->pending_forget_valid = 1;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }

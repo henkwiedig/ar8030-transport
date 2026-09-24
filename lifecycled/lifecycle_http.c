@@ -560,6 +560,56 @@ static void handle_pair(lifecycle_http_ctx* http, int fd)
     }
 }
 
+/* GET /api/v1/peers -- the air units this ground accepts (multi-bind, see
+ * lifecycle_pair.h): "current" is the latest pair (the JSON's ap_mac),
+ * "peers" every accepted one, current first. DEV side only. */
+static void handle_peers(lifecycle_http_ctx* http, int fd)
+{
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+    if (cfg->role != LC_ROLE_DEV || !cfg->cfg_path[0]) {
+        send_json(fd, 404, "Not Found", "{\"ok\":false,\"error\":\"multi-bind is a ground (dev) feature\"}");
+        return;
+    }
+    char json[16 + BB_CONFIG_MAX_SLOT_CANDIDATE * 12 + 96];
+    if (lc_peers_json(cfg->cfg_path, json, sizeof(json)) != 0) {
+        send_json(fd, 500, "Internal Server Error", "{\"ok\":false,\"error\":\"peer list too long\"}");
+        return;
+    }
+    send_json(fd, 200, "OK", json);
+}
+
+/* POST /api/v1/peers/forget?mac=<8 hex digits> -- stop accepting one
+ * remembered air unit; ?all=1 forgets every one but the current. The
+ * current one can only be replaced by binding another. */
+static void handle_peers_forget(lifecycle_http_ctx* http, int fd, const char* query)
+{
+    char mac[16], all[4];
+    int  have_mac = query_param(query, "mac", mac, sizeof(mac)) == 0;
+    int  want_all = query_param(query, "all", all, sizeof(all)) == 0 && strcmp(all, "1") == 0;
+    if (have_mac == want_all) {
+        send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"pass either mac=<8 hex digits> or all=1\"}");
+        return;
+    }
+    switch (lifecycle_request_forget_peer(http->lc, have_mac ? mac : NULL)) {
+    case 0:
+        send_json(fd, 202, "Accepted", "{\"ok\":true}");
+        return;
+    case -1:
+        send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"mac must be 8 hex digits\"}");
+        return;
+    case -2:
+        send_json(fd, 409, "Conflict",
+                  "{\"ok\":false,\"error\":\"that is the current air unit; bind another to replace it\"}");
+        return;
+    case -3:
+        send_json(fd, 404, "Not Found", "{\"ok\":false,\"error\":\"not a remembered air unit\"}");
+        return;
+    default:
+        send_json(fd, 404, "Not Found", "{\"ok\":false,\"error\":\"multi-bind is a ground (dev) feature\"}");
+        return;
+    }
+}
+
 static void handle_bandwidth(lifecycle_http_ctx* http, int fd, const char* query)
 {
     int mhz;
@@ -1017,6 +1067,10 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_rf_temp(http, fd);
     } else if (strcmp(path, "/api/v1/batt") == 0) {
         handle_batt(http, fd);
+    } else if (strcmp(path, "/api/v1/peers") == 0) {
+        handle_peers(http, fd);
+    } else if (strcmp(path, "/api/v1/peers/forget") == 0 && strcmp(method, "POST") == 0) {
+        handle_peers_forget(http, fd, query);
     } else if (strcmp(path, "/api/v1/linkctl") == 0) {
         handle_linkctl(fd, query);
     } else {

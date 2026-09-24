@@ -18,6 +18,10 @@ extern "C" {
  * ar8030-linkctl's own cmd_status() comment.
  */
 
+/* <dir of cfg_path>/<name>: every sidecar lives next to the baseband JSON
+ * it belongs to (ar8030.tuning, ar8030.channel, ar8030.peers, ...). */
+void lc_sidecar_path(const char* cfg_path, const char* name, char* out, size_t out_sz);
+
 /* Non-zero if mhz is one of the AR8030's actual bandwidth gears
  * (1/2/5/10/20/40 -- see BW_MHZ_BY_ENUM). Exported so callers outside
  * this file (the HTTP control API) can reject a bad value up front with

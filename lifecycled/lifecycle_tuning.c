@@ -36,7 +36,7 @@ int lc_tuning_valid_mhz(int mhz)
 
 /* <dir of cfg_path>/<name> -- every sidecar this file owns lives next to
  * the baseband JSON it tunes. */
-static void sidecar_path(const char* cfg_path, const char* name, char* out, size_t out_sz)
+void lc_sidecar_path(const char* cfg_path, const char* name, char* out, size_t out_sz)
 {
     const char* slash = strrchr(cfg_path, '/');
     if (slash) {
@@ -53,7 +53,7 @@ static void sidecar_path(const char* cfg_path, const char* name, char* out, size
 
 static void tuning_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
 {
-    sidecar_path(cfg_path, "ar8030.tuning", out, out_sz);
+    lc_sidecar_path(cfg_path, "ar8030.tuning", out, out_sz);
 }
 
 int lc_tuning_load(const char* cfg_path)
@@ -163,7 +163,7 @@ int lc_retx_valid(int win, int busy, int idle, int conti_busy, int conti_idle)
 
 static void retx_sidecar_path(const char* cfg_path, char* out, size_t out_sz)
 {
-    sidecar_path(cfg_path, "ar8030.retx", out, out_sz);
+    lc_sidecar_path(cfg_path, "ar8030.retx", out, out_sz);
 }
 
 int lc_retx_load(const char* cfg_path, bb_retx_cfg_t* out)
@@ -272,7 +272,7 @@ int lc_channel_parse(const char* s, int* out)
 int lc_channel_load(const char* cfg_path, int* out)
 {
     char path[512];
-    sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
+    lc_sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
 
     FILE* f = fopen(path, "r");
     if (!f) {
@@ -298,7 +298,7 @@ int lc_channel_save(const char* cfg_path, int chan)
     }
 
     char path[512];
-    sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
+    lc_sidecar_path(cfg_path, "ar8030.channel", path, sizeof(path));
     char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
 
@@ -502,7 +502,7 @@ void lc_power_levels_json(int is_ap, char* out, size_t out_sz)
 int lc_power_load(const char* cfg_path, int* out)
 {
     char path[512];
-    sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
+    lc_sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
 
     FILE* f = fopen(path, "r");
     if (!f) {
@@ -528,7 +528,7 @@ int lc_power_save(const char* cfg_path, int level)
     }
 
     char path[512];
-    sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
+    lc_sidecar_path(cfg_path, "ar8030.power", path, sizeof(path));
     char tmp_path[520];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
 
