@@ -117,6 +117,12 @@ static void usage(const char *argv0)
             "      with [file], writes the raw bytes there (else hex dump) --\n"
             "      for diffing stock vs ours.\n"
             "\n"
+            "  distance [-n count] [-i ms]\n"
+            "      Reads BB_GET_DISTC_RESULT for every slot, count times (default\n"
+            "      10) every ms milliseconds (default 500). Raw units: -1 = no\n"
+            "      ranging result, >= 0 = result after the chip subtracts\n"
+            "      ar8030.json's dist_calc.offset.\n"
+            "\n"
             "  rf-temp [-c channel] [-a]\n"
             "      RF-board temperature from the AR8030's own ADC (default channel 4,\n"
             "      the Caddx Ascent's thermistor): BB_GET_PRJ_DISPATCH 0x89, mapped\n"
@@ -673,38 +679,13 @@ static int cmd_status(int argc, char **argv)
         }
     }
 
-    /* Ranging ("dist_calc" in ar8030.json -- enable/window/timeout/offset,
-     * matching bb_conf_distc_t's own fields exactly) has *never* actually
-     * produced a result on real hardware despite that config already
-     * having enable:true, which is exactly the symptom
-     * lc_pair_apply_known_candidate() (lifecycle_pair.c) already hit for
-     * pairing candidates: BB_SET_CANDIDATES/BB_SET_AP_MAC live in the
-     * chip's volatile RAM and are confirmed (via decompile of stock
-     * ar_ldy_gnd) to NOT be loaded from the on-disk JSON at boot --
-     * something has to push them live every time. Testing the same
-     * suspicion here: push BB_CFG_DISTC live, with the identical
-     * enable/window/timeout/offset values already sitting unused in
-     * ar8030.json, immediately before reading BB_GET_DISTC_RESULT below,
-     * and log its return so a run on real hardware shows straight away
-     * whether the chip even accepts this command (this SDK build has
-     * already been caught silently not implementing at least one other
-     * BB_CFG_* command -- BB_CFG_SLOT_RX_MCS's bw_auto policy, "req 5 not
-     * found", see this file's own top-of-file comment) or whether it's
-     * accepted but ranging still needs something else. Raw units: the
-     * SDK's own doc comment gives no calibrated unit (just "-1 = no
-     * ranging result, >= 0 = ranging result"), so this prints the raw
-     * value rather than fabricate a meters conversion with no source for
-     * the scale factor. Read for every configured slot, same cfg_sbmp
-     * filter as the link_status loop above. */
-    bb_conf_distc_t distc_cfg = {
-        .enable  = 1,
-        .window  = 3,
-        .timeout = 63,
-        .offset  = 20,
-    };
-    int distc_ret = bb_ioctl(g_hbb, BB_CFG_DISTC, &distc_cfg, NULL);
-    printf("BB_CFG_DISTC(enable=1,window=3,timeout=63,offset=20): ret=%d\n", distc_ret);
-
+    /* Ranging result for every configured slot (same cfg_sbmp filter as the
+     * link_status loop above). Configured only by ar8030.json's dist_calc
+     * at chip load -- BB_CFG_DISTC at runtime is rejected (ret=-2), and the
+     * stock streamers never send it either. The chip subtracts
+     * dist_calc.offset and clamps at 0, so a short-range link can read 0.
+     * Raw units: no calibrated scale is known (the SDK only says -1 = no
+     * result). `ar8030-linkctl distance` samples it repeatedly. */
     bb_get_distc_result_in_t dist_in = { .slot_bmp = st_out.cfg_sbmp };
     bb_get_distc_result_out_t dist_out;
     memset(&dist_out, 0, sizeof(dist_out));
@@ -1493,6 +1474,34 @@ static int cmd_prj_cmd(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_distance(int argc, char **argv)
+{
+    int count = 10, interval_ms = 500, opt;
+    optind = 1;
+    while ((opt = getopt(argc, argv, "n:i:")) != -1) {
+        if (opt == 'n')
+            count = atoi(optarg);
+        else if (opt == 'i')
+            interval_ms = atoi(optarg);
+        else
+            return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        bb_get_distc_result_in_t  in = { .slot_bmp = 0xff };
+        bb_get_distc_result_out_t out;
+        memset(&out, 0xa5, sizeof(out)); /* spot slots the chip never writes */
+        int ret = bb_ioctl(g_hbb, BB_GET_DISTC_RESULT, &in, &out);
+        printf("ret=%d", ret);
+        for (int s = 0; s < BB_SLOT_MAX; s++)
+            printf(" s%d=%d", s, out.distance[s]);
+        printf("\n");
+        fflush(stdout);
+        if (i + 1 < count)
+            usleep((useconds_t)interval_ms * 1000);
+    }
+    return 0;
+}
+
 static int cmd_rf_temp(int argc, char **argv)
 {
     int channel = AR8030_RFTEMP_DEFAULT_ADC, force_arm = 0, opt;
@@ -1704,6 +1713,8 @@ int main(int argc, char **argv)
         rc = cmd_frame_change(argc - 1, argv + 1);
     else if (!strcmp(cmd, "cfg-dump"))
         rc = cmd_cfg_dump(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "distance"))
+        rc = cmd_distance(argc - 1, argv + 1);
     else if (!strcmp(cmd, "rf-temp"))
         rc = cmd_rf_temp(argc - 1, argv + 1);
     else if (!strcmp(cmd, "prj-cmd"))
