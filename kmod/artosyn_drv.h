@@ -92,8 +92,17 @@ struct artosyn_dev {
 	void *rx_scratch;              /* SDIO_TRANS_MAX_SZIE, drain target if alloc_skb() fails */
 	atomic_t open_count;
 
+	/* link_trailer=1 only: SDIO_TRANS_MAX_SZIE staging buffer each RPC
+	 * frame is copied into so the { 0x00, type, len } trailer can be
+	 * appended to its last block (see artosyn_write_trailer()). */
+	u8 *tx_stage;
+
 	/* Counters, reported via the netdev's sysfs stats file. */
 	unsigned long irq_events;
+	unsigned long tx_trailer_drops;  /* frame larger than the chip's TX grant */
+	unsigned long rx_trailer_errors; /* transfer without a parseable trailer run */
+	unsigned long rx_trailer_ip;     /* 0xCC IPv4-tunnel runs (not handled, dropped) */
+	unsigned long rx_trailer_ack;    /* 0xEE flow-control runs (ignored) */
 	unsigned long rx_transfers;
 	unsigned long rx_transfer_bytes;
 	unsigned long rx_errors;
