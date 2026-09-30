@@ -39,6 +39,9 @@ SRCS := \
 	main.c \
 	rtp_h265.c \
 	idr_relay.c \
+	clock_sync.c \
+	sidecar_srv.c \
+	$(COMMON)/timing_sei.c \
 	$(COMMON)/chunker.c \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/reassembly.c \

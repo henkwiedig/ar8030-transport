@@ -2,6 +2,7 @@
 #define AR8030_TRANSPORT_IDR_CTRL_H
 
 #include "ar8030_link.h"
+#include "outq.h"
 
 /*
  * Air side of the keyframe request path (see rx/idr_relay.h): reads the
@@ -18,6 +19,10 @@
  *    requests less than 100 ms apart -- so without this one burst could
  *    force up to three keyframes. A request that PixelPilot repeats
  *    because no IDR arrived comes after the window and gets through.
+ *
+ * The same reader answers the ground's clock-sync probes ("SYNC", see
+ * common/ar8030_chunk.h): t2 is stamped as soon as the chunk is read and
+ * the reply is queued on outq; tx/main.c stamps t3 when it writes it.
  */
 
 typedef struct {
@@ -27,6 +32,7 @@ typedef struct {
     int coalesce_ms;           /* 0 = honor every new token */
     int dedup_ms;
     int verbose;
+    tx_outq_t *outq;           /* SYNCR replies; NULL = don't answer SYNC */
     const volatile int *stop_flag;
 } idr_ctrl_cfg_t;
 

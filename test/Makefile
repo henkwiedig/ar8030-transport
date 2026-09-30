@@ -30,16 +30,27 @@ SRCS := \
 	$(RX)/rtp_h265.c
 OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(SRCS:.c=.o)))
 
+TIMING_SRCS := \
+	timing_test.c \
+	$(COMMON)/timing_sei.c \
+	$(RX)/clock_sync.c
+TIMING_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(TIMING_SRCS:.c=.o)))
+
 TARGET := roundtrip_test
+TIMING_TARGET := timing_test
 
 .PHONY: all check clean
-all: $(TARGET)
+all: $(TARGET) $(TIMING_TARGET)
 
-check: $(TARGET)
+check: $(TARGET) $(TIMING_TARGET)
 	./$(TARGET)
+	./$(TIMING_TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(ALL_CFLAGS) -o $@ $(OBJS)
+
+$(TIMING_TARGET): $(TIMING_OBJS)
+	$(CC) $(ALL_CFLAGS) -o $@ $(TIMING_OBJS) -lpthread
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -54,4 +65,4 @@ $(BUILD_DIR)/%.o: $(RX)/%.c | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 clean:
-	rm -rf $(TARGET) $(BUILD_DIR)
+	rm -rf $(TARGET) $(TIMING_TARGET) $(BUILD_DIR)

@@ -2,6 +2,7 @@
 #define AR8030_TRANSPORT_IDR_RELAY_H
 
 #include "ar8030_link.h"
+#include "clock_sync.h"
 
 /*
  * Keyframe requests from PixelPilot to the air unit.
@@ -16,11 +17,16 @@
  * stream) and written as one AR8030_CHUNK_CODEC_CTRL "IDR <token>" chunk
  * into the reverse direction of the video socket, where
  * ar8030-transport-tx turns it into the waybeam call (tx/idr_ctrl.c).
+ *
+ * This thread is the ground's only writer into that reverse direction, so
+ * it also sends the clock-sync probes ("SYNC", rx/clock_sync.h) when they
+ * are due -- with udp_port 0 it does only that.
  */
 
 typedef struct {
     ar8030_link_t *link;           /* sockfd loaded atomically per write */
-    int udp_port;                  /* 11223 like alink_idr */
+    int udp_port;                  /* 11223 like alink_idr, 0 = no keyframe relay */
+    clock_sync_t *sync;            /* NULL = no clock-sync probes */
     int verbose;
     const volatile int *stop_flag;
 } idr_relay_cfg_t;

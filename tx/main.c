@@ -21,10 +21,13 @@
 #include "bitrate_ctl.h"
 #include "idr_ctrl.h"
 #include "chunker.h"
+#include "outq.h"
+#include "sidecar_sub.h"
 #include "venc_frame_ring.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
@@ -145,6 +148,7 @@ struct tx_args {
     int idr_coalesce_ms;
     uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
     double ring_backoff;         /* bitrate multiplier per URGENT cut */
+    int sidecar_port;            /* waybeam outgoing.sidecarPort to forward, 0 = off */
     int verbose;
 };
 
@@ -174,6 +178,9 @@ static void usage(const char *argv0)
             "                 the ground's keyframe requests -- -N disables those)\n"
             "  -i <ms>        coalesce keyframe requests within this window (default %d, 0 = honor\n"
             "                 every one; PixelPilot sends 3 per request, 100 ms apart)\n"
+            "  -S <port>      forward waybeam's RTP timing sidecar from this loopback UDP port\n"
+            "                 (waybeam outgoing.sidecarPort) to the ground (default 0 = off)\n"
+
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
@@ -203,10 +210,14 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->idr_coalesce_ms = DEFAULT_IDR_COALESCE_MS;
     a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
     a->ring_backoff = 0.92;
+    a->sidecar_port = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:XNvh")) != -1) {
         switch (opt) {
+        case 'S':
+            a->sidecar_port = atoi(optarg);
+            break;
         case 'i':
             a->idr_coalesce_ms = atoi(optarg);
             break;
@@ -294,6 +305,13 @@ struct tx_stats {
     uint64_t chunks_sent;
     uint64_t chunks_failed;
     uint64_t bytes_sent;
+    /* Time from the first bb_socket_write() of a video frame until its
+     * last one returned, per stats interval: the air's own share of the
+     * link (RPC + ar8030d + SDIO + chip buffer backpressure). */
+    uint64_t write_us_sum;
+    uint64_t write_us_max;
+    uint64_t write_frames;
+    uint64_t age_at_send_us_sum; /* capture -> first write of the frame */
 };
 
 struct tx_send_ctx {
@@ -301,7 +319,103 @@ struct tx_send_ctx {
     int write_timeout_ms;
     const volatile int *stop_flag;
     struct tx_stats *stats;
+    /* Non-video chunks (tx/outq.h) ride in the same bb_socket_write() as
+     * the next video chunk -- see stage_outq(). combo holds them followed
+     * by that chunk; aux_scratch builds one of them at a time. */
+    tx_outq_t *outq;
+    uint32_t aux_payload_max;
+    uint16_t aux_seq;
+    uint8_t *combo;
+    uint32_t combo_cap;
+    uint32_t combo_len;
+    uint8_t aux_scratch[AR8030_CHUNK_HDR_SIZE + AR8030_SIDECAR_MAX_PAYLOAD];
 };
+
+static uint64_t now_monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+/* Writes buf whole, retrying on partial progress -- see
+ * chunk_send_to_socket() for why partial progress is not a failure. */
+static int write_all(struct tx_send_ctx *sc, const uint8_t *buf, uint32_t len)
+{
+    uint32_t sent = 0;
+    while (sent < len) {
+        if (sc->stop_flag && *sc->stop_flag)
+            return -1;
+
+        int wr = bb_socket_write(sc->link->sockfd, buf + sent, len - sent, sc->write_timeout_ms);
+        if (wr <= 0) {
+            fprintf(stderr, "tx: bb_socket_write made no progress (len=%u, sent=%u, ret=%d)\n", len,
+                    sent, wr);
+            return -1;
+        }
+        sent += (uint32_t)wr;
+    }
+    return 0;
+}
+
+/* ar8030_chunk_send_fn that appends into sc->combo instead of writing. */
+static int append_to_combo(void *ctx, const uint8_t *buf, uint32_t len)
+{
+    struct tx_send_ctx *sc = (struct tx_send_ctx *)ctx;
+    if (sc->combo_len + len > sc->combo_cap)
+        return -1;
+    memcpy(sc->combo + sc->combo_len, buf, len);
+    sc->combo_len += len;
+    return 0;
+}
+
+/* Moves everything tx/outq.h holds -- SYNCR replies and tunnelled sidecar
+ * datagrams -- into sc->combo as whole single-chunk frames, for the caller
+ * to write together with a video chunk.
+ *
+ * Why not write them on their own: each bb_socket_write() is a round trip
+ * to ar8030d, and one extra per frame (the sidecar sends one datagram per
+ * frame) measurably delayed reading the next frame off the ring. Stream
+ * mode has no write boundaries, so sharing a write costs nothing, and the
+ * ground routes every non-video chunk away before reassembly, so landing
+ * between two chunks of one frame is harmless.
+ *
+ * A SYNCR's t3 is stamped here, right before the write that carries it:
+ * however long the reply waited for that write shows up in t3-t2 (the
+ * air's own turnaround), which the ground's offset formula removes. */
+static void stage_outq(struct tx_send_ctx *sc)
+{
+    tx_outq_item_t item;
+    while (sc->outq && tx_outq_pop(sc->outq, &item)) {
+        const uint8_t *data = item.data;
+        uint32_t len = item.len;
+        char syncr[AR8030_CTRL_MAX_PAYLOAD];
+        if (item.is_syncr) {
+            int n = snprintf(syncr, sizeof(syncr), "SYNCR %" PRIx32 " %" PRIx64 " %" PRIx64 " %" PRIx64,
+                             item.sync_seq, item.t1_us, item.t2_us, now_monotonic_us());
+            if (n <= 0 || (size_t)n >= sizeof(syncr))
+                continue;
+            data = (const uint8_t *)syncr;
+            len = (uint32_t)n;
+        }
+        if (len == 0 || len > sc->aux_payload_max)
+            continue; /* the ground only accepts these as one chunk */
+        uint32_t chunks = 0;
+        ar8030_chunk_frame(sc->aux_seq++, 0, item.codec, 0, data, len, sc->aux_payload_max, append_to_combo, sc,
+                           &chunks, sc->aux_scratch, sizeof(sc->aux_scratch));
+    }
+}
+
+/* Writes whatever is queued on its own, for when no video is flowing to
+ * carry it (a SYNCR must still get answered then). */
+static void flush_outq(struct tx_send_ctx *sc)
+{
+    sc->combo_len = 0;
+    stage_outq(sc);
+    if (sc->combo_len)
+        write_all(sc, sc->combo, sc->combo_len);
+    sc->combo_len = 0;
+}
 
 /* ar8030_chunk_send_fn for ar8030_chunk_frame(): writes one whole chunk,
  * retrying on partial progress rather than treating it as failure.
@@ -322,20 +436,23 @@ struct tx_send_ctx {
 static int chunk_send_to_socket(void *ctx, const uint8_t *buf, uint32_t len)
 {
     struct tx_send_ctx *sc = (struct tx_send_ctx *)ctx;
-    uint32_t sent = 0;
 
-    while (sent < len) {
-        if (sc->stop_flag && *sc->stop_flag)
-            return -1;
-
-        int wr = bb_socket_write(sc->link->sockfd, buf + sent, len - sent, sc->write_timeout_ms);
-        if (wr <= 0) {
-            fprintf(stderr, "tx: bb_socket_write made no progress (len=%u, sent=%u, ret=%d)\n", len,
-                    sent, wr);
-            sc->stats->chunks_failed++;
-            return -1;
-        }
-        sent += (uint32_t)wr;
+    /* Queued non-video chunks go first, in the same write (stage_outq()). */
+    sc->combo_len = 0;
+    stage_outq(sc);
+    int ret;
+    if (sc->combo_len && sc->combo_len + len <= sc->combo_cap) {
+        memcpy(sc->combo + sc->combo_len, buf, len);
+        ret = write_all(sc, sc->combo, sc->combo_len + len);
+    } else {
+        ret = sc->combo_len ? write_all(sc, sc->combo, sc->combo_len) : 0;
+        if (ret == 0)
+            ret = write_all(sc, buf, len);
+    }
+    sc->combo_len = 0;
+    if (ret != 0) {
+        sc->stats->chunks_failed++;
+        return -1;
     }
     sc->stats->chunks_sent++;
     sc->stats->bytes_sent += len;
@@ -607,13 +724,22 @@ int main(int argc, char **argv)
                                         * Ghidra, not in the SDK's own bb_event_e) */
     bc_cfg.stop_flag = &g_stop;
 
+    tx_outq_t outq;
+    tx_outq_init(&outq);
+
     idr_ctrl_cfg_t idr_cfg = {
         .link = &link, .waybeam_host = args.waybeam_host, .waybeam_port = args.waybeam_port,
         .coalesce_ms = args.idr_coalesce_ms, .dedup_ms = 2000 /* alink_idr's --keep-ms default */,
-        .verbose = args.verbose, .stop_flag = &g_stop
+        .verbose = args.verbose, .outq = &outq, .stop_flag = &g_stop
     };
     pthread_t idr_thread;
     int idr_thread_ok = args.sock_bidir && pthread_create(&idr_thread, NULL, idr_ctrl_thread_main, &idr_cfg) == 0;
+
+    sidecar_sub_cfg_t sc_cfg = {
+        .port = args.sidecar_port, .outq = &outq, .verbose = args.verbose, .stop_flag = &g_stop
+    };
+    pthread_t sc_thread;
+    int sc_thread_ok = args.sidecar_port > 0 && pthread_create(&sc_thread, NULL, sidecar_sub_thread_main, &sc_cfg) == 0;
 
     pthread_t bc_thread;
     int bc_thread_ok = (pthread_create(&bc_thread, NULL, bitrate_thread_main, &bc_cfg) == 0);
@@ -646,8 +772,19 @@ int main(int argc, char **argv)
     double stats_last_print = now_monotonic_s();
 
     struct tx_send_ctx send_ctx = {
-        .link = &link, .write_timeout_ms = args.write_timeout_ms, .stop_flag = &g_stop, .stats = &stats
+        .link = &link, .write_timeout_ms = args.write_timeout_ms, .stop_flag = &g_stop, .stats = &stats,
+        .outq = &outq,
+        .aux_payload_max = args.chunk_payload < AR8030_SIDECAR_MAX_PAYLOAD ? args.chunk_payload
+                                                                           : AR8030_SIDECAR_MAX_PAYLOAD,
     };
+    /* Room for a full outq's worth of aux chunks plus one video chunk. */
+    send_ctx.combo_cap = TX_OUTQ_DEPTH * (AR8030_CHUNK_HDR_SIZE + AR8030_SIDECAR_MAX_PAYLOAD) +
+                         AR8030_CHUNK_HDR_SIZE + args.chunk_payload;
+    send_ctx.combo = malloc(send_ctx.combo_cap);
+    if (!send_ctx.combo) {
+        fprintf(stderr, "tx: OOM allocating %u-byte write buffer\n", send_ctx.combo_cap);
+        g_stop = 1;
+    }
     /* Consecutive frames where not even the first chunk got written --
      * see BACKOFF_AFTER_CONSECUTIVE_STALLS. A frame that sent *some*
      * chunks before failing resets this: that is ordinary loss, not
@@ -656,11 +793,26 @@ int main(int argc, char **argv)
     double last_health_check_s = now_monotonic_s();
 
     uint16_t frame_seq = 0;
+    /* air CLOCK_MONOTONIC (low 32 bits, us) minus the frame's pts when it
+     * was read off the ring. The ground's latency figures assume pts is
+     * CLOCK_MONOTONIC too, so this must be a small positive number (encode
+     * + ring wait); logged for the first frames and with -v. */
+    int32_t pts_age_us = 0;
+    int pts_age_logged = 0;
     while (!g_stop) {
         if (args.verbose) {
             double now = now_monotonic_s();
             if (now - stats_last_print >= STATS_INTERVAL_S) {
                 print_tx_stats(&stats, &stats_prev, now - stats_last_print, ring);
+                uint64_t wf = stats.write_frames - stats_prev.write_frames;
+                fprintf(stderr, "tx stats: pts age %.2f ms | capture->write start %.2f ms avg | frame write %.2f ms avg, "
+                        "%.2f max | sidecar forwarded=%llu | outq dropped=%llu\n",
+                        pts_age_us / 1000.0,
+                        wf ? (stats.age_at_send_us_sum - stats_prev.age_at_send_us_sum) / 1000.0 / wf : 0.0,
+                        wf ? (stats.write_us_sum - stats_prev.write_us_sum) / 1000.0 / wf : 0.0,
+                        stats.write_us_max / 1000.0, (unsigned long long)sc_cfg.forwarded,
+                        (unsigned long long)outq.dropped);
+                stats.write_us_max = 0;
                 stats_prev = stats;
                 stats_last_print = now;
             }
@@ -741,6 +893,11 @@ int main(int argc, char **argv)
         uint32_t out_len = 0;
         int ret = venc_frame_ring_read_wait(ring, ring_buf, ring_buf_size, &out_len, 200);
         if (ret != 0) {
+            /* No frame to carry queued SYNCR replies / sidecar datagrams
+             * (see stage_outq()): send them on their own. */
+            if (send_ctx.combo)
+                flush_outq(&send_ctx);
+
             /* A read timeout is also the cheapest place to notice waybeam
              * restarted out from under us (see stat_named_shm()'s own
              * comment) -- at this project's normal fps a healthy ring
@@ -810,12 +967,26 @@ int main(int argc, char **argv)
         const uint8_t *frame_data = ring_buf + VENC_FRAME_META_SIZE;
         uint32_t frame_len = out_len - VENC_FRAME_META_SIZE;
 
+        pts_age_us = (int32_t)((uint32_t)now_monotonic_us() - meta.pts);
+        if (pts_age_logged < 5) {
+            pts_age_logged++;
+            fprintf(stderr, "tx: pts age %d us (air CLOCK_MONOTONIC - frame pts; expect a few ms)\n",
+                    pts_age_us);
+        }
+
         stats.frames_in++;
         uint32_t expected_chunks = 0;
+        uint64_t write_start_us = now_monotonic_us();
+        stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
         int sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
                                        meta.pts, frame_data, frame_len, args.chunk_payload,
                                        chunk_send_to_socket, &send_ctx, &expected_chunks, chunk_scratch,
                                        chunk_scratch_size);
+        uint64_t write_us = now_monotonic_us() - write_start_us;
+        stats.write_us_sum += write_us;
+        stats.write_frames++;
+        if (write_us > stats.write_us_max)
+            stats.write_us_max = write_us;
         if (sent >= 0 && (uint32_t)sent == expected_chunks)
             stats.frames_complete++;
         else
@@ -845,7 +1016,10 @@ int main(int argc, char **argv)
         pthread_join(bc_thread, NULL);
     if (idr_thread_ok)
         pthread_join(idr_thread, NULL);
+    if (sc_thread_ok)
+        pthread_join(sc_thread, NULL);
 
+    free(send_ctx.combo);
     free(chunk_scratch);
     free(ring_buf);
     ar8030_link_close(&link);

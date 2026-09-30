@@ -53,6 +53,20 @@ static void usage(const char *argv0)
             "      overflow counts, only for ports actually in use) for the\n"
             "      given slot (default 0).\n"
             "\n"
+            "  rtt [-n count]\n"
+            "      Time <count> BB_GET_STATUS round trips (default 200): client ->\n"
+            "      ar8030d -> chip -> back, no radio involved. The host-side share\n"
+            "      of every bb_socket write/read (RPC + SDIO/USB). Prints min,\n"
+            "      median, p90, p99 and max in microseconds.\n"
+            "\n"
+            "  blast [-o port] [-t seconds] [-c bytes] [-B tx_buf]\n"
+            "      Write bulk data to the connected peer on bb_socket <port> (default\n"
+            "      2, the video port: stop ar8030-transport-tx first) as fast as it is\n"
+            "      accepted, for <seconds> (default 5), <bytes> per write (default\n"
+            "      65535, as tx). Reports throughput and per-write call times --\n"
+            "      compare across bandwidths to tell a radio limit from a host\n"
+            "      (RPC/daemon/SDIO) limit.\n"
+            "\n"
             "  bandwidth <mhz> [-d tx|rx] [-s slot] [-w seconds]\n"
             "      Manually set channel bandwidth. <mhz> is one of\n"
             "      1.25 2.5 5 10 20 40, or a raw bb_bandwidth_e index 0-5.\n"
@@ -515,6 +529,128 @@ static void print_bit_list(const char *label, uint8_t bmp, int count)
     if (!any)
         printf(" none");
     printf("\n");
+}
+
+static int cmp_u32(const void *a, const void *b)
+{
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+static int cmd_rtt(int argc, char **argv)
+{
+    int n = 200;
+    int opt;
+    while ((opt = getopt(argc, argv, "n:")) != -1) {
+        if (opt == 'n')
+            n = atoi(optarg);
+        else
+            return 1;
+    }
+    if (n < 1)
+        n = 1;
+    uint64_t *us = calloc((size_t)n, sizeof(*us));
+    if (!us)
+        return 1;
+    for (int i = 0; i < n; i++) {
+        bb_get_status_in_t st_in = { .user_bmp = 0xffff };
+        bb_get_status_out_t st_out;
+        struct timespec a, b;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        if (bb_ioctl(g_hbb, BB_GET_STATUS, &st_in, &st_out)) {
+            fprintf(stderr, "linkctl: BB_GET_STATUS failed\n");
+            free(us);
+            return 1;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        us[i] = (uint64_t)(((int64_t)(b.tv_sec - a.tv_sec) * 1000000000 + (b.tv_nsec - a.tv_nsec)) / 1000);
+    }
+    qsort(us, (size_t)n, sizeof(*us), cmp_u64);
+    printf("BB_GET_STATUS round trip over %d calls (us): min %llu  median %llu  p90 %llu  p99 %llu  max %llu\n", n,
+           (unsigned long long)us[0], (unsigned long long)us[n / 2], (unsigned long long)us[n * 9 / 10],
+           (unsigned long long)us[n * 99 / 100], (unsigned long long)us[n - 1]);
+    free(us);
+    return 0;
+}
+
+static int cmd_blast(int argc, char **argv)
+{
+    int port = 2, secs = 5;
+    uint32_t chunk = 65535, tx_buf = 64 * 1024;
+    int opt;
+    while ((opt = getopt(argc, argv, "o:t:c:B:")) != -1) {
+        switch (opt) {
+        case 'o': port = atoi(optarg); break;
+        case 't': secs = atoi(optarg); break;
+        case 'c': chunk = (uint32_t)strtoul(optarg, NULL, 0); break;
+        case 'B': tx_buf = (uint32_t)strtoul(optarg, NULL, 0); break;
+        default: return 1;
+        }
+    }
+    int slot = resolve_connected_slot(2);
+    if (slot < 0) {
+        fprintf(stderr, "linkctl: no connected peer\n");
+        return 1;
+    }
+    bb_sock_opt_t sopt = { .tx_buf_size = tx_buf, .rx_buf_size = 1024 };
+    /* A previous run (or a stalled write) can leave the port open in the
+     * daemon; reopening it straight away then fails, and repeated attempts
+     * were seen to make ar8030d lose the chip. Same force-close tx does. */
+    bb_force_close_socket_t fc = { .slot = (uint8_t)slot, .port = (uint8_t)port };
+    bb_ioctl(g_hbb, BB_FORCE_CLS_SOCKET, &fc, NULL);
+    int fd = bb_socket_open(g_hbb, (bb_slot_e)slot, (uint32_t)port, BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX, &sopt);
+    if (fd < 0) {
+        fprintf(stderr, "linkctl: bb_socket_open(slot=%d, port=%d) failed (%d) -- port still in use?\n", slot, port, fd);
+        return 1;
+    }
+    uint8_t *buf = malloc(chunk);
+    enum { MAX_CALLS = 200000 };
+    uint32_t *call_us = malloc(MAX_CALLS * sizeof(*call_us));
+    if (!buf || !call_us) {
+        bb_socket_close(fd);
+        free(buf);
+        free(call_us);
+        return 1;
+    }
+    memset(buf, 0x55, chunk);
+    struct timespec t0, t1, a, b;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t bytes = 0, calls = 0, partial = 0, fails = 0;
+    double elapsed = 0;
+    while (elapsed < secs) {
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        int wr = bb_socket_write(fd, buf, chunk, 2500);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (calls < MAX_CALLS)
+            call_us[calls] = (uint32_t)(((int64_t)(b.tv_sec - a.tv_sec) * 1000000000 + (b.tv_nsec - a.tv_nsec)) / 1000);
+        calls++;
+        if (wr <= 0)
+            fails++;
+        else {
+            bytes += (uint64_t)wr;
+            if ((uint32_t)wr < chunk)
+                partial++;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        elapsed = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    }
+    bb_socket_close(fd);
+    uint64_t n = calls < MAX_CALLS ? calls : MAX_CALLS;
+    qsort(call_us, n, sizeof(*call_us), cmp_u32);
+    printf("blast: slot %d port %d, %u B per write: %.2f Mbit/s over %.1f s | %llu calls (%llu partial, %llu "
+           "failed), %.1f KB per call | call us: min %u median %u p90 %u max %u\n",
+           slot, port, chunk, bytes * 8.0 / elapsed / 1e6, elapsed, (unsigned long long)calls,
+           (unsigned long long)partial, (unsigned long long)fails, calls ? bytes / 1024.0 / calls : 0.0,
+           call_us[0], call_us[n / 2], call_us[n * 9 / 10], call_us[n - 1]);
+    free(buf);
+    free(call_us);
+    return 0;
 }
 
 static int cmd_status(int argc, char **argv)
@@ -1764,6 +1900,10 @@ int main(int argc, char **argv)
     int rc;
     if (!strcmp(cmd, "status"))
         rc = cmd_status(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "rtt"))
+        rc = cmd_rtt(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "blast"))
+        rc = cmd_blast(argc - 1, argv + 1);
     else if (!strcmp(cmd, "bandwidth"))
         rc = cmd_bandwidth(argc - 1, argv + 1);
     else if (!strcmp(cmd, "channel-mode"))

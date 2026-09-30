@@ -23,11 +23,15 @@
 #include "ar8030_chunk.h"
 #include "ar8030_link.h"
 #include "chunk_stream.h"
+#include "clock_sync.h"
 #include "reassembly.h"
 #include "rtp_h265.h"
+#include "sidecar_srv.h"
+#include "timing_sei.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <signal.h>
 #include <stdint.h>
@@ -60,6 +64,7 @@
 #define STREAM_BUF_CHUNKS 4
 #define STATS_INTERVAL_S 1.0
 #define DEFAULT_IDR_PORT 11223 /* PixelPilot's kIdrUdpPort, formerly alink_idr's */
+#define DEFAULT_SIDECAR_PORT 5602 /* waybeam's own sidecarPort default */
 /* How often the main loop asks the daemon directly whether it's still
  * there (ar8030_link_is_alive(), a single BB_GET_STATUS round trip) --
  * see that function's own comment (common/ar8030_link.h) for why this
@@ -94,6 +99,8 @@ struct rx_args {
     uint16_t rtp_max_payload;
     uint32_t reassembly_max;
     int idr_port; /* PixelPilot keyframe requests, 0 = off -- see idr_relay.h */
+    int sidecar_port; /* serve the tunnelled waybeam sidecar here, 0 = off */
+    int timing_sei;   /* insert the per-frame timing SEI (common/timing_sei.h) */
     int verbose;
 };
 
@@ -109,11 +116,15 @@ static void usage(const char *argv0)
             "  -b <bytes>     max reassembled frame size (default %d)\n"
             "  -I <port>      UDP port for PixelPilot's keyframe requests, relayed to the air\n"
             "                 unit (alink_idr's 11223 by default, 0 = off)\n"
+            "  -C <port>      loopback UDP port serving the air unit's waybeam sidecar\n"
+            "                 (default %d, 0 = off)\n"
+            "  -T             don't insert the per-frame timing SEI\n"
+
             "  -v             print periodic in/out stats to stderr (chunks, resyncs, frames, "
             "bytes, RTP output)\n"
             "  -h             this help\n",
             argv0, DEFAULT_DAEMON_IP, DEFAULT_VIDEO_PORT, DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT,
-            DEFAULT_MAX_RTP_PAYLOAD, DEFAULT_REASSEMBLY_MAX);
+            DEFAULT_MAX_RTP_PAYLOAD, DEFAULT_REASSEMBLY_MAX, DEFAULT_SIDECAR_PORT);
 }
 
 static int parse_args(int argc, char **argv, struct rx_args *a)
@@ -126,11 +137,19 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
     a->rtp_max_payload = DEFAULT_MAX_RTP_PAYLOAD;
     a->reassembly_max = DEFAULT_REASSEMBLY_MAX;
     a->idr_port = DEFAULT_IDR_PORT;
+    a->sidecar_port = DEFAULT_SIDECAR_PORT;
+    a->timing_sei = 1;
     a->verbose = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:Tvh")) != -1) {
         switch (opt) {
+        case 'C':
+            a->sidecar_port = atoi(optarg);
+            break;
+        case 'T':
+            a->timing_sei = 0;
+            break;
         case 'I':
             a->idr_port = atoi(optarg);
             break;
@@ -272,6 +291,37 @@ static double now_monotonic_s(void)
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* The chunk header carries only the low 32 bits of the air's capture time
+ * (it wraps every ~72 minutes). Rebuild the full value as the candidate
+ * nearest the air clock's current reading, estimated from the ground
+ * clock and the sync offset -- a frame is never more than a fraction of a
+ * wrap old. */
+static uint64_t unwrap_air_pts(uint32_t pts, uint64_t air_now_us)
+{
+    uint64_t cand = (air_now_us & ~0xffffffffull) | pts;
+    if (cand > air_now_us + 0x80000000ull && cand >= 0x100000000ull)
+        cand -= 0x100000000ull;
+    else if (cand + 0x80000000ull < air_now_us)
+        cand += 0x100000000ull;
+    return cand;
+}
+
+/* Handles an air -> ground control message; only SYNCR is defined. t4 is
+ * when its chunk came off the stream. */
+static void handle_air_ctrl(clock_sync_t *sync, const uint8_t *payload, uint32_t len, uint64_t t4)
+{
+    char cmd[AR8030_CTRL_MAX_PAYLOAD];
+    if (len == 0 || len >= sizeof(cmd))
+        return;
+    memcpy(cmd, payload, len);
+    cmd[len] = '\0';
+    uint32_t seq;
+    uint64_t t1, t2, t3;
+    if (strncmp(cmd, "SYNCR ", 6) == 0 &&
+        sscanf(cmd + 6, "%" SCNx32 " %" SCNx64 " %" SCNx64 " %" SCNx64, &seq, &t1, &t2, &t3) == 4)
+        clock_sync_on_reply(sync, t1, t2, t3, t4);
+}
+
 int main(int argc, char **argv)
 {
     struct rx_args args;
@@ -369,11 +419,34 @@ int main(int argc, char **argv)
     ar8030_chunk_stream_init(&stream, read_from_bb_socket, &link.sockfd, stream_buf, stream_buf_cap,
                               STREAM_READ_TIMEOUT_MS, &g_stop);
 
+    clock_sync_t sync;
+    clock_sync_init(&sync);
+
+    /* Always started now: besides PixelPilot's keyframe requests (skipped
+     * with -I 0) it sends the clock-sync probes. */
     idr_relay_cfg_t idr_cfg = {
-        .link = &link, .udp_port = args.idr_port, .verbose = args.verbose, .stop_flag = &g_stop
+        .link = &link, .udp_port = args.idr_port, .sync = &sync,
+        .verbose = args.verbose, .stop_flag = &g_stop
     };
     pthread_t idr_thread;
-    int idr_thread_ok = args.idr_port > 0 && pthread_create(&idr_thread, NULL, idr_relay_thread_main, &idr_cfg) == 0;
+    int idr_thread_ok = pthread_create(&idr_thread, NULL, idr_relay_thread_main, &idr_cfg) == 0;
+
+    sidecar_srv_t sidecar = {.port = args.sidecar_port, .sync = &sync, .stop_flag = &g_stop, .verbose = args.verbose};
+    sidecar_srv_open(&sidecar);
+    pthread_t sidecar_thread;
+    int sidecar_thread_ok =
+        sidecar.fd >= 0 && pthread_create(&sidecar_thread, NULL, sidecar_srv_thread_main, &sidecar) == 0;
+
+    /* Frames the air sent that never reached us whole, from gaps in the
+     * video frame_seq -- including frames lost entirely, which the
+     * reassembler never sees and so cannot count. */
+    uint32_t frames_lost = 0;
+    uint16_t last_frame_seq = 0;
+    int have_last_frame_seq = 0;
+    /* -v: capture -> reassembled on the ground clock, per stats interval. */
+    double air_latency_sum_ms = 0;
+    double air_latency_max_ms = 0;
+    uint32_t air_latency_n = 0;
 
     uint64_t rtp_packets_sent = 0;
     uint64_t rtp_bytes_sent = 0;
@@ -388,6 +461,22 @@ int main(int argc, char **argv)
                 struct rx_stats_snapshot cur =
                     rx_stats_snapshot_take(&stream, &reasm, rtp_packets_sent, rtp_bytes_sent);
                 print_rx_stats(&cur, &stats_prev, now - stats_last_print);
+                int64_t off;
+                uint32_t unc;
+                if (clock_sync_get(&sync, &off, &unc))
+                    fprintf(stderr,
+                            "rx timing: air-ground offset %" PRId64 " us +-%u us (%llu sync replies) | "
+                            "capture->rx %.2f ms avg, %.2f max | encode %.2f ms | frames lost %u | "
+                            "sidecar %llu\n",
+                            off, unc, (unsigned long long)sync.replies,
+                            air_latency_n ? air_latency_sum_ms / air_latency_n : 0.0, air_latency_max_ms,
+                            sidecar.encode_avg_us / 1000.0, frames_lost,
+                            (unsigned long long)sidecar.published);
+                else
+                    fprintf(stderr, "rx timing: no clock sync reply from the air unit yet\n");
+                air_latency_sum_ms = 0;
+                air_latency_max_ms = 0;
+                air_latency_n = 0;
                 stats_prev = cur;
                 stats_last_print = now;
             }
@@ -461,10 +550,56 @@ int main(int argc, char **argv)
             continue; /* timeout, stop requested, or (ret<0) a misconfigured buffer -- either way,
                         * loop back and re-check g_stop */
 
-        if (hdr.codec == AR8030_CHUNK_CODEC_CTRL)
-            continue; /* control traffic goes ground -> air only; never video */
+        if (hdr.codec == AR8030_CHUNK_CODEC_CTRL) {
+            handle_air_ctrl(&sync, payload_buf, payload_len, clock_sync_now_us());
+            continue;
+        }
+        if (hdr.codec == AR8030_CHUNK_CODEC_SIDECAR) {
+            sidecar_srv_publish(&sidecar, payload_buf, payload_len);
+            continue;
+        }
+        if (hdr.codec != AR8030_CHUNK_CODEC_H265)
+            continue; /* never hand anything but video to the reassembler */
         if (!ar8030_reassembly_feed(&reasm, &hdr, payload_buf, payload_len))
             continue;
+        uint64_t rx_done_us = clock_sync_now_us();
+
+        if (have_last_frame_seq) {
+            uint16_t gap = (uint16_t)(reasm.frame_seq - last_frame_seq);
+            if (gap > 1 && gap < 1000) /* a larger jump is a tx restart, not loss */
+                frames_lost += gap - 1u;
+        }
+        last_frame_seq = reasm.frame_seq;
+        have_last_frame_seq = 1;
+
+        int64_t offset;
+        uint32_t uncertainty;
+        if (clock_sync_get(&sync, &offset, &uncertainty)) {
+            uint64_t capture_air = unwrap_air_pts(reasm.frame_pts, (uint64_t)((int64_t)rx_done_us + offset));
+            uint64_t capture_ground = (uint64_t)((int64_t)capture_air - offset);
+            double lat_ms = ((double)rx_done_us - (double)capture_ground) / 1000.0;
+            air_latency_sum_ms += lat_ms;
+            if (lat_ms > air_latency_max_ms)
+                air_latency_max_ms = lat_ms;
+            air_latency_n++;
+
+            if (args.timing_sei) {
+                uint32_t encode_us = __atomic_load_n(&sidecar.encode_avg_us, __ATOMIC_RELAXED);
+                struct timing_sei_v1 t = {
+                    .version = TIMING_SEI_VERSION,
+                    .flags = TIMING_SEI_FLAG_SYNC_VALID | (encode_us ? TIMING_SEI_FLAG_ENCODE : 0),
+                    .frame_seq = reasm.frame_seq,
+                    .capture_ground_us = capture_ground,
+                    .rx_done_ground_us = rx_done_us,
+                    .sync_uncertainty_us = uncertainty,
+                    .encode_us = encode_us,
+                    .frames_lost = frames_lost,
+                };
+                uint8_t sei[TIMING_SEI_NAL_MAX];
+                uint32_t sei_len = timing_sei_build(&t, sei);
+                timing_sei_insert(reasm.buf, &reasm.write_off, reasm.cap, sei, sei_len);
+            }
+        }
 
         uint32_t rtp_ts = (uint32_t)(((uint64_t)reasm.frame_pts * 90ull) / 1000ull);
         int rtp_pkts = rtp_h265_send_frame(&rtp_ctx, reasm.buf, reasm.write_off, rtp_ts);
@@ -482,6 +617,9 @@ int main(int argc, char **argv)
     g_stop = 1;
     if (idr_thread_ok)
         pthread_join(idr_thread, NULL); /* before the link it writes to goes away */
+    if (sidecar_thread_ok)
+        pthread_join(sidecar_thread, NULL);
+    sidecar_srv_close(&sidecar);
     ar8030_link_close(&link);
     return 0;
 }

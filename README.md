@@ -410,6 +410,60 @@ new token a second later -> 1. The control chunk is tiny (22-byte header
 Unknown control commands are ignored, so the same path can carry more
 ground -> air commands later.
 
+## Per-frame timing: clock sync, timing SEI, sidecar tunnel
+
+rx knows, for every frame, when the air unit captured it -- on the ground's
+own clock -- and hands that to PixelPilot inside the bitstream, so the OSD
+can show capture-to-screen latency per frame and where it goes.
+
+**Clock sync** (`rx/clock_sync.c`). rx sends `SYNC <seq> <t1>` on the
+reverse direction of the video socket (the keyframe-request path above);
+tx answers `SYNCR <seq> <t1> <t2> <t3>` (CLOCK_MONOTONIC us, hex). NTP
+offset/rtt, and the lowest-rtt sample of the last 16 wins. The minimum
+round trip is ~23 ms even on an idle port, so the reported bound (rtt/2) is
+~+-12 ms -- but checked against the true air clock over wired paths from a
+PC, the real error is -2.5 ms median (-4.2..-0.2 p10..p90). A reply that no
+round trip in the window can explain resets the window (air reboot).
+
+**Capture time.** The chunk header's `frame_pts` is waybeam's
+`VencFrameMeta.pts`: sensor capture on the air's CLOCK_MONOTONIC (on CV610
+that needs waybeam's conversion from the MPP timebase). rx unwraps the 32
+bits against its estimate of the air clock and maps it onto the ground.
+tx logs `pts age` (air clock minus pts) for its first frames and with `-v`;
+it must be a few ms, not seconds.
+
+**Timing SEI** (`common/timing_sei.[ch]`). Before each access unit's first
+slice rx inserts a prefix SEI (user_data_unregistered, our UUID) carrying
+`struct timing_sei_v1`: capture and rx-done times on the ground clock, the
+sync bound, the sidecar's encode time and the frame-loss count. It survives
+RTP and GStreamer untouched; PixelPilot_rk (`src/timing_sei.c`) keeps its
+own copy of the layout. `-T` turns it off.
+
+**Sidecar tunnel.** With `-S <port>` tx subscribes to waybeam's RTP timing
+sidecar on the air (waybeam's default `outgoing.sidecarPort` 5602) and sends
+each MSG_FRAME datagram as an `AR8030_CHUNK_CODEC_SIDECAR` chunk. rx serves
+them on `127.0.0.1:5602` (`-C`, 0 = off) with waybeam's subscribe/TTL rules
+and answers SYNC_REQ on the air clock, so a ground probe sees the air unit's
+sidecar as if it were local. SYNCR replies and sidecar datagrams share the
+next video chunk's `bb_socket_write()` (`tx/outq.[ch]`): each extra write is
+a round trip to ar8030d, and one per frame measurably delayed the video.
+
+**Measuring the path.** `ar8030-linkctl rtt` times BB_GET_STATUS round
+trips (client -> ar8030d -> chip, no radio): ~2 ms median on the air
+(SDIO), ~0.65 ms on the ground (USB). `ar8030-linkctl blast` writes bulk data
+to a port (stop tx first when using its port) and reports throughput and
+per-write times: 17.8 Mbit/s at 10 MHz, 36.6 at 20 MHz, ~40 at 40 MHz -- the
+host path (client -> TCP -> ar8030d -> SDIO) caps at ~40 Mbit/s, so 40 MHz
+buys nothing until that path is faster (and in video use frames backed up).
+tx `-v` adds "capture->write start" and "frame write" (first to last
+`bb_socket_write()` of a frame): ~7.5 ms for a 25 KB frame at 20 MHz, about
+1.8 ms fixed plus 0.22 ms/KB.
+
+Bench breakdown, 1080p100 at ~20 Mbit/s, 20 MHz (2026-09-30): capture ->
+encode done 12.2 ms (sensor readout 8.3 ms + encoder), -> frame written
+~21 ms, -> reassembled on the ground ~38-40 ms; with PixelPilot's
+`--front-buffer`, capture -> on screen ~47 ms median on a 60 Hz output.
+
 ## Frame-shm ring: surviving a waybeam restart
 
 `ar8030-transport-tx` attaches to waybeam's frame-shm ring

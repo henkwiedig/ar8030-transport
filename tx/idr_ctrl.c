@@ -3,6 +3,7 @@
 #include "ar8030_chunk.h"
 #include "chunk_stream.h"
 #include "http_get.h"
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +36,13 @@ static int read_reverse(void *ctx, uint8_t *buf, uint32_t cap, int timeout_ms)
     if (n < 0)
         usleep((useconds_t)timeout_ms * 1000); /* don't spin on a dead fd */
     return n;
+}
+
+static uint64_t now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
 }
 
 struct seen_token {
@@ -100,12 +108,21 @@ void *idr_ctrl_thread_main(void *arg)
         uint32_t len = 0;
         if (ar8030_chunk_stream_read(&stream, &hdr, payload, AR8030_CHUNK_MAX_PAYLOAD, &len) <= 0)
             continue;
+        uint64_t read_us = now_us(); /* t2 of a SYNC: as close to arrival as this thread gets */
         if (hdr.codec != AR8030_CHUNK_CODEC_CTRL || len == 0 || len >= AR8030_CTRL_MAX_PAYLOAD)
             continue;
         char cmd[AR8030_CTRL_MAX_PAYLOAD];
         memcpy(cmd, payload, len);
         cmd[len] = '\0';
-        if (strncmp(cmd, "IDR ", 4) == 0 && cmd[4])
+        uint32_t sync_seq;
+        uint64_t t1;
+        if (strncmp(cmd, "SYNC ", 5) == 0 && sscanf(cmd + 5, "%" SCNx32 " %" SCNx64, &sync_seq, &t1) == 2) {
+            if (cfg->outq) {
+                tx_outq_item_t reply = {.codec = AR8030_CHUNK_CODEC_CTRL, .is_syncr = 1,
+                                        .sync_seq = sync_seq, .t1_us = t1, .t2_us = read_us};
+                tx_outq_push(cfg->outq, &reply);
+            }
+        } else if (strncmp(cmd, "IDR ", 4) == 0 && cmd[4])
             handle_idr(cfg, cmd + 4, seen, &last_honored_ms);
         else if (cfg->verbose)
             fprintf(stderr, "tx: unknown control message \"%s\", ignored\n", cmd);

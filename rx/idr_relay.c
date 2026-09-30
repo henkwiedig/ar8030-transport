@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <stdio.h>
@@ -34,35 +35,56 @@ static int ctrl_send(void *ctx, const uint8_t *buf, uint32_t len)
     return 0;
 }
 
-void *idr_relay_thread_main(void *arg)
+static int open_idr_socket(int port)
 {
-    idr_relay_cfg_t *cfg = arg;
-
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         fprintf(stderr, "rx: idr relay: socket failed: %s\n", strerror(errno));
-        return NULL;
+        return -1;
     }
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     /* Any address, like alink_idr: PixelPilot sends to whichever address
      * our RTP came from, which is only loopback when it runs locally. */
-    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons((uint16_t)cfg->udp_port),
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port),
                                .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "rx: idr relay: bind UDP %d failed: %s -- keyframe requests disabled\n",
-                cfg->udp_port, strerror(errno));
+        fprintf(stderr, "rx: idr relay: bind UDP %d failed: %s -- keyframe requests disabled\n", port,
+                strerror(errno));
         close(fd);
-        return NULL;
+        return -1;
     }
-    fprintf(stderr, "rx: idr relay listening on UDP %d\n", cfg->udp_port);
+    fprintf(stderr, "rx: idr relay listening on UDP %d\n", port);
+    return fd;
+}
+
+void *idr_relay_thread_main(void *arg)
+{
+    idr_relay_cfg_t *cfg = arg;
+
+    int fd = cfg->udp_port > 0 ? open_idr_socket(cfg->udp_port) : -1;
+    if (fd < 0 && !cfg->sync)
+        return NULL;
 
     uint8_t scratch[AR8030_CHUNK_HDR_SIZE + AR8030_CTRL_MAX_PAYLOAD];
     uint16_t ctrl_seq = 0;
 
     while (!*cfg->stop_flag) {
+        uint32_t sync_seq;
+        uint64_t t1;
+        if (cfg->sync && clock_sync_due(cfg->sync, clock_sync_now_us(), &sync_seq, &t1)) {
+            char payload[AR8030_CTRL_MAX_PAYLOAD];
+            int payload_len = snprintf(payload, sizeof(payload), "SYNC %" PRIx32 " %" PRIx64, sync_seq, t1);
+            uint32_t chunks = 0;
+            ar8030_chunk_frame(ctrl_seq++, 0, AR8030_CHUNK_CODEC_CTRL, 0, (const uint8_t *)payload,
+                               (uint32_t)payload_len, AR8030_CTRL_MAX_PAYLOAD, ctrl_send, cfg->link, &chunks,
+                               scratch, sizeof(scratch));
+        }
+
+        /* Short enough to send the next SYNC on time; with no keyframe
+         * socket this is just the pacing sleep. */
         struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        if (poll(&pfd, 1, 500) <= 0)
+        if (poll(&pfd, fd >= 0 ? 1 : 0, 20) <= 0)
             continue;
 
         char buf[64];
@@ -92,6 +114,7 @@ void *idr_relay_thread_main(void *arg)
             fprintf(stderr, "rx: idr request token=%s -> air %s\n", buf, sent == 1 ? "sent" : "FAILED");
     }
 
-    close(fd);
+    if (fd >= 0)
+        close(fd);
     return NULL;
 }

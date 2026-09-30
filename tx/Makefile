@@ -41,6 +41,8 @@ SRCS := \
 	main.c \
 	bitrate_ctl.c \
 	idr_ctrl.c \
+	outq.c \
+	sidecar_sub.c \
 	$(COMMON)/chunk_stream.c \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/http_get.c \

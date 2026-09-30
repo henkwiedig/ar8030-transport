@@ -82,17 +82,37 @@
  * `send()` on the ground side. */
 #define AR8030_CHUNK_CODEC_OPUS 0x02u
 
-/* A control message, ground -> air, on the reverse direction of the same
- * video socket (both ends open it TX|RX). One single-chunk frame whose
- * payload is one ASCII command line, no terminator:
+/* A control message on the video socket (both ends open it TX|RX). One
+ * single-chunk frame whose payload is one ASCII command line, no
+ * terminator. Ground -> air:
  *   "IDR <token>"  request a keyframe -- PixelPilot's IDR token (formerly
  *                  sent to alink_idr on UDP 11223), relayed by
  *                  rx/idr_relay.c and handled by tx/idr_ctrl.c, which
  *                  calls waybeam's GET /request/idr.
+ *   "SYNC <seq> <t1>"
+ *                  clock-offset probe (rx/clock_sync.c). t1 is the ground's
+ *                  CLOCK_MONOTONIC in us at send.
+ * Air -> ground, written by tx/main.c between two video frames (never in
+ * the middle of one -- the stream-mode socket must not interleave chunks):
+ *   "SYNCR <seq> <t1> <t2> <t3>"
+ *                  answer to SYNC: t1 echoed, t2 = air CLOCK_MONOTONIC us
+ *                  when the SYNC was read, t3 = air CLOCK_MONOTONIC us
+ *                  right before this reply was written.
+ * seq and all times are lowercase hex without a 0x prefix (13 hex digits
+ * cover 142 years of uptime, so a SYNCR fits in AR8030_CTRL_MAX_PAYLOAD).
  * Unknown commands are ignored, so new ones can be added later. frame_pts
  * and flags are 0; frame_seq counts control messages on their own. */
 #define AR8030_CHUNK_CODEC_CTRL 0x03u
 #define AR8030_CTRL_MAX_PAYLOAD 64u
+
+/* Air -> ground: one waybeam RTP timing sidecar datagram (waybeam's
+ * include/rtp_sidecar.h, MSG_FRAME with its trailers), verbatim --
+ * forwarded by tx/sidecar_sub.c and served again on the ground by
+ * rx/sidecar_srv.c, so a ground consumer speaks the same sidecar protocol
+ * it would against waybeam directly. Single chunk, written between video
+ * frames like SYNCR above; frame_pts is 0. */
+#define AR8030_CHUNK_CODEC_SIDECAR 0x04u
+#define AR8030_SIDECAR_MAX_PAYLOAD 512u /* waybeam's RTP_SIDECAR_DGRAM_MAX */
 
 #pragma pack(push, 1)
 struct ar8030_chunk_hdr {
