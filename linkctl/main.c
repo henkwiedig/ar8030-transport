@@ -155,6 +155,11 @@ static void usage(const char *argv0)
             "      value too, for recalibrating. Arms the ADC first if it reads\n"
             "      0 mV, or always with -a. 0 mV = nothing on the power input.\n"
             "\n"
+            "  tx-path <bitmap>\n"
+            "      BB_SET_TX_PATH: which RF paths transmit, bit 0 = path A,\n"
+            "      bit 1 = path B (the SDK documents it for power testing). Shows\n"
+            "      which of a board's paths actually radiates.\n"
+            "\n"
             "  prj-cmd <cmd> [byte ...]\n"
             "      Raw BB_SET_PRJ_DISPATCH: cmd id (dec/0x hex) + up to 252\n"
             "      payload bytes. Stock init uses 0x8c <0|1> (rfo_kikp), 0x8a\n"
@@ -1621,6 +1626,20 @@ static int cmd_prj_cmd(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_tx_path(int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "linkctl: tx-path needs <bitmap> (1 = A, 2 = B, 3 = both)\n");
+        return 1;
+    }
+    bb_set_tx_path_t in;
+    memset(&in, 0, sizeof(in));
+    in.path_bmp = (uint8_t)strtoul(argv[1], NULL, 0);
+    int ret = bb_ioctl(g_hbb, BB_SET_TX_PATH, &in, NULL);
+    printf("BB_SET_TX_PATH(path_bmp=0x%02x) ret=%d\n", in.path_bmp, ret);
+    return ret ? 1 : 0;
+}
+
 static int cmd_distance(int argc, char **argv)
 {
     int count = 10, interval_ms = 500, opt;
@@ -1934,6 +1953,8 @@ int main(int argc, char **argv)
         rc = cmd_batt(argc - 1, argv + 1);
     else if (!strcmp(cmd, "prj-cmd"))
         rc = cmd_prj_cmd(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "tx-path"))
+        rc = cmd_tx_path(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))
         rc = cmd_retx(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx-watch"))
