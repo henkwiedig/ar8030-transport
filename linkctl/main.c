@@ -155,6 +155,11 @@ static void usage(const char *argv0)
             "      value too, for recalibrating. Arms the ADC first if it reads\n"
             "      0 mV, or always with -a. 0 mV = nothing on the power input.\n"
             "\n"
+            "  rf [a|b tx|rx 0|1]\n"
+            "      No arguments: BB_GET_RF, whether each RF path's TX and RX is\n"
+            "      switched on. With arguments: BB_SET_RF, switch one path's TX\n"
+            "      or RX on/off (e.g. a board with a single PA: is path B on?).\n"
+            "\n"
             "  tx-path <bitmap>\n"
             "      BB_SET_TX_PATH: which RF paths transmit, bit 0 = path A,\n"
             "      bit 1 = path B (the SDK documents it for power testing). Shows\n"
@@ -1640,6 +1645,31 @@ static int cmd_tx_path(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_rf(int argc, char **argv)
+{
+    if (argc == 1) {
+        bb_get_rf_out_t out;
+        memset(&out, 0, sizeof(out));
+        int ret = bb_ioctl(g_hbb, BB_GET_RF, NULL, &out);
+        printf("BB_GET_RF ret=%d: path A tx=%u rx=%u, path B tx=%u rx=%u\n", ret, out.path_a_tx_state,
+               out.path_a_rx_state, out.path_b_tx_state, out.path_b_rx_state);
+        return ret ? 1 : 0;
+    }
+    if (argc != 4 || (strcmp(argv[1], "a") && strcmp(argv[1], "b")) ||
+        (strcmp(argv[2], "tx") && strcmp(argv[2], "rx")) || (strcmp(argv[3], "0") && strcmp(argv[3], "1"))) {
+        fprintf(stderr, "linkctl: rf takes no arguments, or <a|b> <tx|rx> <0|1>\n");
+        return 1;
+    }
+    bb_set_rf_t in;
+    memset(&in, 0, sizeof(in));
+    in.rf_path = strcmp(argv[1], "a") ? BB_RF_PATH_B : BB_RF_PATH_A;
+    in.dir = strcmp(argv[2], "tx") ? BB_DIR_RX : BB_DIR_TX;
+    in.state = (uint8_t)atoi(argv[3]);
+    int ret = bb_ioctl(g_hbb, BB_SET_RF, &in, NULL);
+    printf("BB_SET_RF(path %s, %s, %s) ret=%d\n", argv[1], argv[2], in.state ? "on" : "off", ret);
+    return ret ? 1 : 0;
+}
+
 static int cmd_distance(int argc, char **argv)
 {
     int count = 10, interval_ms = 500, opt;
@@ -1953,6 +1983,8 @@ int main(int argc, char **argv)
         rc = cmd_batt(argc - 1, argv + 1);
     else if (!strcmp(cmd, "prj-cmd"))
         rc = cmd_prj_cmd(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "rf"))
+        rc = cmd_rf(argc - 1, argv + 1);
     else if (!strcmp(cmd, "tx-path"))
         rc = cmd_tx_path(argc - 1, argv + 1);
     else if (!strcmp(cmd, "retx"))
