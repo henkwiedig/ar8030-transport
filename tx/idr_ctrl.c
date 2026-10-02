@@ -1,6 +1,7 @@
 #include "idr_ctrl.h"
 
 #include "ar8030_chunk.h"
+#include "bitrate_ctl.h"
 #include "chunk_stream.h"
 #include "http_get.h"
 #include <inttypes.h>
@@ -66,6 +67,12 @@ static void handle_idr(idr_ctrl_cfg_t *cfg, const char *token, struct seen_token
             oldest = i;
     snprintf(seen[oldest].token, sizeof(seen[oldest].token), "%s", token);
     seen[oldest].at_ms = now;
+
+    if (bitrate_ctl_congested()) {
+        if (cfg->verbose)
+            fprintf(stderr, "tx: idr request token=%s: suppressed (link congested)\n", token);
+        return;
+    }
 
     if (*last_honored_ms && now - *last_honored_ms < cfg->coalesce_ms) {
         if (cfg->verbose)

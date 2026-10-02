@@ -702,17 +702,20 @@ int main(int argc, char **argv)
     bc_cfg.min_kbps = args.min_kbps;
     bc_cfg.max_kbps = args.max_kbps;
     bc_cfg.hysteresis = 0.05;
-    bc_cfg.min_interval_ms = 1500;
-    bc_cfg.poll_interval_ms = 2000;
+    bc_cfg.min_interval_ms = 500;  /* between increases; cuts are never held back */
+    bc_cfg.poll_interval_ms = 500; /* BB_GET_MCS poll, on top of MCS_CHANGE events */
     bc_cfg.ring = ring; /* already attached above; see bitrate_ctl.h's cfg->ring comment */
     bc_cfg.ring_backlog_high_slots = args.ring_backlog_slots; /* venc_frame_ring.h: >=2 is standing backlog */
     bc_cfg.ring_backoff = args.ring_backoff;
-    bc_cfg.ramp_step = 0.10;          /* +10% per apply toward the MCS-derived target */
-    bc_cfg.ramp_settle_ms = 3000;     /* no increase until 3s of clear backlog */
+    bc_cfg.ramp_step = 0.25;          /* +25% per increase toward the MCS-derived target
+                                       * (was +10% per ~2 s: ~50 s from 1 to 10 Mbit/s,
+                                       * flight 2026-10-02) */
+    bc_cfg.ramp_settle_ms = 1000;     /* no increase until 1 s without backlog or cut */
     bc_cfg.probe_ceiling_frac = 0.95; /* after a backlog cut, stay <95% of the offending rate ... */
     bc_cfg.probe_hold_ms = 15000;     /* ... for 15s, then probe above it again */
-    bc_cfg.roi_max_kbps = 3000;    /* last-resort measure: only below ~3Mbit/s (this project's own
-                                     * "2-4Mbit/s" call, middle of the range) */
+    bc_cfg.roi_max_kbps = 0;       /* ROI off: at the bitrate floor it made the encoder overshoot
+                                     * ~22x (1058 kbps set, ~23 Mbit/s out, bench 2026-10-02) and
+                                     * jam the ring. Was 3000 (last-resort measure below ~3 Mbit/s). */
     bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
                                      * switching it back off */
     bc_cfg.ldpc_ratio_high = 0.10; /* see bitrate_ctl.h's own comment: >=10% LDPC blocks failing is

@@ -40,8 +40,9 @@ typedef struct {
     uint32_t min_kbps;
     uint32_t max_kbps;
     double hysteresis;        /* fractional change required to re-apply, e.g. 0.05 */
-    int min_interval_ms;      /* rate limit between /api/v1/set calls */
-    int poll_interval_ms;     /* safety-net poll period regardless of events */
+    int min_interval_ms;      /* minimum time between two increases (decreases are never
+                               * held back by this -- see the MCS path in bitrate_ctl.c) */
+    int poll_interval_ms;     /* BB_GET_MCS poll period, on top of the event wake hint */
 
     /* Second, faster backoff signal alongside the MCS-derived target
      * above, mirroring the stock vendor streamer's own dual-signal
@@ -98,10 +99,11 @@ typedef struct {
      * jumping straight there (which overshot, backlogged, and got cut
      * again -- a bang-bang sawtooth). 0 disables (jump to target, the old
      * behaviour). Decreases are never stepped -- cutting is always
-     * immediate.
+     * immediate. Exception: right after a fade (target >= 2x the current
+     * rate) the first increase jumps to 60% of the target.
      *
-     * ramp_settle_ms: no increase until the ring has shown no backlog for
-     * this long.
+     * ramp_settle_ms: no increase until the ring has shown no backlog,
+     * and no cut from any path has happened, for this long.
      *
      * After an URGENT ring cut, increases are additionally held below
      * probe_ceiling_frac * (the bitrate that just backlogged) for
@@ -160,5 +162,13 @@ typedef struct {
  * -1 if the initial event subscription failed (the caller may still
  * choose to run without it -- see tx/main.c). */
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg);
+
+/* Non-zero while the link is congested: within ~1.5 s of any bitrate cut
+ * or of an observed ring backlog. idr_ctrl suppresses keyframe requests
+ * then -- a keyframe is the largest burst the encoder makes, the GOP
+ * brings one within a second anyway, and forcing extra ones into a link
+ * that is already backlogged is what turned the 2026-10-02 fade into
+ * seconds of frozen, jittering video. Callable from any thread. */
+int bitrate_ctl_congested(void);
 
 #endif /* AR8030_TRANSPORT_TX_BITRATE_CTL_H */

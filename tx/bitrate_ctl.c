@@ -128,6 +128,16 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
  * signal itself updates). */
 #define RING_BACKLOG_MIN_INTERVAL_MS 250
 
+/* ROI safety net: if the ring is still backlogged this long after ROI was
+ * switched on, ROI is making it worse -- switch it off and never back on
+ * for the rest of the process. Bench walk 2026-10-02: ROI on at the
+ * 1058 kbps floor made the encoder emit ~23 Mbit/s; the ring sat at 100%
+ * with ~110 ms frame age and 804 dropped frames, and nothing could undo
+ * it -- the ROI-off path waits for 5 s of clear backlog, which ROI itself
+ * prevented, while cuts were pinned at the floor and increases held off by
+ * the very same backlog. */
+#define ROI_BACKLOG_ABORT_MS 2000
+
 /* After an URGENT cut, ignore further backlog for this long. A cut only
  * takes effect once the encoder has emitted frames at the new rate and
  * low_water_slots (itself a ~200ms window) has drained the frames that
@@ -161,6 +171,66 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 /* Same rate-limit class as LDPC_BACKOFF_MIN_INTERVAL_MS above -- see
  * bitrate_ctl.h's own comment on retx_event_backoff. */
 #define RETX_EVENT_BACKOFF_MIN_INTERVAL_MS 250
+
+/* The multiplicative fast paths (RETX/LDPC) don't stack on top of a cut
+ * that hasn't taken effect yet: the encoder needs a few frames at the new
+ * rate before the radio's repair pressure can drop, so re-reading the
+ * same pressure 250 ms later and cutting again just compounds one event
+ * into several (flight 2026-10-02: 7.4 -> 6.3 -> 5.3 -> ... Mbit/s at
+ * ~1 cut/s while the MCS-derived target that would have cut straight to
+ * what the link carries was starved -- see the MCS path below). */
+#define FAST_CUT_HOLDOFF_MS 500
+
+/* A drop of the MCS-derived target is applied as a direct cut on this
+ * short leash of its own -- not behind cfg->min_interval_ms (which now
+ * only paces increases), and not behind the fast paths' last cut either:
+ * a RETX storm cutting every FAST_CUT_HOLDOFF_MS would otherwise keep
+ * re-arming that gate and starve this path again (seen in a host replay
+ * of the 2026-10-02 fade: stepping down by 15% per 500 ms for 6 s
+ * instead of one cut to what the link carries). */
+#define MCS_CUT_MIN_INTERVAL_MS 250
+
+/* "Congested" (see bitrate_ctl_congested()) lasts this long after any
+ * cut or observed ring backlog. */
+#define CONGESTED_HOLD_MS 1500
+
+/* Recovery jump: when the MCS-derived target is at least this many times
+ * the current rate (a fade just ended), the first increase goes straight
+ * to RECOVERY_JUMP_FRAC of the target instead of one ramp_step -- from
+ * ~1 Mbit/s, +25% steps alone would still need ~10 steps to reach a
+ * 10 Mbit/s link. Not all the way: jumping straight to the full target
+ * overshot and backlogged before (see bitrate_ctl.h on ramp_step). */
+#define RECOVERY_JUMP_RATIO 2.0
+#define RECOVERY_JUMP_FRAC  0.6
+
+static uint64_t g_congested_until_ms; /* CLOCK_MONOTONIC ms, __atomic access */
+
+/* waybeam refuses video0.bitrate below its own floor with HTTP 409 (a
+ * deliberate, configurable safety net: below ~1 Mbit/s the encoder can't
+ * hold a steady rate). cfg->min_kbps doesn't know that floor, so the
+ * multiplicative cuts kept asking for 854-999 kbps and getting 409 over
+ * and over (36 times in one flight on 2026-10-02). The first 409 on a cut
+ * teaches us the floor: the rate currently applied, which waybeam did
+ * accept. Learned per process, so a changed waybeam config is picked up
+ * on the next start. */
+static uint32_t learn_floor(uint32_t floor_kbps, int status, uint32_t applied_kbps)
+{
+    if (status == 409 && applied_kbps > floor_kbps) {
+        fprintf(stderr, "bitrate_ctl: waybeam refused a lower bitrate (409) -> floor %u kbps\n", applied_kbps);
+        return applied_kbps;
+    }
+    return floor_kbps;
+}
+
+static void mark_congested(uint64_t now)
+{
+    __atomic_store_n(&g_congested_until_ms, now + CONGESTED_HOLD_MS, __ATOMIC_RELEASE);
+}
+
+int bitrate_ctl_congested(void)
+{
+    return now_ms() < __atomic_load_n(&g_congested_until_ms, __ATOMIC_ACQUIRE);
+}
 
 int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
 {
@@ -231,6 +301,8 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     sig_atomic_t last_seen_wake = 0;
     sig_atomic_t last_seen_retx_too_many = 0;
     int roi_enabled = 0;
+    int roi_banned = 0;          /* set by the ROI safety net, see ROI_BACKLOG_ABORT_MS */
+    uint64_t roi_enabled_ms = 0;
     uint64_t last_backlog_ms = 0;
     uint64_t last_urgent_cut_ms = 0;
     uint32_t probe_ceiling_kbps = 0; /* 0 = none */
@@ -238,6 +310,11 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     uint64_t last_roi_disable_attempt_ms = 0;
     uint64_t last_ldpc_apply_ms = 0;
     uint64_t last_retx_event_apply_ms = 0;
+    uint64_t last_cut_ms = 0;      /* any decrease, from any path */
+    uint64_t last_mcs_cut_ms = 0;  /* MCS-derived decreases only */
+    uint32_t floor_kbps = cfg->min_kbps; /* raised by learn_floor() */
+    uint64_t last_increase_ms = 0; /* paces increases (cfg->min_interval_ms) */
+    uint64_t last_mcs_poll_ms = 0; /* paces BB_GET_MCS (cfg->poll_interval_ms) */
 
     while (!*cfg->stop_flag) {
         usleep(100 * 1000);
@@ -264,9 +341,10 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             uint16_t backlog_slots = __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
             if (backlog_slots >= cfg->ring_backlog_high_slots) {
                 last_backlog_ms = now;
+                mark_congested(now);
 
                 uint32_t backlog_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ring_backoff),
-                                                      cfg->min_kbps, cfg->max_kbps);
+                                                      floor_kbps, cfg->max_kbps);
                 int cut_bitrate = backlog_target < last_applied_kbps &&
                                   (last_urgent_cut_ms == 0 ||
                                    (now - last_urgent_cut_ms) >= (uint64_t)RING_CUT_HOLDOFF_MS);
@@ -293,7 +371,20 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                  * overshoot from turning ROI on is just more backlog,
                  * handled by this same loop on its next tick like any
                  * other overshoot source; no separate compensation needed. */
-                int want_roi = last_applied_kbps < cfg->roi_max_kbps;
+                if (roi_enabled && (now - roi_enabled_ms) >= (uint64_t)ROI_BACKLOG_ABORT_MS) {
+                    int st = http_get_status(cfg->waybeam_host, cfg->waybeam_port,
+                                             "/api/v1/live/set?fpv.roiEnabled=false", 1000);
+                    fprintf(stderr,
+                            "bitrate_ctl: ring still backlogged %llu ms after ROI on -> fpv.roiEnabled=false "
+                            "(status=%d), ROI disabled for this run\n",
+                            (unsigned long long)(now - roi_enabled_ms), st);
+                    if (st >= 200 && st < 300) {
+                        roi_enabled = 0;
+                        roi_banned = 1;
+                    }
+                }
+
+                int want_roi = !roi_banned && last_applied_kbps < cfg->roi_max_kbps;
 
                 if (cut_bitrate || (want_roi && !roi_enabled)) {
                     char path[160];
@@ -319,13 +410,18 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                             last_applied_kbps = backlog_target;
                             last_apply_ms = now;
                             last_urgent_cut_ms = now;
+                            last_cut_ms = now;
                         }
-                        if (want_roi)
+                        if (want_roi && !roi_enabled) {
                             roi_enabled = 1;
+                            roi_enabled_ms = now;
+                        }
                     } else {
                         fprintf(stderr,
                                 "bitrate_ctl: waybeam %s returned status=%d (URGENT backlog=%u slots)\n",
                                 path, status, backlog_slots);
+                        if (cut_bitrate)
+                            floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
                     }
                 }
             } else if (roi_enabled && last_applied_kbps >= cfg->roi_max_kbps &&
@@ -358,7 +454,8 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
          * own next poll once the ratio drops back below threshold, same
          * as the ring path's cut side has no dedicated "undo" either. */
         if (cfg->ldpc_ratio_high > 0.0 && have_applied &&
-            (now - last_ldpc_apply_ms) >= (uint64_t)LDPC_BACKOFF_MIN_INTERVAL_MS) {
+            (now - last_ldpc_apply_ms) >= (uint64_t)LDPC_BACKOFF_MIN_INTERVAL_MS &&
+            (now - last_cut_ms) >= (uint64_t)FAST_CUT_HOLDOFF_MS) {
             /* Set on every attempt, not just a tripped one -- this is what
              * actually enforces LDPC_BACKOFF_MIN_INTERVAL_MS. Setting it
              * only inside the tripped branch below left the healthy-link
@@ -371,7 +468,7 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             double ldpc_ratio;
             if (read_ldpc_ratio(cfg->link, &ldpc_ratio) == 0 && ldpc_ratio >= cfg->ldpc_ratio_high) {
                 uint32_t ldpc_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ldpc_backoff),
-                                                  cfg->min_kbps, cfg->max_kbps);
+                                                  floor_kbps, cfg->max_kbps);
                 if (ldpc_target < last_applied_kbps) {
                     char path[128];
                     snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", ldpc_target);
@@ -381,10 +478,13 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                                 ldpc_ratio * 100.0, ldpc_target);
                         last_applied_kbps = ldpc_target;
                         last_apply_ms = now;
+                        last_cut_ms = now;
+                        mark_congested(now);
                     } else {
                         fprintf(stderr,
                                 "bitrate_ctl: waybeam %s returned status=%d (LDPC ratio=%.1f%%)\n", path,
                                 status, ldpc_ratio * 100.0);
+                        floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
                     }
                 }
             }
@@ -401,13 +501,14 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
          * cut only -- same shape as every other fast-path signal in this
          * file. */
         if (cfg->retx_event_backoff > 0.0 && have_applied &&
-            (now - last_retx_event_apply_ms) >= (uint64_t)RETX_EVENT_BACKOFF_MIN_INTERVAL_MS) {
+            (now - last_retx_event_apply_ms) >= (uint64_t)RETX_EVENT_BACKOFF_MIN_INTERVAL_MS &&
+            (now - last_cut_ms) >= (uint64_t)FAST_CUT_HOLDOFF_MS) {
             sig_atomic_t retx_too_many_now = g_retx_too_many;
             if (retx_too_many_now != last_seen_retx_too_many) {
                 last_seen_retx_too_many = retx_too_many_now;
                 last_retx_event_apply_ms = now;
                 uint32_t retx_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->retx_event_backoff),
-                                                  cfg->min_kbps, cfg->max_kbps);
+                                                  floor_kbps, cfg->max_kbps);
                 if (retx_target < last_applied_kbps) {
                     char path[128];
                     snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", retx_target);
@@ -417,20 +518,28 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                                 retx_target);
                         last_applied_kbps = retx_target;
                         last_apply_ms = now;
+                        last_cut_ms = now;
+                        mark_congested(now);
                     } else {
                         fprintf(stderr, "bitrate_ctl: waybeam %s returned status=%d (RETX_TOO_MANY)\n", path,
                                 status);
+                        floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
                     }
                 }
             }
         }
 
-        int poll_due = (now - last_apply_ms) >= (uint64_t)cfg->poll_interval_ms || !have_applied;
+        /* MCS-derived target: polled on its own timer (plus the event
+         * wake hint), not "poll_interval_ms since the last apply" -- with
+         * the fast paths above cutting every few hundred ms during a fade,
+         * that gate never opened and the link-derived target (the one
+         * signal that knows what the radio can carry right now) went
+         * unread for 11 s (flight 2026-10-02, 11:53:51). */
         int woken = g_wake != last_seen_wake;
         last_seen_wake = g_wake;
-
-        if (!poll_due && !woken)
+        if (have_applied && !woken && (now - last_mcs_poll_ms) < (uint64_t)cfg->poll_interval_ms)
             continue;
+        last_mcs_poll_ms = now;
 
         /* Atomic load: tx/main.c updates cfg->slot after a reconnect if
          * the peer's connected slot resolves differently than before
@@ -441,7 +550,7 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             continue;
 
         uint32_t target_kbps = (uint32_t)((double)link_kbps * cfg->margin);
-        target_kbps = clamp_u32(target_kbps, cfg->min_kbps, cfg->max_kbps);
+        target_kbps = clamp_u32(target_kbps, floor_kbps, cfg->max_kbps);
 
         if (have_applied) {
             double delta =
@@ -452,21 +561,35 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                 continue;
         }
 
-        if (have_applied && (now - last_apply_ms) < (uint64_t)cfg->min_interval_ms)
+        /* Decreases: straight to the link-derived target, on a short
+         * leash of their own -- never behind min_interval_ms. */
+        int ramped = 0;
+        int cutting = have_applied && target_kbps < last_applied_kbps;
+        if (cutting && (now - last_mcs_cut_ms) < (uint64_t)MCS_CUT_MIN_INTERVAL_MS)
             continue;
 
-        /* Stepwise ramp-up (see bitrate_ctl.h): only ever shapes
-         * increases; decreases fall through untouched. */
-        int ramped = 0;
-        if (have_applied && cfg->ramp_step > 0.0 && target_kbps > last_applied_kbps) {
-            if ((now - last_backlog_ms) < (uint64_t)cfg->ramp_settle_ms)
+        /* Increases: paced by min_interval_ms, held off for
+         * ramp_settle_ms after any backlog or cut, and stepped (see
+         * bitrate_ctl.h) -- except a recovery jump right after a fade. */
+        if (have_applied && !cutting) {
+            if ((now - last_increase_ms) < (uint64_t)cfg->min_interval_ms)
                 continue;
-            uint32_t step_cap = (uint32_t)((double)last_applied_kbps * (1.0 + cfg->ramp_step));
-            if (step_cap <= last_applied_kbps)
-                step_cap = last_applied_kbps + 1;
-            if (target_kbps > step_cap) {
-                target_kbps = step_cap;
-                ramped = 1;
+            if ((now - last_backlog_ms) < (uint64_t)cfg->ramp_settle_ms ||
+                (now - last_cut_ms) < (uint64_t)cfg->ramp_settle_ms)
+                continue;
+            if (cfg->ramp_step > 0.0) {
+                uint32_t step_cap = (uint32_t)((double)last_applied_kbps * (1.0 + cfg->ramp_step));
+                if ((double)target_kbps >= (double)last_applied_kbps * RECOVERY_JUMP_RATIO) {
+                    uint32_t jump = (uint32_t)((double)target_kbps * RECOVERY_JUMP_FRAC);
+                    if (jump > step_cap)
+                        step_cap = jump;
+                }
+                if (step_cap <= last_applied_kbps)
+                    step_cap = last_applied_kbps + 1;
+                if (target_kbps > step_cap) {
+                    target_kbps = step_cap;
+                    ramped = 1;
+                }
             }
             if (probe_ceiling_kbps && now < probe_ceiling_until_ms && target_kbps > probe_ceiling_kbps) {
                 target_kbps = probe_ceiling_kbps;
@@ -492,11 +615,20 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         if (status < 200 || status >= 300) {
             fprintf(stderr, "bitrate_ctl: waybeam %s returned status=%d (link=%u kbps, target=%u kbps)\n",
                     path, status, link_kbps, target_kbps);
+            if (cutting)
+                floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
             continue; /* try again next tick rather than pinning last_applied to an unapplied value */
         }
 
         fprintf(stderr, "bitrate_ctl: link=%u kbps -> video0.bitrate=%u kbps%s\n", link_kbps, target_kbps,
                 ramped ? " (ramp)" : "");
+        if (cutting) {
+            last_cut_ms = now;
+            last_mcs_cut_ms = now;
+            mark_congested(now);
+        } else {
+            last_increase_ms = now;
+        }
         last_applied_kbps = target_kbps;
         have_applied = 1;
         last_apply_ms = now;
