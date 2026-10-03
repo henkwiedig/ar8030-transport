@@ -82,6 +82,8 @@ static void print_help(const char* argv0)
     printf("  --batt-scale <n>          supply mV = ADC mV * n + offset (default 16)\n");
     printf("  --batt-offset-mv <mv>     ... + this (default 1200; both measured on the Lite)\n");
     printf("  --batt-file <path>        also write it there as volts (\"11.98\"), \"\" = don't\n");
+    printf("  --rf-path-b-off           single-PA board: switch RF path B (TX and RX) off at\n");
+    printf("                            startup, as stock does on the Ascent Lite\n");
     printf("                            (default: \"\")\n");
     printf("  -h, --help                this help\n");
 }
@@ -120,6 +122,7 @@ enum {
     OPT_BATT_SCALE,
     OPT_BATT_OFFSET_MV,
     OPT_BATT_FILE,
+    OPT_RF_PATH_B_OFF,
 };
 
 static void handle_sigterm(int sig)
@@ -175,6 +178,7 @@ int main(int argc, char** argv)
         {"batt-scale",        required_argument, 0, OPT_BATT_SCALE       },
         {"batt-offset-mv",    required_argument, 0, OPT_BATT_OFFSET_MV   },
         {"batt-file",         required_argument, 0, OPT_BATT_FILE        },
+        {"rf-path-b-off",     no_argument,       0, OPT_RF_PATH_B_OFF    },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -253,6 +257,9 @@ int main(int argc, char** argv)
             break;
         case OPT_BATT_FILE:
             snprintf(cfg.batt_file, sizeof(cfg.batt_file), "%s", optarg);
+            break;
+        case OPT_RF_PATH_B_OFF:
+            cfg.rf_path_b_off = 1;
             break;
         case 'h':
             print_help(argv[0]);

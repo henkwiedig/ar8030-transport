@@ -992,6 +992,21 @@ void* lifecycle_thread_main(void* arg)
         lc_channel_apply_local(ctx->client.handle, ctx->channel);
     }
 
+    /* Single-PA boards (see lc_config_t.rf_path_b_off): stock's
+     * fpv_bb_set_rf_path_b(0) -- BB_SET_PRJ_DISPATCH cmd 0xcb with
+     * data[4] = 0x01, data[5] = 0x03 (path B, both directions),
+     * data[6] = 0 (off). */
+    if (ctx->cfg.rf_path_b_off) {
+        uint8_t buf[256];
+        memset(buf, 0, sizeof(buf));
+        buf[0] = 0xcb;
+        buf[4] = 0x01;
+        buf[5] = 0x03;
+        buf[6] = 0;
+        int ret = bb_ioctl(ctx->client.handle, BB_SET_PRJ_DISPATCH, buf, NULL);
+        lc_log("lifecycle: rf path B off (PRJ_CMD_RF_PATH_CTRL) ret=%d", ret);
+    }
+
     /* Output power is chip-wide and needs no link: set it before the link
      * comes up (so the disconnected/search power is already right too),
      * and again on every connect -- see lc_apply_tuning_on_connect(). */

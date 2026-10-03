@@ -105,6 +105,15 @@ typedef struct {
     int  batt_scale;
     int  batt_offset_mv;
     char batt_file[256];
+
+    /* Single-PA boards: switch the chip's RF path B off at startup, the
+     * way stock does (ar_ldyhs_sky fpv_bb_init(): fpv_bb_set_rf_path_b(0)
+     * for project types 4/6/7 -- the Ascent Lite is 7). That is the
+     * firmware's own PRJ_CMD_RF_PATH_CTRL (BB_SET_PRJ_DISPATCH 0xcb), not
+     * BB_SET_RF: besides turning path B's TX and RX off it re-weights
+     * path A ("recfg patha weight" in the chip log). Chip-local state,
+     * lost on a chip reset, so it is applied on every lifecycled start. */
+    int  rf_path_b_off;
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;
