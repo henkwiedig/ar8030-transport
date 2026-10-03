@@ -820,11 +820,20 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
                 why = "severe";
             }
             last_severe_ms = last_disturb_ms = now;
-        } else if ((ldpc >= cfg->ldpc_ratio_high || new_retx) && now - last_disturb_ms >= PI_DISTURB_HOLD_MS) {
+        } else if (((cfg->ldpc_ratio_high > 0.0 && ldpc >= cfg->ldpc_ratio_high) || new_retx) &&
+                   now - last_disturb_ms >= PI_DISTURB_HOLD_MS) {
             k_i *= cfg->pi_mild_trim;
             last_disturb_ms = now;
             why = "trim";
         }
+
+        /* Which signal tripped it (diagnosing clamps with no congestion in
+         * sight: steady capacity, low delay -- bench walk 2026-10-03
+         * 14:19:02-14:19:54). Logged whether or not a new rate follows. */
+        if (why)
+            fprintf(stderr,
+                    "bitrate_ctl: pi disturbance %s: ldpc=%.0f%% retx_1s=%d new_retx=%d C=%u D=%.1fms k_i=%.2f\n",
+                    why, ldpc * 100.0, recent_retx, new_retx, cap_kbps, d_ms, k_i);
 
         /* Ring backlog: hard backstop, same signal as the rules mode. */
         venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);

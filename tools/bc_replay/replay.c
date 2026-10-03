@@ -347,9 +347,9 @@ static void defaults(int mode)
     cfg.probe_hold_ms = 15000;
     cfg.roi_max_kbps = 0;
     cfg.roi_recovery_ms = 5000;
-    cfg.ldpc_ratio_high = 0.10;
+    cfg.ldpc_ratio_high = 0; /* = tx/main.c: off, the air reads its uplink */
     cfg.ldpc_backoff = 0.85;
-    cfg.ldpc_severe_ratio = 0.5;
+    cfg.ldpc_severe_ratio = 0;
     cfg.retx_severe_events = 3;
     cfg.severe_backoff = 0.4;
     cfg.retx_event_backoff = 0.85;
@@ -381,6 +381,7 @@ static void apply_override(const char *kv)
     }
     D(pi_delay_set_ms); D(pi_kp_up); D(pi_kp_down); D(pi_ki_up); D(pi_ki_down); D(pi_k_min); D(pi_k_max);
     D(pi_slew_up); D(pi_severe_k); D(pi_mild_trim); D(margin); D(ramp_step); D(severe_backoff);
+    D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events);
     I(max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
     else {
         fprintf(stderr, "unknown key %s\n", key);

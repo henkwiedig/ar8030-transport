@@ -734,10 +734,14 @@ int main(int argc, char **argv)
                                      * jam the ring. Was 3000 (last-resort measure below ~3 Mbit/s). */
     bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
                                      * switching it back off */
-    bc_cfg.ldpc_ratio_high = 0.10; /* see bitrate_ctl.h's own comment: >=10% LDPC blocks failing is
-                                     * treated as the radio actively under repair pressure */
+    /* LDPC off (0): BB_GET_USER_QUALITY on the air reports the air's own
+     * receive side -- the uplink. Bench walk 2026-10-03 14:25-14:27: every
+     * LDPC-only clamp (62-100%) coincided with uplink LDPC errors
+     * (312-7656) while the downlink carrying the video was error-free
+     * (ground ldpc 0, SNR 15-17 dB). RETX_TOO_MANY is the downlink signal. */
+    bc_cfg.ldpc_ratio_high = 0;
     bc_cfg.ldpc_backoff = 0.85;    /* same cut factor as ring_backoff above */
-    bc_cfg.ldpc_severe_ratio = 0.5;  /* >= 50% LDPC blocks failing, or */
+    bc_cfg.ldpc_severe_ratio = 0;    /* LDPC off, see above; */
     bc_cfg.retx_severe_events = 3;   /* >= 3 RETX_TOO_MANY within 1 s: */
     bc_cfg.severe_backoff = 0.4;     /* cut to 40% at once instead of 85% */
     bc_cfg.retx_event_backoff = 0.85; /* see bitrate_ctl.h's own comment: fires on every
