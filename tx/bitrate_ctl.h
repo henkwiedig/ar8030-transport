@@ -112,6 +112,14 @@ typedef struct {
      * permanently). */
     double ramp_step;
     int ramp_settle_ms;
+
+    /* While the link is unstable -- its throughput jumped up >= 1.5x and
+     * fell back >= 1.5x within unstable_window_ms, less than
+     * unstable_window_ms ago -- increases use unstable_ramp_step instead
+     * of ramp_step and skip the recovery jump. A fade (falling, then
+     * rising once) is not a swing, so recoveries stay fast. 0 disables. */
+    int unstable_window_ms;
+    double unstable_ramp_step;
     double probe_ceiling_frac;
     int probe_hold_ms;
 
@@ -153,6 +161,14 @@ typedef struct {
      * payload parsing might apply. Bypasses hysteresis like the ring/LDPC
      * paths, with its own rate limit. 0 disables this path entirely. */
     double retx_event_backoff; /* multiplies last_applied_kbps on every event firing, e.g. 0.85 */
+
+    /* Severity: a deep fade cuts harder than a marginal one. An LDPC
+     * error ratio >= ldpc_severe_ratio, or >= retx_severe_events
+     * RETX_TOO_MANY events within 1 s, multiply by severe_backoff instead
+     * of ldpc_backoff / retx_event_backoff. 0 disables each trigger. */
+    double ldpc_severe_ratio;  /* e.g. 0.5 */
+    int retx_severe_events;    /* e.g. 3 */
+    double severe_backoff;     /* e.g. 0.4 */
 
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;

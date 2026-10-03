@@ -711,6 +711,8 @@ int main(int argc, char **argv)
                                        * (was +10% per ~2 s: ~50 s from 1 to 10 Mbit/s,
                                        * flight 2026-10-02) */
     bc_cfg.ramp_settle_ms = 1000;     /* no increase until 1 s without backlog or cut */
+    bc_cfg.unstable_window_ms = 3000; /* link up and down again within 3 s = unstable: */
+    bc_cfg.unstable_ramp_step = 0.10; /* ... only +10% per increase, no recovery jump */
     bc_cfg.probe_ceiling_frac = 0.95; /* after a backlog cut, stay <95% of the offending rate ... */
     bc_cfg.probe_hold_ms = 15000;     /* ... for 15s, then probe above it again */
     bc_cfg.roi_max_kbps = 0;       /* ROI off: at the bitrate floor it made the encoder overshoot
@@ -721,6 +723,9 @@ int main(int argc, char **argv)
     bc_cfg.ldpc_ratio_high = 0.10; /* see bitrate_ctl.h's own comment: >=10% LDPC blocks failing is
                                      * treated as the radio actively under repair pressure */
     bc_cfg.ldpc_backoff = 0.85;    /* same cut factor as ring_backoff above */
+    bc_cfg.ldpc_severe_ratio = 0.5;  /* >= 50% LDPC blocks failing, or */
+    bc_cfg.retx_severe_events = 3;   /* >= 3 RETX_TOO_MANY within 1 s: */
+    bc_cfg.severe_backoff = 0.4;     /* cut to 40% at once instead of 85% */
     bc_cfg.retx_event_backoff = 0.85; /* see bitrate_ctl.h's own comment: fires on every
                                         * BB_EVENT_RETX_TOO_MANY, the vendor's own real
                                         * retx-pressure signal (independently recovered via

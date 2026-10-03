@@ -203,23 +203,59 @@ static uint32_t clamp_u32(uint32_t v, uint32_t lo, uint32_t hi)
 #define RECOVERY_JUMP_RATIO 2.0
 #define RECOVERY_JUMP_FRAC  0.6
 
+/* Link throughput change that counts as a jump for swing detection. */
+#define LINK_SWING_FACTOR 1.5
+
+/* RETX_TOO_MANY events counted over this window for the severe cut
+ * (cfg->retx_severe_events), and how many timestamps are kept for it. */
+#define RETX_SEVERE_WINDOW_MS 1000
+#define RETX_EVENT_HISTORY    16
+
 static uint64_t g_congested_until_ms; /* CLOCK_MONOTONIC ms, __atomic access */
 
 /* waybeam refuses video0.bitrate below its own floor with HTTP 409 (a
  * deliberate, configurable safety net: below ~1 Mbit/s the encoder can't
- * hold a steady rate). cfg->min_kbps doesn't know that floor, so the
- * multiplicative cuts kept asking for 854-999 kbps and getting 409 over
- * and over (36 times in one flight on 2026-10-02). The first 409 on a cut
- * teaches us the floor: the rate currently applied, which waybeam did
- * accept. Learned per process, so a changed waybeam config is picked up
- * on the next start. */
-static uint32_t learn_floor(uint32_t floor_kbps, int status, uint32_t applied_kbps)
+ * hold a steady rate). cfg->min_kbps doesn't know that floor. A 409 for
+ * `rejected` kbps proves the floor is above it, so the floor becomes
+ * rejected + 1. Learned per process, so a changed waybeam config is
+ * picked up on the next start.
+ *
+ * (The first version took the *currently applied* rate as the floor.
+ * That was harmless with 15% cuts, which only ever asked for a little
+ * below the real floor, but a severe 40% cut from 1594 kbps asked for
+ * 637, got 409 and pinned the floor at 1594 for the rest of the run --
+ * caught in a host replay of the 2026-10-03 10:45 fade.) */
+static uint32_t learn_floor(uint32_t floor_kbps, int status, uint32_t rejected_kbps)
 {
-    if (status == 409 && applied_kbps > floor_kbps) {
-        fprintf(stderr, "bitrate_ctl: waybeam refused a lower bitrate (409) -> floor %u kbps\n", applied_kbps);
-        return applied_kbps;
-    }
+    if (status == 409 && rejected_kbps + 1 > floor_kbps)
+        return rejected_kbps + 1;
     return floor_kbps;
+}
+
+/* Applies a cut to *kbps from current_kbps (which waybeam accepted). On a
+ * 409 the floor is learned and the request retried halfway between the
+ * refused value and current_kbps, a few times: bisects onto waybeam's
+ * real floor instead of leaving the bitrate where it was. On success
+ * *kbps holds what was actually applied. Returns the last HTTP status. */
+static int apply_cut(const bitrate_ctl_cfg_t *cfg, uint32_t *kbps, uint32_t current_kbps, uint32_t *floor_kbps)
+{
+    int status = 0;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        char path[128];
+        snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", *kbps);
+        status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+        if (status != 409)
+            return status;
+        uint32_t floor_before = *floor_kbps;
+        *floor_kbps = learn_floor(*floor_kbps, status, *kbps);
+        if (*floor_kbps != floor_before)
+            fprintf(stderr, "bitrate_ctl: waybeam refused %u kbps (409) -> floor >= %u kbps\n", *kbps,
+                    *floor_kbps);
+        if (*kbps >= current_kbps || current_kbps - *kbps <= 32)
+            return status;
+        *kbps += (current_kbps - *kbps) / 2;
+    }
+    return status;
 }
 
 static void mark_congested(uint64_t now)
@@ -312,7 +348,13 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     uint64_t last_retx_event_apply_ms = 0;
     uint64_t last_cut_ms = 0;      /* any decrease, from any path */
     uint64_t last_mcs_cut_ms = 0;  /* MCS-derived decreases only */
-    uint32_t floor_kbps = cfg->min_kbps; /* raised by learn_floor() */
+    uint32_t prev_link_kbps = 0;   /* previous BB_GET_MCS throughput */
+    uint64_t last_link_rise_ms = 0; /* link throughput jumped up (>= LINK_SWING_FACTOR) */
+    uint64_t last_link_swing_ms = 0; /* ... and fell back within unstable_window_ms */
+    uint32_t floor_kbps = cfg->min_kbps; /* raised by learn_floor()/apply_cut() */
+    uint64_t retx_event_ms[RETX_EVENT_HISTORY] = {0}; /* ring of recent RETX_TOO_MANY times */
+    unsigned retx_event_pos = 0;
+    sig_atomic_t retx_counted = 0;
     uint64_t last_increase_ms = 0; /* paces increases (cfg->min_interval_ms) */
     uint64_t last_mcs_poll_ms = 0; /* paces BB_GET_MCS (cfg->poll_interval_ms) */
 
@@ -320,6 +362,7 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         usleep(100 * 1000);
 
         uint64_t now = now_ms();
+
 
         /* Ring backlog check: a cheap, always-on shared-memory read (no
          * RPC, unlike BB_GET_MCS), so this runs every ~100ms tick
@@ -421,7 +464,7 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                                 "bitrate_ctl: waybeam %s returned status=%d (URGENT backlog=%u slots)\n",
                                 path, status, backlog_slots);
                         if (cut_bitrate)
-                            floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
+                            floor_kbps = learn_floor(floor_kbps, status, backlog_target);
                     }
                 }
             } else if (roi_enabled && last_applied_kbps >= cfg->roi_max_kbps &&
@@ -467,24 +510,27 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             last_ldpc_apply_ms = now;
             double ldpc_ratio;
             if (read_ldpc_ratio(cfg->link, &ldpc_ratio) == 0 && ldpc_ratio >= cfg->ldpc_ratio_high) {
-                uint32_t ldpc_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->ldpc_backoff),
+                /* Severity: a mostly-failing link (flight 2026-10-03
+                 * 10:44:57, ratio 100%) got the same 15% trim as a
+                 * marginal one, and the fade finished filling the ring
+                 * before the MCS path caught up. */
+                double factor = (cfg->ldpc_severe_ratio > 0.0 && ldpc_ratio >= cfg->ldpc_severe_ratio)
+                                    ? cfg->severe_backoff
+                                    : cfg->ldpc_backoff;
+                uint32_t ldpc_target = clamp_u32((uint32_t)((double)last_applied_kbps * factor),
                                                   floor_kbps, cfg->max_kbps);
                 if (ldpc_target < last_applied_kbps) {
-                    char path[128];
-                    snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", ldpc_target);
-                    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+                    int status = apply_cut(cfg, &ldpc_target, last_applied_kbps, &floor_kbps);
                     if (status >= 200 && status < 300) {
-                        fprintf(stderr, "bitrate_ctl: LDPC error ratio=%.1f%% -> video0.bitrate=%u kbps\n",
-                                ldpc_ratio * 100.0, ldpc_target);
+                        fprintf(stderr, "bitrate_ctl: LDPC error ratio=%.1f%% -> video0.bitrate=%u kbps%s\n",
+                                ldpc_ratio * 100.0, ldpc_target, factor == cfg->severe_backoff ? " (severe)" : "");
                         last_applied_kbps = ldpc_target;
                         last_apply_ms = now;
                         last_cut_ms = now;
                         mark_congested(now);
                     } else {
-                        fprintf(stderr,
-                                "bitrate_ctl: waybeam %s returned status=%d (LDPC ratio=%.1f%%)\n", path,
-                                status, ldpc_ratio * 100.0);
-                        floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
+                        fprintf(stderr, "bitrate_ctl: waybeam video0.bitrate=%u returned status=%d (LDPC ratio=%.1f%%)\n",
+                                ldpc_target, status, ldpc_ratio * 100.0);
                     }
                 }
             }
@@ -500,6 +546,15 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
          * succession cuts once, not once per event. Bypasses hysteresis,
          * cut only -- same shape as every other fast-path signal in this
          * file. */
+        /* Timestamp every RETX_TOO_MANY event as it is seen, independent
+         * of the cut gating below, for the severity count. */
+        {
+            sig_atomic_t c = g_retx_too_many;
+            while (retx_counted != c) {
+                retx_counted++;
+                retx_event_ms[retx_event_pos++ % RETX_EVENT_HISTORY] = now;
+            }
+        }
         if (cfg->retx_event_backoff > 0.0 && have_applied &&
             (now - last_retx_event_apply_ms) >= (uint64_t)RETX_EVENT_BACKOFF_MIN_INTERVAL_MS &&
             (now - last_cut_ms) >= (uint64_t)FAST_CUT_HOLDOFF_MS) {
@@ -507,23 +562,27 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             if (retx_too_many_now != last_seen_retx_too_many) {
                 last_seen_retx_too_many = retx_too_many_now;
                 last_retx_event_apply_ms = now;
-                uint32_t retx_target = clamp_u32((uint32_t)((double)last_applied_kbps * cfg->retx_event_backoff),
+                int recent = 0;
+                for (int i = 0; i < RETX_EVENT_HISTORY; i++)
+                    if (retx_event_ms[i] && now - retx_event_ms[i] < (uint64_t)RETX_SEVERE_WINDOW_MS)
+                        recent++;
+                double factor = (cfg->retx_severe_events > 0 && recent >= cfg->retx_severe_events)
+                                    ? cfg->severe_backoff
+                                    : cfg->retx_event_backoff;
+                uint32_t retx_target = clamp_u32((uint32_t)((double)last_applied_kbps * factor),
                                                   floor_kbps, cfg->max_kbps);
                 if (retx_target < last_applied_kbps) {
-                    char path[128];
-                    snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", retx_target);
-                    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+                    int status = apply_cut(cfg, &retx_target, last_applied_kbps, &floor_kbps);
                     if (status >= 200 && status < 300) {
-                        fprintf(stderr, "bitrate_ctl: BB_EVENT_RETX_TOO_MANY -> video0.bitrate=%u kbps\n",
-                                retx_target);
+                        fprintf(stderr, "bitrate_ctl: BB_EVENT_RETX_TOO_MANY -> video0.bitrate=%u kbps%s\n",
+                                retx_target, factor == cfg->severe_backoff ? " (severe)" : "");
                         last_applied_kbps = retx_target;
                         last_apply_ms = now;
                         last_cut_ms = now;
                         mark_congested(now);
                     } else {
-                        fprintf(stderr, "bitrate_ctl: waybeam %s returned status=%d (RETX_TOO_MANY)\n", path,
-                                status);
-                        floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
+                        fprintf(stderr, "bitrate_ctl: waybeam video0.bitrate=%u returned status=%d (RETX_TOO_MANY)\n",
+                                retx_target, status);
                     }
                 }
             }
@@ -548,6 +607,19 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
         uint32_t link_kbps;
         if (read_tx_throughput_kbps(cfg->link, slot, &link_kbps) != 0)
             continue;
+
+        /* Link swing detection for the cautious ramp: the link's own
+         * throughput jumping up and falling back within
+         * unstable_window_ms (a yo-yo, flight 2026-10-03 10:37:55-10:38:06:
+         * MCS 2 -> 8 -> 2 within seconds). A fade -- falling, then rising
+         * once -- is not a swing, so its recovery ramps at full speed. */
+        if (prev_link_kbps && link_kbps >= prev_link_kbps * LINK_SWING_FACTOR) {
+            last_link_rise_ms = now;
+        } else if (prev_link_kbps && link_kbps * LINK_SWING_FACTOR <= prev_link_kbps && last_link_rise_ms &&
+                   (now - last_link_rise_ms) < (uint64_t)cfg->unstable_window_ms) {
+            last_link_swing_ms = now;
+        }
+        prev_link_kbps = link_kbps;
 
         uint32_t target_kbps = (uint32_t)((double)link_kbps * cfg->margin);
         target_kbps = clamp_u32(target_kbps, floor_kbps, cfg->max_kbps);
@@ -577,9 +649,16 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
             if ((now - last_backlog_ms) < (uint64_t)cfg->ramp_settle_ms ||
                 (now - last_cut_ms) < (uint64_t)cfg->ramp_settle_ms)
                 continue;
-            if (cfg->ramp_step > 0.0) {
-                uint32_t step_cap = (uint32_t)((double)last_applied_kbps * (1.0 + cfg->ramp_step));
-                if ((double)target_kbps >= (double)last_applied_kbps * RECOVERY_JUMP_RATIO) {
+            /* Unstable link: it swung (see above) within the last
+             * unstable_window_ms -- step cautiously and skip the recovery
+             * jump. Flight 2026-10-03 10:37:59: +25% steps rode a short
+             * MCS 8 peak from 4.5 to 8.8 Mbit/s, the next drop hit a full
+             * ring (93 ms frame age). */
+            int unstable = last_link_swing_ms && (now - last_link_swing_ms) < (uint64_t)cfg->unstable_window_ms;
+            double step = unstable && cfg->unstable_ramp_step > 0.0 ? cfg->unstable_ramp_step : cfg->ramp_step;
+            if (step > 0.0) {
+                uint32_t step_cap = (uint32_t)((double)last_applied_kbps * (1.0 + step));
+                if (!unstable && (double)target_kbps >= (double)last_applied_kbps * RECOVERY_JUMP_RATIO) {
                     uint32_t jump = (uint32_t)((double)target_kbps * RECOVERY_JUMP_FRAC);
                     if (jump > step_cap)
                         step_cap = jump;
@@ -609,14 +688,17 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
          * /etc/waybeam.json and, worse, have a crash/reboot right after a
          * link-quality dip boot back up pinned at that low bitrate
          * instead of the configured default. */
-        char path[128];
-        snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", target_kbps);
-        int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+        int status;
+        if (cutting && have_applied) {
+            status = apply_cut(cfg, &target_kbps, last_applied_kbps, &floor_kbps);
+        } else {
+            char path[128];
+            snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", target_kbps);
+            status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+        }
         if (status < 200 || status >= 300) {
-            fprintf(stderr, "bitrate_ctl: waybeam %s returned status=%d (link=%u kbps, target=%u kbps)\n",
-                    path, status, link_kbps, target_kbps);
-            if (cutting)
-                floor_kbps = learn_floor(floor_kbps, status, last_applied_kbps);
+            fprintf(stderr, "bitrate_ctl: waybeam video0.bitrate=%u returned status=%d (link=%u kbps)\n",
+                    target_kbps, status, link_kbps);
             continue; /* try again next tick rather than pinning last_applied to an unapplied value */
         }
 
