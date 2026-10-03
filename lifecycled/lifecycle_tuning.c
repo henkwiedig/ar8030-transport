@@ -103,7 +103,7 @@ int lc_tuning_save(const char* cfg_path, int bandwidth_mhz)
     return 0;
 }
 
-int lc_tuning_read_current(bb_dev_handle_t* handle)
+int lc_tuning_read_current(bb_dev_handle_t* handle, int is_ap)
 {
     bb_get_status_in_t  in = {0xffff};
     bb_get_status_out_t out;
@@ -112,10 +112,8 @@ int lc_tuning_read_current(bb_dev_handle_t* handle)
     if (bb_ioctl(handle, BB_GET_STATUS, &in, &out) != 0) {
         return -1;
     }
-    /* This project only ever runs single-user mode -- see
-     * lifecycle_pair.c's own slot-scan comment for the equivalent
-     * reasoning on the slot side; user 0 is always the real data user. */
-    int bw = out.user_status[0].tx_status.bandwidth;
+    /* Single-user mode only -- see lifecycle_pair.c's slot-scan comment. */
+    int bw = out.user_status[is_ap ? BB_USER_BR_CS : BB_USER_0].tx_status.bandwidth;
     if (bw < 0 || bw >= BB_BW_MAX) {
         return -1;
     }

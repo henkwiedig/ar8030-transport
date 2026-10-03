@@ -40,10 +40,12 @@ int lc_tuning_load(const char* cfg_path);
  * cfg_path. Returns 0 on success. */
 int lc_tuning_save(const char* cfg_path, int bandwidth_mhz);
 
-/* Reads the AR8030's own currently-active TX bandwidth (MHz) for user 0
- * via BB_GET_STATUS. Returns -1 on ioctl failure or an out-of-range
- * reading. */
-int lc_tuning_read_current(bb_dev_handle_t* handle);
+/* Reads the AR8030's own currently-active TX bandwidth (MHz) via
+ * BB_GET_STATUS: the DEV's user 0, the AP's BR/CS user (user 8 -- the
+ * AP's user 0 TX status is an unused 2.5 MHz placeholder; its video goes
+ * out on user 8, same user lc_power_apply() sets). Returns -1 on ioctl
+ * failure or an out-of-range reading. */
+int lc_tuning_read_current(bb_dev_handle_t* handle, int is_ap);
 
 /* Applies bandwidth_mhz (TX direction) to the given slot via
  * BB_SET_BANDWIDTH. slot must be the slot actually reporting CONNECT

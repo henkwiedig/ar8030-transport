@@ -1172,32 +1172,27 @@ void* lifecycle_thread_main(void* arg)
                 break;
             }
             ctx->drop_miss_count = 0;
-            /* Re-apply (not "detect and persist a live change"): confirmed
-             * live, tonight, that a fresh CONNECT can report a narrow
-             * bandwidth (e.g. 2.5M) for a while before the two sides
-             * finish negotiating up to what was actually just requested --
-             * this is exactly the "bandwidth-plateau" behavior
-             * S65ar8030-transport-tx's own former apply_link_tuning()
-             * fought by re-issuing its fixed BB_SET_BANDWIDTH every 30s
-             * regardless of what the last reading showed. An earlier
-             * version of this code tried to be cleverer -- read the
-             * current value, and if it differed from what was last
-             * applied, treat that as an operator's own live
-             * `ar8030-linkctl bandwidth` change and persist it -- but a
-             * mid-negotiation narrow reading is indistinguishable from a
-             * genuine operator change by value alone, and got
-             * self-inflicted proof of that live: it persisted a transient
-             * 2MHz plateau reading over a real 20MHz default within one
-             * second of connecting. Re-asserting the intended value
-             * periodically (BB_SET_BANDWIDTH is a fast, idempotent
-             * override, safe to reissue on an already-correct link) is
-             * simpler and matches the one thing already proven to work. */
+            /* Re-apply (never persist) when the chip reports another TX
+             * bandwidth than wanted: a fresh CONNECT can sit at a narrow
+             * bandwidth (e.g. 2.5M) for a while before the two sides finish
+             * negotiating up to what was requested (the "bandwidth-plateau"
+             * the old S65 apply_link_tuning() fought), and a narrow reading
+             * mid-negotiation is indistinguishable from an operator's
+             * `ar8030-linkctl bandwidth` by value alone -- an earlier
+             * version persisted a 2 MHz plateau over the 20 MHz default.
+             * Only on a mismatch, though: re-issuing BB_SET_BANDWIDTH and
+             * BB_SET_FRAME_CHANGE every 5 s regardless also hit the link in
+             * the middle of fades, and stock never does it. */
             if (did_fallback_poll && ctx->last_bandwidth > 0) {
-                lc_tuning_apply(ctx->client.handle, ctx->connected_slot, ctx->last_bandwidth);
-                /* Bandwidth renegotiation may reset the frame structure;
-                 * mode=1 is idempotent, so just re-assert it alongside. */
-                if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
-                    lc_frame_change_apply(ctx->client.handle, 1);
+                int cur = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
+                if (cur > 0 && cur != ctx->last_bandwidth) {
+                    lc_log("lifecycle: tuning: chip at %d MHz, want %d MHz -- re-applying", cur,
+                           ctx->last_bandwidth);
+                    lc_tuning_apply(ctx->client.handle, ctx->connected_slot, ctx->last_bandwidth);
+                    /* Bandwidth renegotiation may reset the frame structure. */
+                    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
+                        lc_frame_change_apply(ctx->client.handle, 1);
+                    }
                 }
             }
             if (did_fallback_poll) {
