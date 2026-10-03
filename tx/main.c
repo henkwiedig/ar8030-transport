@@ -146,6 +146,7 @@ struct tx_args {
     uint32_t sock_rx_buf;
     int sock_bidir;
     int idr_coalesce_ms;
+    int bc_mode; /* BITRATE_CTL_MODE_RULES / _PI, -C */
     uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
     double ring_backoff;         /* bitrate multiplier per URGENT cut */
     int sidecar_port;            /* waybeam outgoing.sidecarPort to forward, 0 = off */
@@ -178,6 +179,8 @@ static void usage(const char *argv0)
             "                 the ground's keyframe requests -- -N disables those)\n"
             "  -i <ms>        coalesce keyframe requests within this window (default %d, 0 = honor\n"
             "                 every one; PixelPilot sends 3 per request, 100 ms apart)\n"
+            "  -C <rules|pi>  bitrate controller: rule-based (default) or feedforward + PI on the\n"
+            "                 air-side delay (see bitrate_ctl.c and tools/bc_replay)\n"
             "  -S <port>      forward waybeam's RTP timing sidecar from this loopback UDP port\n"
             "                 (waybeam outgoing.sidecarPort) to the ground (default 0 = off)\n"
 
@@ -208,12 +211,13 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->sock_rx_buf = 1024;
     a->sock_bidir = 1;
     a->idr_coalesce_ms = DEFAULT_IDR_COALESCE_MS;
+    a->bc_mode = BITRATE_CTL_MODE_RULES;
     a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
     a->ring_backoff = 0.92;
     a->sidecar_port = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:C:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
@@ -262,6 +266,16 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'X':
             a->sock_bidir = 1;
+            break;
+        case 'C':
+            if (!strcmp(optarg, "pi"))
+                a->bc_mode = BITRATE_CTL_MODE_PI;
+            else if (!strcmp(optarg, "rules"))
+                a->bc_mode = BITRATE_CTL_MODE_RULES;
+            else {
+                fprintf(stderr, "tx: -C takes pi or rules\n");
+                return -1;
+            }
             break;
         case 'N':
             a->sock_bidir = 0;
@@ -730,6 +744,20 @@ int main(int argc, char **argv)
                                         * BB_EVENT_RETX_TOO_MANY, the vendor's own real
                                         * retx-pressure signal (independently recovered via
                                         * Ghidra, not in the SDK's own bb_event_e) */
+    /* PI mode (-C pi): gains from a replay sweep over the 2026-10-02/03
+     * flight logs (tools/bc_replay): same mean bitrate as the rules mode,
+     * about half the dropped frames and delay spikes. */
+    bc_cfg.mode = args.bc_mode;
+    bc_cfg.pi_delay_set_ms = 30;
+    bc_cfg.pi_kp_up = 0.006;
+    bc_cfg.pi_kp_down = 0.02;
+    bc_cfg.pi_ki_up = 0.01;
+    bc_cfg.pi_ki_down = 0.05;
+    bc_cfg.pi_k_min = 0.2;
+    bc_cfg.pi_k_max = 1.1;
+    bc_cfg.pi_slew_up = 2.0;
+    bc_cfg.pi_severe_k = 0.3;
+    bc_cfg.pi_mild_trim = 0.85;
     bc_cfg.stop_flag = &g_stop;
 
     tx_outq_t outq;
@@ -990,8 +1018,18 @@ int main(int argc, char **argv)
                                        meta.pts, frame_data, frame_len, args.chunk_payload,
                                        chunk_send_to_socket, &send_ctx, &expected_chunks, chunk_scratch,
                                        chunk_scratch_size);
-        uint64_t write_us = now_monotonic_us() - write_start_us;
+        uint64_t write_end_us = now_monotonic_us();
+        uint64_t write_us = write_end_us - write_start_us;
         stats.write_us_sum += write_us;
+        /* Air-side delay for the PI controller: pts -> last chunk written,
+         * EWMA 1/8 (pts is the low 32 bits of CLOCK_MONOTONIC us). */
+        {
+            static double delay_ewma_us;
+            double d_us = (double)(uint32_t)((uint32_t)write_end_us - meta.pts);
+            delay_ewma_us = delay_ewma_us ? delay_ewma_us + (d_us - delay_ewma_us) / 8.0 : d_us;
+            __atomic_store_n(&bc_cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
+            __atomic_store_n(&bc_cfg.last_tx_done_ms, write_end_us / 1000, __ATOMIC_RELEASE);
+        }
         stats.write_frames++;
         if (write_us > stats.write_us_max)
             stats.write_us_max = write_us;

@@ -170,8 +170,33 @@ typedef struct {
     int retx_severe_events;    /* e.g. 3 */
     double severe_backoff;     /* e.g. 0.4 */
 
+    /* BITRATE_CTL_MODE_RULES (default) or BITRATE_CTL_MODE_PI, see
+     * bitrate_ctl.c. The PI mode uses margin, min/max_kbps,
+     * poll_interval_ms, ring/ring_backlog_high_slots/ring_backoff,
+     * ldpc_ratio_high, ldpc_severe_ratio, retx_severe_events and the
+     * pi_* fields below; the ramp/settle/unstable/backoff factors are
+     * rules-mode only. */
+    int mode;
+
+    /* Air-side delay, written by tx/main.c's send loop (__atomic):
+     * EWMA of (last chunk written - frame pts) in us, and when the last
+     * frame finished (CLOCK_MONOTONIC ms). PI mode only. */
+    uint32_t delay_us;
+    uint64_t last_tx_done_ms;
+
+    double pi_delay_set_ms;  /* delay setpoint, e.g. 25 */
+    double pi_kp_up, pi_kp_down; /* proportional gain per ms of error */
+    double pi_ki_up, pi_ki_down; /* integral gain per ms of error per s */
+    double pi_k_min, pi_k_max;   /* bounds of k (rate = C * margin * k) */
+    double pi_slew_up;           /* max relative increase per second, e.g. 1.5 */
+    double pi_severe_k;          /* integrator clamp on a severe LDPC/RETX burst, e.g. 0.4 */
+    double pi_mild_trim;         /* integrator trim on a mild one, e.g. 0.9 */
+
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;
+
+#define BITRATE_CTL_MODE_RULES 0
+#define BITRATE_CTL_MODE_PI    1
 
 /* Runs the control loop until *cfg->stop_flag becomes non-zero. Meant to
  * be the body of its own pthread (blocks). Returns 0 on a clean stop,

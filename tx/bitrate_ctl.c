@@ -268,7 +268,7 @@ int bitrate_ctl_congested(void)
     return now_ms() < __atomic_load_n(&g_congested_until_ms, __ATOMIC_ACQUIRE);
 }
 
-int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
+static void subscribe_events(const bitrate_ctl_cfg_t *cfg)
 {
     /* Loaded once here via the same atomic accessor the rest of this file
      * uses (see ar8030_link_t's own header comment) even though nothing
@@ -330,7 +330,13 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
                     retx_sub_ret);
         }
     }
+}
 
+/* The rule-based controller (cfg->mode == BITRATE_CTL_MODE_RULES): capacity
+ * feedforward plus fixed multiplicative cuts and a stepped ramp. Kept as
+ * the default until the PI controller below has flown. */
+static int run_rules(const bitrate_ctl_cfg_t *cfg)
+{
     uint32_t last_applied_kbps = 0;
     int have_applied = 0;
     uint64_t last_apply_ms = 0;
@@ -717,4 +723,183 @@ int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
     }
 
     return 0;
+}
+
+/* ---------------------------------------------------------------------
+ * PI controller (cfg->mode == BITRATE_CTL_MODE_PI)
+ *
+ * rate = clamp(C * margin * k, floor, max_kbps), every 100 ms tick:
+ *   C  -- link capacity, BB_GET_MCS throughput (feedforward: a drop is
+ *         applied at once, a rise is slew-limited);
+ *   k  -- PI output on the air-side delay D (capture -> last chunk
+ *         written, published by tx/main.c), error e = D_set - D in ms,
+ *         asymmetric gains (back off fast, creep up slowly), no D term;
+ *   disturbance feedforward: severe LDPC / RETX bursts clamp the
+ *         integrator at once, milder ones trim it; ring backlog stays as
+ *         a hard backstop.
+ * Anti-windup: the integrator doesn't climb while the rate is held by
+ * the ceiling or the slew limit, and doesn't sink while at waybeam's
+ * floor.
+ * ------------------------------------------------------------------- */
+
+#define PI_TICK_MS            100
+#define PI_DISTURB_HOLD_MS    500  /* mild LDPC/RETX trims at most this often */
+#define PI_CONGESTED_FACTOR   2.0  /* D above this x D_set counts as congested */
+#define PI_STALE_MS           150  /* no frame finished this long: D grows with it */
+#define PI_MIN_UP_STEP        0.05 /* send increases of at least 5% ... */
+#define PI_MIN_DOWN_STEP      0.03 /* ... and decreases of at least 3% */
+
+static int run_pi(const bitrate_ctl_cfg_t *cfg)
+{
+    uint32_t cap_kbps = 0;           /* last good BB_GET_MCS throughput */
+    uint64_t last_mcs_poll_ms = 0;
+    sig_atomic_t last_seen_wake = 0;
+    double k_i = 1.0;                /* integrator state */
+    double k = 1.0;
+    uint32_t applied_kbps = 0;       /* last rate waybeam accepted */
+    uint64_t last_apply_ms = 0;
+    uint32_t floor_kbps = cfg->min_kbps;
+    uint64_t last_ldpc_ms = 0, last_disturb_ms = 0, last_severe_ms = 0, last_backlog_ms = 0;
+    uint64_t retx_event_ms[RETX_EVENT_HISTORY] = {0};
+    unsigned retx_event_pos = 0;
+    sig_atomic_t retx_counted = 0, retx_seen = 0;
+    uint64_t last_tick_ms = now_ms();
+
+    while (!*cfg->stop_flag) {
+        usleep(PI_TICK_MS * 1000);
+        uint64_t now = now_ms();
+        double dt = (double)(now - last_tick_ms) / 1000.0;
+        last_tick_ms = now;
+
+        /* Measured delay; if nothing finished for a while, the frame in
+         * flight is at least that old. */
+        double d_ms = (double)__atomic_load_n(&cfg->delay_us, __ATOMIC_ACQUIRE) / 1000.0;
+        uint64_t done_ms = __atomic_load_n(&cfg->last_tx_done_ms, __ATOMIC_ACQUIRE);
+        if (done_ms && now > done_ms + PI_STALE_MS && (double)(now - done_ms) > d_ms)
+            d_ms = (double)(now - done_ms);
+
+        /* Capacity (feedforward). */
+        int woken = g_wake != last_seen_wake;
+        last_seen_wake = g_wake;
+        if (!cap_kbps || woken || now - last_mcs_poll_ms >= (uint64_t)cfg->poll_interval_ms) {
+            last_mcs_poll_ms = now;
+            uint32_t c;
+            bb_slot_e slot = __atomic_load_n(&cfg->slot, __ATOMIC_ACQUIRE);
+            if (read_tx_throughput_kbps(cfg->link, slot, &c) == 0 && c)
+                cap_kbps = c;
+        }
+        if (!cap_kbps)
+            continue;
+
+        /* Disturbance feedforward: the radio says it is losing frames
+         * before the delay can show it. */
+        {
+            sig_atomic_t c = g_retx_too_many;
+            while (retx_counted != c) {
+                retx_counted++;
+                retx_event_ms[retx_event_pos++ % RETX_EVENT_HISTORY] = now;
+            }
+        }
+        int recent_retx = 0;
+        for (int i = 0; i < RETX_EVENT_HISTORY; i++)
+            if (retx_event_ms[i] && now - retx_event_ms[i] < (uint64_t)RETX_SEVERE_WINDOW_MS)
+                recent_retx++;
+        int new_retx = retx_seen != retx_counted;
+        retx_seen = retx_counted;
+        double ldpc = 0.0;
+        if (cfg->ldpc_ratio_high > 0.0 && now - last_ldpc_ms >= (uint64_t)LDPC_BACKOFF_MIN_INTERVAL_MS) {
+            last_ldpc_ms = now;
+            if (read_ldpc_ratio(cfg->link, &ldpc) != 0)
+                ldpc = 0.0;
+        }
+        const char *why = NULL;
+        if ((cfg->ldpc_severe_ratio > 0.0 && ldpc >= cfg->ldpc_severe_ratio) ||
+            (cfg->retx_severe_events > 0 && recent_retx >= cfg->retx_severe_events)) {
+            if (k_i > cfg->pi_severe_k) {
+                k_i = cfg->pi_severe_k;
+                why = "severe";
+            }
+            last_severe_ms = last_disturb_ms = now;
+        } else if ((ldpc >= cfg->ldpc_ratio_high || new_retx) && now - last_disturb_ms >= PI_DISTURB_HOLD_MS) {
+            k_i *= cfg->pi_mild_trim;
+            last_disturb_ms = now;
+            why = "trim";
+        }
+
+        /* Ring backlog: hard backstop, same signal as the rules mode. */
+        venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);
+        if (ring && __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED) >= cfg->ring_backlog_high_slots &&
+            now - last_backlog_ms >= (uint64_t)RING_CUT_HOLDOFF_MS) {
+            k_i = (k < k_i ? k : k_i) * cfg->ring_backoff;
+            last_backlog_ms = now;
+            why = "backlog";
+        }
+
+        /* PI on the delay. */
+        double e = cfg->pi_delay_set_ms - d_ms;
+        double kp = e < 0 ? cfg->pi_kp_down : cfg->pi_kp_up;
+        double ki = e < 0 ? cfg->pi_ki_down : cfg->pi_ki_up;
+        double base = (double)cap_kbps * cfg->margin;
+        int at_floor = applied_kbps && applied_kbps <= floor_kbps;
+        int held_up = applied_kbps && (double)applied_kbps < base * k * 0.9; /* ceiling or slew holding it */
+        if ((e > 0 && !held_up && applied_kbps < cfg->max_kbps) || (e < 0 && !at_floor))
+            k_i += ki * e * dt;
+        if (k_i < cfg->pi_k_min)
+            k_i = cfg->pi_k_min;
+        if (k_i > cfg->pi_k_max)
+            k_i = cfg->pi_k_max;
+        k = k_i + kp * e;
+        if (k < cfg->pi_k_min)
+            k = cfg->pi_k_min;
+        if (k > cfg->pi_k_max)
+            k = cfg->pi_k_max;
+
+        if (d_ms > cfg->pi_delay_set_ms * PI_CONGESTED_FACTOR || (last_severe_ms && now - last_severe_ms < 1500))
+            mark_congested(now);
+
+        /* Target: capacity feedforward x k, slew-limited upward. */
+        double target = base * k;
+        if (target < floor_kbps)
+            target = floor_kbps;
+        if (target > cfg->max_kbps)
+            target = cfg->max_kbps;
+        if (applied_kbps && target > applied_kbps) {
+            double cap_up = (double)applied_kbps * (1.0 + cfg->pi_slew_up * dt);
+            if (target > cap_up)
+                target = cap_up;
+        }
+        uint32_t t = (uint32_t)target;
+        if (applied_kbps) {
+            double rel = ((double)t - applied_kbps) / applied_kbps;
+            int due = now - last_apply_ms >= 1000;
+            if (rel > 0 ? (rel < PI_MIN_UP_STEP && !due) : (-rel < PI_MIN_DOWN_STEP && !why))
+                continue;
+            if (t == applied_kbps)
+                continue;
+        }
+
+        int status;
+        if (applied_kbps && t < applied_kbps) {
+            status = apply_cut(cfg, &t, applied_kbps, &floor_kbps);
+        } else {
+            char path[128];
+            snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", t);
+            status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+        }
+        if (status < 200 || status >= 300) {
+            fprintf(stderr, "bitrate_ctl: pi waybeam video0.bitrate=%u returned status=%d\n", t, status);
+            continue;
+        }
+        fprintf(stderr, "bitrate_ctl: pi C=%u D=%.1fms k=%.2f%s%s -> video0.bitrate=%u kbps\n", cap_kbps, d_ms, k,
+                why ? " " : "", why ? why : "", t);
+        applied_kbps = t;
+        last_apply_ms = now;
+    }
+    return 0;
+}
+
+int bitrate_ctl_run(const bitrate_ctl_cfg_t *cfg)
+{
+    subscribe_events(cfg);
+    return cfg->mode == BITRATE_CTL_MODE_PI ? run_pi(cfg) : run_rules(cfg);
 }
