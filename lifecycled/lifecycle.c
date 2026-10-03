@@ -107,6 +107,10 @@ struct lifecycle_ctx {
      * CONNECT while in LC_STATE_CONNECTED -- see LC_DROP_CONFIRM_TICKS.
      * Reset to 0 on any CONNECT reading. */
     int drop_miss_count;
+    /* AP: BB_SET_FRAME_CHANGE(1) not yet accepted on this link -- it can
+     * fail right after CONNECT (ret -2, seen 2026-10-03 with --fem-ctrl:
+     * MCS 10 then gives 19.5 instead of 27.7 Mbit/s), retried per poll. */
+    int frame_change_pending;
 
     /* Consecutive main-loop ticks (1s each) the link has read as CONNECT
      * while in LC_STATE_IDLE -- every CONNECT this process ever observes
@@ -418,7 +422,7 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
      * gets ~40 Mbit/s at MCS 12 vs 25.9 without this). Chip-wide, needs an
      * established link, and is lost on reboot/re-link, hence here. */
     if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
-        lc_frame_change_apply(ctx->client.handle, 1);
+        ctx->frame_change_pending = lc_frame_change_apply(ctx->client.handle, 1) != 0;
     }
 
     /* DEV side of --link-policy: the downlink's table, on every connect
@@ -1191,9 +1195,12 @@ void* lifecycle_thread_main(void* arg)
                     lc_tuning_apply(ctx->client.handle, ctx->connected_slot, ctx->last_bandwidth);
                     /* Bandwidth renegotiation may reset the frame structure. */
                     if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
-                        lc_frame_change_apply(ctx->client.handle, 1);
+                        ctx->frame_change_pending = 1;
                     }
                 }
+            }
+            if (did_fallback_poll && ctx->frame_change_pending) {
+                ctx->frame_change_pending = lc_frame_change_apply(ctx->client.handle, 1) != 0;
             }
             if (did_fallback_poll) {
                 lc_channel_track(ctx);
