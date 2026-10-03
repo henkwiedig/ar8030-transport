@@ -438,7 +438,7 @@ static void defaults(int mode)
     cfg.pi_severe_k = 0.5;
     cfg.pi_retx_severe_events = 6;
     cfg.pi_mild_trim = 0.85;
-    cfg.pi_recover_per_s = 0;
+    cfg.pi_recover_per_s = 0.2;
     cfg.stop_flag = &g_stop;
 }
 
