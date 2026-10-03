@@ -29,6 +29,7 @@
 #include "bb_dev.h"
 #include "../common/ar8030_batt.h"
 #include "../common/ar8030_rftemp.h"
+#include "../common/ar8030_link_policy.h"
 
 #include <math.h>
 #include <signal.h>
@@ -1335,45 +1336,25 @@ static int cmd_mcs_range(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
-/* Transcribed byte-for-byte from Ghidra's decompile of stock ar_ldy_gnd's
- * mcs-table-reload routine (FUN_001a1c68 in that binary) -- param_1==0
- * and ==1 both hit the same branch (table index 0 below); ==2 hits a
- * second, distinct branch (table index 1 below). Field order here
- * matches bb_set_mcs_item_t exactly (mcs, ldpc_up_num, snr_up, snr_dw,
- * ldpc_dw_num, up_keep_time, dw_keep_time) -- NOT bb_mcs_para_t's own
- * declared order, which this wire struct does not reuse. */
-struct mcs_table_entry {
-    uint8_t  mcs;
-    uint8_t  ldpc_up_num;
-    uint16_t snr_up;
-    uint16_t snr_dw;
-    uint8_t  ldpc_dw_num;
-    uint16_t up_keep_time;
-    uint16_t dw_keep_time;
-};
-
-static const struct mcs_table_entry mcs_tables[2][7] = {
-    /* [0]: stock's "else" branch (video_strategy 0 or 1) */
-    {
-        { 1, 2, 0x24, 0x1d, 4, 1000, 15 },
-        { 2, 2, 0x5c, 0x41, 4, 0x5dc, 15 },
-        { 5, 2, 0xa8, 0x77, 4, 0x5dc, 15 },
-        { 7, 2, 0x12f, 0xf1, 4, 800, 15 },
-        { 8, 2, 0x256, 0x1db, 3, 800, 15 },
-        { 10, 2, 0x4a8, 0x3b3, 4, 1000, 12 },
-        { 12, 2, 0x736, 0x5ba, 2, 1000, 1 },
-    },
-    /* [1]: stock's video_strategy==2 branch */
-    {
-        { 1, 3, 0x24, 0x1d, 5, 1000, 0 },
-        { 2, 4, 0x41, 0x34, 6, 0x5dc, 100 },
-        { 5, 3, 0x72, 0x5a, 5, 0x5dc, 100 },
-        { 7, 3, 300, 0xd6, 5, 700, 0x19 },
-        { 8, 3, 0x214, 0x1a6, 5, 800, 15 },
-        { 10, 3, 0x426, 0x34b, 5, 1000, 0 },
-        { 12, 3, 0x736, 0x5bb, 5, 1000, 0 },
-    },
-};
+/* Stock's tables, see common/ar8030_link_policy.h. */
+static int push_mcs_items(const ar8030_mcs_item_t *t, int n, int only_mcs, const char *what)
+{
+    int fail = 0;
+    for (int i = 0; i < n; i++) {
+        if (only_mcs >= 0 && t[i].mcs != only_mcs) {
+            continue;
+        }
+        int ret = ar8030_set_mcs_item(g_hbb, &t[i]);
+        printf("BB_SET_MCS_ITEM(%s mcs=%u snr_up=%u snr_dw=%u ldpc_up=%u ldpc_dw=%u rsv2=%u "
+               "up_keep=%ums dw_keep=%ums) ret=%d\n",
+               what, t[i].mcs, t[i].snr_up, t[i].snr_dw, t[i].ldpc_up_num, t[i].ldpc_dw_num,
+               t[i].rsv2, t[i].up_keep_time, t[i].dw_keep_time, ret);
+        if (ret) {
+            fail = 1;
+        }
+    }
+    return fail;
+}
 
 static int cmd_mcs_table(int argc, char **argv)
 {
@@ -1386,71 +1367,16 @@ static int cmd_mcs_table(int argc, char **argv)
         fprintf(stderr, "linkctl: mcs-table must be 0, 1, or 2\n");
         return 1;
     }
-    const struct mcs_table_entry *table = mcs_tables[variant == 2 ? 1 : 0];
-
     /* Optional 3rd arg: push only the single entry matching this mcs
      * value, instead of all 7 -- for retrying/isolating one that failed
      * in a full run. */
     int only_mcs = argc >= 3 ? atoi(argv[2]) : -1;
-
-    int fail = 0;
-    for (int i = 0; i < 7; i++) {
-        if (only_mcs >= 0 && table[i].mcs != only_mcs) {
-            continue;
-        }
-        bb_set_mcs_item_t item;
-        memset(&item, 0, sizeof(item));
-        item.mcs           = table[i].mcs;
-        item.ldpc_up_num   = table[i].ldpc_up_num;
-        item.snr_up        = table[i].snr_up;
-        item.snr_dw        = table[i].snr_dw;
-        item.ldpc_dw_num   = table[i].ldpc_dw_num;
-        item.up_keep_time  = table[i].up_keep_time;
-        item.dw_keep_time  = table[i].dw_keep_time;
-
-        int ret = bb_ioctl(g_hbb, BB_SET_MCS_ITEM, &item, NULL);
-        printf("BB_SET_MCS_ITEM(mcs=%u snr_up=%u snr_dw=%u ldpc_up=%u ldpc_dw=%u "
-               "up_keep=%ums dw_keep=%ums) ret=%d\n",
-               item.mcs, item.snr_up, item.snr_dw, item.ldpc_up_num, item.ldpc_dw_num,
-               item.up_keep_time, item.dw_keep_time, ret);
-        if (ret) {
-            fail = 1;
-        }
-    }
-    return fail;
+    return push_mcs_items(ar8030_gnd_mcs_table(variant), AR8030_GND_MCS_ITEMS, only_mcs, "gnd");
 }
 
-/* Stock AIR's table, from ar_ldyhs_sky fpv_ap_reload_mcs_tab @ 0x000685c0
- * (3 entries only). Byte 10 of the wire struct (rsv2 here) is 2 in every
- * entry -- unlike the ground table -- so it is set explicitly. */
 static int cmd_mcs_table_air(void)
 {
-    static const struct { uint8_t mcs, up, dwn; uint16_t snr_up, snr_dw, upk, dwk; } air[3] = {
-        { 1, 2, 4, 0x42, 0x2f, 1000, 500 },
-        { 2, 2, 3, 0x83, 0x5d, 500, 10 },
-        { 5, 2, 4, 0xee, 0xa9, 500, 30 },
-    };
-    int fail = 0;
-    for (int i = 0; i < 3; i++) {
-        bb_set_mcs_item_t item;
-        memset(&item, 0, sizeof(item));
-        item.mcs          = air[i].mcs;
-        item.ldpc_up_num  = air[i].up;
-        item.snr_up       = air[i].snr_up;
-        item.snr_dw       = air[i].snr_dw;
-        item.rsv2         = 2;
-        item.ldpc_dw_num  = air[i].dwn;
-        item.up_keep_time = air[i].upk;
-        item.dw_keep_time = air[i].dwk;
-        int ret = bb_ioctl(g_hbb, BB_SET_MCS_ITEM, &item, NULL);
-        printf("BB_SET_MCS_ITEM(air mcs=%u snr_up=%u snr_dw=%u ldpc_up=%u ldpc_dw=%u rsv2=2 up=%ums dw=%ums) ret=%d\n",
-               item.mcs, item.snr_up, item.snr_dw, item.ldpc_up_num, item.ldpc_dw_num,
-               item.up_keep_time, item.dw_keep_time, ret);
-        if (ret) {
-            fail = 1;
-        }
-    }
-    return fail;
+    return push_mcs_items(ar8030_air_mcs_table, AR8030_AIR_MCS_ITEMS, -1, "air");
 }
 
 /* Raw BB_SET_PRJ_DISPATCH, same 256-byte buffer layout the vendor uses

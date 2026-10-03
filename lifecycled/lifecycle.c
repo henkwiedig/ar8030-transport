@@ -8,6 +8,7 @@
 #include "lifecycle_pair.h"
 #include "lifecycle_tuning.h"
 #include "../common/ar8030_batt.h"
+#include "../common/ar8030_link_policy.h"
 #include "../common/ar8030_rftemp.h"
 #include <pthread.h>
 #include <stdio.h>
@@ -339,6 +340,33 @@ static int lc_poll_link_state(lifecycle_ctx* ctx, bb_link_state_e* out_state)
     return 0;
 }
 
+/* Pushes a stock MCS item table (see common/ar8030_link_policy.h). */
+static void lc_push_mcs_items(lifecycle_ctx* ctx, const ar8030_mcs_item_t* t, int n, const char* what)
+{
+    int fail = 0;
+    for (int i = 0; i < n; i++) {
+        int ret = ar8030_set_mcs_item(ctx->client.handle, &t[i]);
+        if (ret != 0) {
+            lc_log("lifecycle: link policy: %s mcs %u item failed ret=%d", what, t[i].mcs, ret);
+            fail = 1;
+        }
+    }
+    lc_log("lifecycle: link policy: %s mcs table (%d items)%s", what, n, fail ? " with failures" : "");
+}
+
+/* AP side of --link-policy, once per chip session (stock: end of
+ * fpv_bb_init): the uplink's 3-item table, its MCS range and rfo_kikp. */
+static void lc_apply_link_policy_ap(lifecycle_ctx* ctx)
+{
+    int strategy = ctx->cfg.link_policy;
+    lc_push_mcs_items(ctx, ar8030_air_mcs_table, AR8030_AIR_MCS_ITEMS, "air");
+    int mcs_min = strategy == 2 ? 1 : 2;
+    int ret     = ar8030_set_mcs_range(ctx->client.handle, BB_SLOT_0, mcs_min, 2);
+    lc_log("lifecycle: link policy: BB_SET_MCS_RANGE(slot 0, %d, 2) ret=%d", mcs_min, ret);
+    ret = ar8030_set_rfo_kikp(ctx->client.handle, strategy == 2);
+    lc_log("lifecycle: link policy: rfo_kikp %d ret=%d", strategy == 2, ret);
+}
+
 /* Applies persisted (or, absent that, this process's --default-bandwidth)
  * tuning to a freshly-connected slot, and seeds ctx->last_bandwidth so the
  * periodic re-check below has a baseline to compare fresh readings
@@ -391,6 +419,13 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
      * established link, and is lost on reboot/re-link, hence here. */
     if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
         lc_frame_change_apply(ctx->client.handle, 1);
+    }
+
+    /* DEV side of --link-policy: the downlink's table, on every connect
+     * like stock's goggles (ar_ldy_gnd reloads it ~2 s after each connect,
+     * for video_strategy 1/2 only). */
+    if (ctx->cfg.role == LC_ROLE_DEV && (ctx->cfg.link_policy == 1 || ctx->cfg.link_policy == 2)) {
+        lc_push_mcs_items(ctx, ar8030_gnd_mcs_table(ctx->cfg.link_policy), AR8030_GND_MCS_ITEMS, "gnd");
     }
 }
 
@@ -614,7 +649,7 @@ static void lc_apply_power(lifecycle_ctx* ctx)
     if (ctx->power == LC_POWER_NONE) {
         return;
     }
-    lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, ctx->power);
+    lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, ctx->power, ctx->cfg.fem_ctrl);
 }
 
 /* Refreshes lifecycle_get_status()'s power_dbm, once per fallback poll. */
@@ -1005,6 +1040,10 @@ void* lifecycle_thread_main(void* arg)
         buf[6] = 0;
         int ret = bb_ioctl(ctx->client.handle, BB_SET_PRJ_DISPATCH, buf, NULL);
         lc_log("lifecycle: rf path B off (PRJ_CMD_RF_PATH_CTRL) ret=%d", ret);
+    }
+
+    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.link_policy >= 0) {
+        lc_apply_link_policy_ap(ctx);
     }
 
     /* Output power is chip-wide and needs no link: set it before the link

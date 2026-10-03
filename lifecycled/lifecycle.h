@@ -114,6 +114,17 @@ typedef struct {
      * path A ("recfg patha weight" in the chip log). Chip-local state,
      * lost on a chip reset, so it is applied on every lifecycled start. */
     int  rf_path_b_off;
+
+    /* Stock's runtime MCS policy for this video_strategy (0/1/2), -1 =
+     * leave ar8030.json's tables alone. AP: the 3-item uplink table,
+     * BB_SET_MCS_RANGE and rfo_kikp once at startup; DEV: the 7-item
+     * downlink table on every connect (strategy 1/2 only, as stock). See
+     * common/ar8030_link_policy.h. */
+    int  link_policy;
+    /* AP, Ascent Lite: stock's power extras on every power apply --
+     * BB_SET_POWER_AUTO mode 3 {1, 1} and the fem ctrl bit at >= 24 dBm.
+     * See common/ar8030_link_policy.h. */
+    int  fem_ctrl;
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;

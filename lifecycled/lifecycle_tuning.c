@@ -1,5 +1,6 @@
 #include "lifecycle_tuning.h"
 #include "lc_log.h"
+#include "../common/ar8030_link_policy.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -568,7 +569,7 @@ static int power_auto_ioctl(bb_dev_handle_t* handle, int mode, int max, int min)
  *          BB_GET_CUR_POWER reports, but not what the ground receives)
  *  ground: {ON, 27, 14} for auto / {OFF, 17, 14} otherwise, then
  *          {DISCONNECT, dbm, dbm}, then BB_SET_POWER(user 0, dbm + 3) */
-int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level)
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level, int fem_ctrl)
 {
 #ifdef BB_HAVE_PWR_AUTO_BOUNDS
     int dbm = power_level_dbm(is_ap, level);
@@ -582,6 +583,11 @@ int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level)
     if (is_ap) {
         usr    = BB_USER_BR_CS;
         target = dbm;
+        if (fem_ctrl) {
+            /* Mode 3 isn't in bb_pwr_auto_mode_e: stock sends {3, 1, 1}
+             * before every power set in its normal (flying) mode. */
+            ret |= power_auto_ioctl(handle, 3, 1, 1);
+        }
     } else {
         usr    = BB_USER_0;
         target = dbm + DEV_TARGET_OFFSET_DBM;
@@ -596,11 +602,18 @@ int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level)
     bb_set_pwr_in_t sp = {.usr = (uint8_t)usr, .pwr = (uint8_t)target};
     int             r  = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
     lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", usr, target, r);
+    if (is_ap && fem_ctrl) {
+        int on = target >= AR8030_FEM_CTRL_MIN_DBM;
+        int rf = ar8030_set_fem_ctrl(handle, on);
+        lc_log("lifecycle: tuning: fem ctrl %d (%d dBm) ret=%d", on, target, rf);
+        r |= rf;
+    }
     return ret | r;
 #else
     (void)handle;
     (void)is_ap;
     (void)level;
+    (void)fem_ctrl;
     lc_log("lifecycle: tuning: SDK lacks the BB_SET_POWER_AUTO size fix, not touching output power");
     return -1;
 #endif

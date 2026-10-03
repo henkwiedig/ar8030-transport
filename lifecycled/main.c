@@ -85,6 +85,12 @@ static void print_help(const char* argv0)
     printf("  --rf-path-b-off           single-PA board: switch RF path B (TX and RX) off at\n");
     printf("                            startup, as stock does on the Ascent Lite\n");
     printf("                            (default: \"\")\n");
+    printf("  --link-policy <0|1|2>     stock's runtime MCS policy for this video_strategy\n");
+    printf("                            (Ascent Lite ships 2): air uplink table + MCS range +\n");
+    printf("                            rfo_kikp at startup, ground downlink table on every\n");
+    printf("                            connect (default: none -- ar8030.json's tables)\n");
+    printf("  --fem-ctrl                air, Ascent Lite: stock's power extras -- power-auto\n");
+    printf("                            mode 3 and the FEM bit at >= 24 dBm\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -118,6 +124,8 @@ enum {
     OPT_FRAME_CHANGE,
     OPT_RF_TEMP_ADC,
     OPT_RF_TEMP_FILE,
+    OPT_LINK_POLICY,
+    OPT_FEM_CTRL,
     OPT_BATT_ADC,
     OPT_BATT_SCALE,
     OPT_BATT_OFFSET_MV,
@@ -155,6 +163,7 @@ int main(int argc, char** argv)
         .batt_scale        = AR8030_BATT_DEFAULT_SCALE,
         .batt_offset_mv    = AR8030_BATT_DEFAULT_OFFSET_MV,
         .batt_file         = "",
+        .link_policy       = -1,
     };
 
     static struct option long_options[] = {
@@ -179,6 +188,8 @@ int main(int argc, char** argv)
         {"batt-offset-mv",    required_argument, 0, OPT_BATT_OFFSET_MV   },
         {"batt-file",         required_argument, 0, OPT_BATT_FILE        },
         {"rf-path-b-off",     no_argument,       0, OPT_RF_PATH_B_OFF    },
+        {"link-policy",       required_argument, 0, OPT_LINK_POLICY      },
+        {"fem-ctrl",          no_argument,       0, OPT_FEM_CTRL         },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -260,6 +271,16 @@ int main(int argc, char** argv)
             break;
         case OPT_RF_PATH_B_OFF:
             cfg.rf_path_b_off = 1;
+            break;
+        case OPT_LINK_POLICY:
+            cfg.link_policy = (int)strtol(optarg, NULL, 10);
+            if (cfg.link_policy < 0 || cfg.link_policy > 2) {
+                fprintf(stderr, "invalid --link-policy '%s' (0, 1 or 2)\n", optarg);
+                return 1;
+            }
+            break;
+        case OPT_FEM_CTRL:
+            cfg.fem_ctrl = 1;
             break;
         case 'h':
             print_help(argv[0]);

@@ -158,9 +158,10 @@ void lc_power_levels_json(int is_ap, char* out, size_t out_sz);
 int lc_power_load(const char* cfg_path, int* out);
 int lc_power_save(const char* cfg_path, int level);
 
-/* Applies level (chip-wide, no link needed). Returns 0 if every ioctl
- * succeeded. */
-int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level);
+/* Applies level (chip-wide, no link needed). fem_ctrl (AP only, Ascent
+ * Lite): also stock's BB_SET_POWER_AUTO mode 3 and fem ctrl bit, see
+ * common/ar8030_link_policy.h. Returns 0 if every ioctl succeeded. */
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level, int fem_ctrl);
 
 /* BB_GET_CUR_POWER for the user this role sets (see lc_power_apply()).
  * Returns the chip's dBm target, or -1. */
