@@ -752,7 +752,7 @@ int main(int argc, char **argv)
      * flight logs (tools/bc_replay): same mean bitrate as the rules mode,
      * about half the dropped frames and delay spikes. */
     bc_cfg.mode = args.bc_mode;
-    bc_cfg.pi_delay_set_ms = 30;
+    bc_cfg.pi_delay_set_ms = 10; /* link-side queueing delay, not capture -> write */
     bc_cfg.pi_kp_up = 0.006;
     bc_cfg.pi_kp_down = 0.02;
     bc_cfg.pi_ki_up = 0.01;
@@ -1025,11 +1025,23 @@ int main(int argc, char **argv)
         uint64_t write_end_us = now_monotonic_us();
         uint64_t write_us = write_end_us - write_start_us;
         stats.write_us_sum += write_us;
-        /* Air-side delay for the PI controller: pts -> last chunk written,
-         * EWMA 1/8 (pts is the low 32 bits of CLOCK_MONOTONIC us). */
+        /* Link-side queueing delay for the PI controller, EWMA 1/8: the
+         * frames still waiting in the ring behind this one x the frame
+         * interval, plus how long the radio took to accept this frame.
+         * Deliberately not pts -> written: that includes the encoder's own
+         * latency, which on the CV610 jumps by ~2 frames and stays there
+         * (venc pic queue busy) -- the PI read that as congestion and held
+         * the video at ~3 Mbit/s for a whole flight (2026-10-03 12:49). */
         {
-            static double delay_ewma_us;
-            double d_us = (double)(uint32_t)((uint32_t)write_end_us - meta.pts);
+            static double delay_ewma_us, frame_period_us = 10000;
+            static uint32_t prev_pts;
+            uint32_t dpts = meta.pts - prev_pts;
+            if (prev_pts && dpts >= 5000 && dpts <= 50000)
+                frame_period_us += ((double)dpts - frame_period_us) / 16.0;
+            prev_pts = meta.pts;
+            venc_frame_ring_fill_t fill;
+            uint32_t behind = venc_frame_ring_get_fill(ring, &fill) == 0 ? fill.used_slots : 0;
+            double d_us = (double)behind * frame_period_us + (double)write_us;
             delay_ewma_us = delay_ewma_us ? delay_ewma_us + (d_us - delay_ewma_us) / 8.0 : d_us;
             __atomic_store_n(&bc_cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
             __atomic_store_n(&bc_cfg.last_tx_done_ms, write_end_us / 1000, __ATOMIC_RELEASE);

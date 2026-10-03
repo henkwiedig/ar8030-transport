@@ -115,8 +115,10 @@ static frame_t q[RING_SLOTS];
 static int q_head, q_n;
 static int inflight;
 static frame_t cur;
+static int cur_behind;      /* frames waiting in the ring when cur was taken */
+static uint64_t cur_take_us;
 static double cur_left;
-static double delay_ewma_us = ENC_LAT_MS * 1000;
+static double delay_ewma_us = 0;
 static int low_water = RING_SLOTS;
 static uint64_t lw_window_start;
 static double next_retx_us;
@@ -198,6 +200,8 @@ static void plant_step_1ms(void)
             q_n--;
             cur_left = cur.bits;
             inflight = 1;
+            cur_behind = q_n;
+            cur_take_us = vt_us;
             sec_start_sum += ((double)vt_us - cur.pts_us) / 1000.0;
             sec_start_n++;
         }
@@ -209,7 +213,9 @@ static void plant_step_1ms(void)
             inflight = 0;
             double d_us = (double)vt_us - cur.pts_us;
             record_delay(d_us / 1000.0);
-            delay_ewma_us += (d_us - delay_ewma_us) / 8.0;
+            /* what tx/main.c publishes: frames behind x 10 ms + write time */
+            double q_us = cur_behind * (1e6 / FPS) + (double)(vt_us - cur_take_us);
+            delay_ewma_us += (q_us - delay_ewma_us) / 8.0;
             __atomic_store_n(&cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
             __atomic_store_n(&cfg.last_tx_done_ms, vt_us / 1000, __ATOMIC_RELEASE);
         }
@@ -354,7 +360,7 @@ static void defaults(int mode)
     cfg.severe_backoff = 0.4;
     cfg.retx_event_backoff = 0.85;
     /* = tx/main.c's PI defaults */
-    cfg.pi_delay_set_ms = 30;
+    cfg.pi_delay_set_ms = 10;
     cfg.pi_kp_up = 0.006;
     cfg.pi_kp_down = 0.02;
     cfg.pi_ki_up = 0.01;

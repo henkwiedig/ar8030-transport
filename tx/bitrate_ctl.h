@@ -178,13 +178,15 @@ typedef struct {
      * rules-mode only. */
     int mode;
 
-    /* Air-side delay, written by tx/main.c's send loop (__atomic):
-     * EWMA of (last chunk written - frame pts) in us, and when the last
-     * frame finished (CLOCK_MONOTONIC ms). PI mode only. */
+    /* Link-side queueing delay, written by tx/main.c's send loop
+     * (__atomic): EWMA of (frames waiting in the ring x frame interval +
+     * time the radio took to accept the frame) in us -- encoder latency
+     * excluded -- and when the last frame finished (CLOCK_MONOTONIC ms).
+     * PI mode only. */
     uint32_t delay_us;
     uint64_t last_tx_done_ms;
 
-    double pi_delay_set_ms;  /* delay setpoint, e.g. 25 */
+    double pi_delay_set_ms;  /* queueing-delay setpoint, e.g. 10 */
     double pi_kp_up, pi_kp_down; /* proportional gain per ms of error */
     double pi_ki_up, pi_ki_down; /* integral gain per ms of error per s */
     double pi_k_min, pi_k_max;   /* bounds of k (rate = C * margin * k) */
