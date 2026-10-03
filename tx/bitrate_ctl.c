@@ -814,7 +814,7 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         }
         const char *why = NULL;
         if ((cfg->ldpc_severe_ratio > 0.0 && ldpc >= cfg->ldpc_severe_ratio) ||
-            (cfg->retx_severe_events > 0 && recent_retx >= cfg->retx_severe_events)) {
+            (cfg->pi_retx_severe_events > 0 && recent_retx >= cfg->pi_retx_severe_events)) {
             if (k_i > cfg->pi_severe_k) {
                 k_i = cfg->pi_severe_k;
                 why = "severe";

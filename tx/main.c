@@ -760,7 +760,13 @@ int main(int argc, char **argv)
     bc_cfg.pi_k_min = 0.2;
     bc_cfg.pi_k_max = 1.1;
     bc_cfg.pi_slew_up = 2.0;
-    bc_cfg.pi_severe_k = 0.3;
+    /* With stock's downlink MCS table (lifecycled --link-policy 2) the
+     * chip runs higher MCS and accepts more retransmissions: bench walk
+     * 2026-10-03 14:29 saw 4 RETX_TOO_MANY/s through most of a fade the
+     * link carried fine at 9-14 Mbit/s capacity (ring empty), and the old
+     * clamp (>= 3/s -> k 0.3) held video at 1.6-3 Mbit/s. */
+    bc_cfg.pi_retx_severe_events = 6;
+    bc_cfg.pi_severe_k = 0.5;
     bc_cfg.pi_mild_trim = 0.85;
     bc_cfg.pi_recover_per_s = 0;   /* off: the cleanest picture (flight 2026-10-03 13:22,
                                     * 0 dropped frames). 0.1-0.3 trade +1.3-1.7 Mbit/s for more

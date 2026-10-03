@@ -173,7 +173,7 @@ typedef struct {
     /* BITRATE_CTL_MODE_RULES (default) or BITRATE_CTL_MODE_PI, see
      * bitrate_ctl.c. The PI mode uses margin, min/max_kbps,
      * poll_interval_ms, ring/ring_backlog_high_slots/ring_backoff,
-     * ldpc_ratio_high, ldpc_severe_ratio, retx_severe_events and the
+     * ldpc_ratio_high, ldpc_severe_ratio and the
      * pi_* fields below; the ramp/settle/unstable/backoff factors are
      * rules-mode only. */
     int mode;
@@ -192,6 +192,8 @@ typedef struct {
     double pi_k_min, pi_k_max;   /* bounds of k (rate = C * margin * k) */
     double pi_slew_up;           /* max relative increase per second, e.g. 1.5 */
     double pi_severe_k;          /* integrator clamp on a severe LDPC/RETX burst, e.g. 0.4 */
+    int pi_retx_severe_events;   /* RETX_TOO_MANY within 1 s that count as severe in PI
+                                  * mode (retx_severe_events is the rules mode's), e.g. 6 */
     double pi_mild_trim;         /* integrator trim on a mild one, e.g. 0.9 */
     double pi_recover_per_s;     /* min climb of k per s, 1 s after the last disturbance
                                   * with the queue below setpoint, e.g. 0.3; 0 = off */

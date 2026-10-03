@@ -435,7 +435,8 @@ static void defaults(int mode)
     cfg.pi_k_min = 0.2;
     cfg.pi_k_max = 1.1;
     cfg.pi_slew_up = 2.0;
-    cfg.pi_severe_k = 0.3;
+    cfg.pi_severe_k = 0.5;
+    cfg.pi_retx_severe_events = 6;
     cfg.pi_mild_trim = 0.85;
     cfg.pi_recover_per_s = 0;
     cfg.stop_flag = &g_stop;
@@ -455,7 +456,7 @@ static void apply_override(const char *kv)
     }
     D(pi_delay_set_ms); D(pi_kp_up); D(pi_kp_down); D(pi_ki_up); D(pi_ki_down); D(pi_k_min); D(pi_k_max);
     D(pi_slew_up); D(pi_severe_k); D(pi_mild_trim); D(margin); D(ramp_step); D(severe_backoff);
-    D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events); D(pi_recover_per_s);
+    D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events); I(pi_retx_severe_events); D(pi_recover_per_s);
     I(max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
     else {
         fprintf(stderr, "unknown key %s\n", key);
