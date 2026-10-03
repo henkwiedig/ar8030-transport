@@ -798,11 +798,13 @@ int main(int argc, char **argv)
     bc_cfg.pi_retx_severe_events = 6;
     bc_cfg.pi_severe_k = 0.5;
     bc_cfg.pi_mild_trim = 0.85;
-    /* k climbs at least this fast once the queue is below setpoint again:
-     * between RETX trims k otherwise crept up at ~0.07/s with the queue
-     * empty. Bench walks 2026-10-03 with --link-policy 2: share of capacity
-     * used in a fade 37% -> 51%, queue <= 19 ms, smooth picture. */
-    bc_cfg.pi_recover_per_s = 0.2;
+    /* Off. 0.2/s (k climbs at least this fast once the queue is below
+     * setpoint) looked perfect on bench walks (fade share 37% -> 51%) but
+     * flight 2026-10-03 15:05 swings MCS 10 -> 1 -> 8 within seconds: the
+     * fast climb refilled the rate before each next drop, queue delay
+     * spikes to 49-57 ms (vs 33 ms max on flight 0031), and the latency
+     * variation was noticeable at the edge spot. Try with -p. */
+    bc_cfg.pi_recover_per_s = 0;
     for (int i = 0; i < args.n_pi_params; i++) {
         if (apply_pi_param(&bc_cfg, args.pi_params[i]) != 0) {
             fprintf(stderr, "tx: bad -p %s\n", args.pi_params[i]);
