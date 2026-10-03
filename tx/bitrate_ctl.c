@@ -830,10 +830,13 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         /* Which signal tripped it (diagnosing clamps with no congestion in
          * sight: steady capacity, low delay -- bench walk 2026-10-03
          * 14:19:02-14:19:54). Logged whether or not a new rate follows. */
-        if (why)
+        static uint64_t last_why_log_ms;
+        if (why && now - last_why_log_ms >= 1000) {
+            last_why_log_ms = now;
             fprintf(stderr,
                     "bitrate_ctl: pi disturbance %s: ldpc=%.0f%% retx_1s=%d new_retx=%d C=%u D=%.1fms k_i=%.2f\n",
                     why, ldpc * 100.0, recent_retx, new_retx, cap_kbps, d_ms, k_i);
+        }
 
         /* Ring backlog: hard backstop, same signal as the rules mode. */
         venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);
@@ -853,6 +856,14 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         int held_up = applied_kbps && (double)applied_kbps < base * k * 0.9; /* ceiling or slew holding it */
         if ((e > 0 && !held_up && applied_kbps < cfg->max_kbps) || (e < 0 && !at_floor))
             k_i += ki * e * dt;
+        /* Recovery after a disturbance clamp: once the radio has been quiet
+         * for a second and the queue is below the setpoint, climb at least
+         * at pi_recover_per_s. The integrator alone needed ~10 s to undo a
+         * clamp to 0.3 (queue ~4 ms vs 10 ms setpoint = small error), and
+         * RETX clamps came every ~3 s in the 2026-10-03 13:22 flight. */
+        if (cfg->pi_recover_per_s > 0.0 && e > 0 && !held_up && k_i < 1.0 &&
+            (!last_disturb_ms || now - last_disturb_ms >= 1000))
+            k_i += cfg->pi_recover_per_s * dt;
         if (k_i < cfg->pi_k_min)
             k_i = cfg->pi_k_min;
         if (k_i > cfg->pi_k_max)

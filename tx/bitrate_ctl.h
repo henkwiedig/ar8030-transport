@@ -193,6 +193,8 @@ typedef struct {
     double pi_slew_up;           /* max relative increase per second, e.g. 1.5 */
     double pi_severe_k;          /* integrator clamp on a severe LDPC/RETX burst, e.g. 0.4 */
     double pi_mild_trim;         /* integrator trim on a mild one, e.g. 0.9 */
+    double pi_recover_per_s;     /* min climb of k per s, 1 s after the last disturbance
+                                  * with the queue below setpoint, e.g. 0.3; 0 = off */
 
     const volatile int *stop_flag;
 } bitrate_ctl_cfg_t;

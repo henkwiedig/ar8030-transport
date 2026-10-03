@@ -114,6 +114,36 @@ typedef struct {
 static frame_t q[RING_SLOTS];
 static int q_head, q_n;
 static int inflight;
+typedef struct {
+    double bits;   /* written into the chip, still to go out over the radio */
+    double pts_us;
+    int written;   /* tx has handed over the whole frame */
+} chip_frame_t;
+#define CHIP_FRAMES 256
+static chip_frame_t chip_q[CHIP_FRAMES];
+static int chip_head, chip_n;
+static double chip_bits;
+/* calibrated against the PI flight 2026-10-03 13:22 (queue D per capacity) */
+static double SDIO_KBPS = 21700;            /* host -> chip, measured write rate */
+static double CHIP_BUF_BITS = 65536 * 8.0;  /* tx_buf_size */
+
+/* per-capacity samples of the published queueing delay (DSTAT=1) */
+static double ds_cap[16], *ds_val[16];
+static size_t ds_n[16];
+static int ds_caps;
+static void dstat_add(double cap, double v)
+{
+    int i;
+    for (i = 0; i < ds_caps && ds_cap[i] != cap; i++)
+        ;
+    if (i == ds_caps) {
+        if (ds_caps == 16)
+            return;
+        ds_cap[ds_caps++] = cap;
+    }
+    ds_val[i] = realloc(ds_val[i], (ds_n[i] + 1) * sizeof(double));
+    ds_val[i][ds_n[i]++] = v;
+}
 static frame_t cur;
 static int cur_behind;      /* frames waiting in the ring when cur was taken */
 static uint64_t cur_take_us;
@@ -187,11 +217,35 @@ static void plant_step_1ms(void)
     if (!s->conn) {
         q_n = 0;
         inflight = 0;
+        chip_n = 0;
+        chip_bits = 0;
     }
 
-    /* transmitter */
-    double drain_bits = cap * 1000.0 * DRAIN_EFF / 1000.0; /* kbps -> bits per ms */
-    while (drain_bits > 0) {
+    /* transmitter, two stages like the real air:
+     *  1. tx writes the frame into the chip's buffer over SDIO (SDIO_KBPS),
+     *     as far as the buffer has room -- the write time tx/main.c
+     *     measures;
+     *  2. the chip drains its buffer over the radio at cap x DRAIN_EFF --
+     *     a frame counts as delivered (end-to-end delay stats) once its
+     *     last bit has gone out. */
+    double rf_bits = cap * DRAIN_EFF;          /* kbps -> bits per ms */
+    while (rf_bits > 0 && chip_n) {
+        chip_frame_t *cf = &chip_q[chip_head];
+        if (cf->bits <= 0 && !cf->written)
+            break; /* head frame is still being written */
+        double take = cf->bits < rf_bits ? cf->bits : rf_bits;
+        cf->bits -= take;
+        rf_bits -= take;
+        chip_bits -= take;
+        sum_sent += take;
+        if (cf->bits <= 0 && cf->written) {
+            record_delay(((double)vt_us - cf->pts_us) / 1000.0);
+            chip_head = (chip_head + 1) % CHIP_FRAMES;
+            chip_n--;
+        }
+    }
+    double sdio_bits = SDIO_KBPS;               /* kbps -> bits per ms */
+    while (sdio_bits > 0) {
         if (!inflight) {
             if (!q_n)
                 break;
@@ -204,22 +258,35 @@ static void plant_step_1ms(void)
             cur_take_us = vt_us;
             sec_start_sum += ((double)vt_us - cur.pts_us) / 1000.0;
             sec_start_n++;
+            if (chip_n == CHIP_FRAMES) /* bookkeeping limit, never hit in practice */
+                break;
+            chip_q[(chip_head + chip_n) % CHIP_FRAMES] = (chip_frame_t){0, cur.pts_us, 0};
+            chip_n++;
         }
-        double take = cur_left < drain_bits ? cur_left : drain_bits;
+        double room = CHIP_BUF_BITS - chip_bits;
+        if (room <= 0)
+            break;
+        double take = cur_left < sdio_bits ? cur_left : sdio_bits;
+        if (take > room)
+            take = room;
         cur_left -= take;
-        drain_bits -= take;
-        sum_sent += take;
+        sdio_bits -= take;
+        chip_bits += take;
+        chip_q[(chip_head + chip_n - 1) % CHIP_FRAMES].bits += take;
         if (cur_left <= 0) {
             inflight = 0;
-            double d_us = (double)vt_us - cur.pts_us;
-            record_delay(d_us / 1000.0);
+            chip_q[(chip_head + chip_n - 1) % CHIP_FRAMES].written = 1;
             /* what tx/main.c publishes: frames behind x 10 ms + write time */
-            double q_us = cur_behind * (1e6 / FPS) + (double)(vt_us - cur_take_us);
+            double q_us = cur_behind * (1e6 / FPS) + (double)(vt_us - cur_take_us) + 2000; /* + RPC overhead */
             delay_ewma_us += (q_us - delay_ewma_us) / 8.0;
             __atomic_store_n(&cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
             __atomic_store_n(&cfg.last_tx_done_ms, vt_us / 1000, __ATOMIC_RELEASE);
         }
     }
+
+    /* per-capacity queueing delay, sampled every 100 ms, for calibration */
+    if (s->conn && vt_us % 100000 == 0)
+        dstat_add(cap, delay_ewma_us / 1000.0);
 
     /* ring low water, published per 200 ms window like waybeam */
     if (q_n < low_water)
@@ -370,6 +437,7 @@ static void defaults(int mode)
     cfg.pi_slew_up = 2.0;
     cfg.pi_severe_k = 0.3;
     cfg.pi_mild_trim = 0.85;
+    cfg.pi_recover_per_s = 0;
     cfg.stop_flag = &g_stop;
 }
 
@@ -387,7 +455,7 @@ static void apply_override(const char *kv)
     }
     D(pi_delay_set_ms); D(pi_kp_up); D(pi_kp_down); D(pi_ki_up); D(pi_ki_down); D(pi_k_min); D(pi_k_max);
     D(pi_slew_up); D(pi_severe_k); D(pi_mild_trim); D(margin); D(ramp_step); D(severe_backoff);
-    D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events);
+    D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events); D(pi_recover_per_s);
     I(max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
     else {
         fprintf(stderr, "unknown key %s\n", key);
@@ -417,6 +485,10 @@ int main(int argc, char **argv)
         IDR_FACTOR = atof(getenv("IDR_FACTOR"));
     if (getenv("DRAIN_EFF"))
         DRAIN_EFF = atof(getenv("DRAIN_EFF"));
+    if (getenv("SDIO_KBPS"))
+        SDIO_KBPS = atof(getenv("SDIO_KBPS"));
+    if (getenv("CHIP_BUF_KB"))
+        CHIP_BUF_BITS = atof(getenv("CHIP_BUF_KB")) * 1024 * 8;
     if (!getenv("REPLAY_LOG") && !freopen("/dev/null", "w", stderr))
         return 1;
 
@@ -426,6 +498,13 @@ int main(int argc, char **argv)
 
     qsort(delays, n_delays, sizeof(double), cmp_d);
     qsort(sec_avgs, n_sec, sizeof(double), cmp_d);
+    if (getenv("DSTAT"))
+        for (int i = 0; i < ds_caps; i++) {
+            qsort(ds_val[i], ds_n[i], sizeof(double), cmp_d);
+            size_t m = ds_n[i];
+            printf("dstat C=%5.0f n=%5zu queue D p10/p50/p90 %5.1f/%5.1f/%5.1f ms\n", ds_cap[i], m,
+                   ds_val[i][m / 10], ds_val[i][m / 2], ds_val[i][m * 9 / 10]);
+        }
     if (getenv("CALIB"))
         printf("calib %-6s write-start avg/s p50 %5.1f p90 %5.1f max %6.1f ms  ring>=50%% in %.1f%% of s  dropped %.2f%%\n",
                argv[2], n_sec ? sec_avgs[n_sec / 2] : 0, n_sec ? sec_avgs[n_sec * 9 / 10] : 0,

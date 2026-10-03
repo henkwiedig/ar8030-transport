@@ -762,6 +762,9 @@ int main(int argc, char **argv)
     bc_cfg.pi_slew_up = 2.0;
     bc_cfg.pi_severe_k = 0.3;
     bc_cfg.pi_mild_trim = 0.85;
+    bc_cfg.pi_recover_per_s = 0;   /* off: the cleanest picture (flight 2026-10-03 13:22,
+                                    * 0 dropped frames). 0.1-0.3 trade +1.3-1.7 Mbit/s for more
+                                    * delay spikes in replay -- see tools/bc_replay. */
     bc_cfg.stop_flag = &g_stop;
 
     tx_outq_t outq;
