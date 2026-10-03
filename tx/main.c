@@ -150,6 +150,8 @@ struct tx_args {
     uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
     double ring_backoff;         /* bitrate multiplier per URGENT cut */
     int sidecar_port;            /* waybeam outgoing.sidecarPort to forward, 0 = off */
+    const char *pi_params[16];   /* -p key=value, applied after the PI defaults */
+    int n_pi_params;
     int verbose;
 };
 
@@ -181,6 +183,8 @@ static void usage(const char *argv0)
             "                 every one; PixelPilot sends 3 per request, 100 ms apart)\n"
             "  -C <rules|pi>  bitrate controller: rule-based (default) or feedforward + PI on the\n"
             "                 air-side delay (see bitrate_ctl.c and tools/bc_replay)\n"
+            "  -p <key=value> override a PI tunable, repeatable: pi_recover_per_s, pi_severe_k,\n"
+            "                 pi_retx_severe_events, pi_mild_trim, pi_k_max, pi_delay_set_ms\n"
             "  -S <port>      forward waybeam's RTP timing sidecar from this loopback UDP port\n"
             "                 (waybeam outgoing.sidecarPort) to the ground (default 0 = off)\n"
 
@@ -190,6 +194,27 @@ static void usage(const char *argv0)
             argv0, DEFAULT_RING_NAME, DEFAULT_DAEMON_IP, DEFAULT_VIDEO_PORT,
             AR8030_CHUNK_DEFAULT_PAYLOAD, DEFAULT_WRITE_TIMEOUT_MS, DEFAULT_WAYBEAM_HOST,
             DEFAULT_WAYBEAM_PORT, DEFAULT_IDR_COALESCE_MS);
+}
+
+/* -p key=value: the PI tunables worth trying on the air without a
+ * rebuild (same names as bitrate_ctl_cfg_t and tools/bc_replay). */
+static int apply_pi_param(bitrate_ctl_cfg_t *c, const char *kv)
+{
+    const char *eq = strchr(kv, '=');
+    if (!eq)
+        return -1;
+    size_t n = (size_t)(eq - kv);
+    char *end;
+    double v = strtod(eq + 1, &end);
+    if (end == eq + 1 || *end)
+        return -1;
+#define PI_D(f) if (n == strlen(#f) && !strncmp(kv, #f, n)) { c->f = v; return 0; }
+#define PI_I(f) if (n == strlen(#f) && !strncmp(kv, #f, n)) { c->f = (int)v; return 0; }
+    PI_D(pi_recover_per_s) PI_D(pi_severe_k) PI_I(pi_retx_severe_events)
+    PI_D(pi_mild_trim) PI_D(pi_k_max) PI_D(pi_delay_set_ms)
+#undef PI_D
+#undef PI_I
+    return -1;
 }
 
 static int parse_args(int argc, char **argv, struct tx_args *a)
@@ -215,9 +240,10 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
     a->ring_backoff = 0.92;
     a->sidecar_port = 0;
+    a->n_pi_params = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:C:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
@@ -285,6 +311,10 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'K':
             a->ring_backoff = strtod(optarg, NULL);
+            break;
+        case 'p':
+            if (a->n_pi_params < (int)(sizeof(a->pi_params) / sizeof(a->pi_params[0])))
+                a->pi_params[a->n_pi_params++] = optarg;
             break;
         case 'v':
             a->verbose = 1;
@@ -771,6 +801,13 @@ int main(int argc, char **argv)
     bc_cfg.pi_recover_per_s = 0;   /* off: the cleanest picture (flight 2026-10-03 13:22,
                                     * 0 dropped frames). 0.1-0.3 trade +1.3-1.7 Mbit/s for more
                                     * delay spikes in replay -- see tools/bc_replay. */
+    for (int i = 0; i < args.n_pi_params; i++) {
+        if (apply_pi_param(&bc_cfg, args.pi_params[i]) != 0) {
+            fprintf(stderr, "tx: bad -p %s\n", args.pi_params[i]);
+            return 1;
+        }
+        fprintf(stderr, "tx: %s\n", args.pi_params[i]);
+    }
     bc_cfg.stop_flag = &g_stop;
 
     tx_outq_t outq;
