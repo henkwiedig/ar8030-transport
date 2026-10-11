@@ -1514,8 +1514,9 @@ never fires — the daemon isn't wrongly declining to act, there's just
 nothing else in this codebase that flushes a newly-arrived backlog once
 the chip's own idle-heartbeat stops reporting anything actionable.
 Confirmed this session it's unrelated to thermal issues (chip
-temperature read a normal 63.8°C via `caddx-ascent-lite-temp` with the
-fan running during the capture). This may be a genuine chip-firmware
+temperature normal with the fan running during the capture:
+`caddx-ascent-lite-temp` read 638, which back then was the sensor's raw
+code, not 63.8°C; it converts to ~67°C). This may be a genuine chip-firmware
 behavior (its own `wanted_pos` tracking getting stuck) rather than
 something fixable purely in this daemon's own bookkeeping — or there
 may be a host-side trigger for it not yet identified. **This is the
