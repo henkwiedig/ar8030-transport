@@ -1,8 +1,10 @@
 #include "lifecycle_bind.h"
 #include "lc_log.h"
 #include "lifecycle_gpio.h"
+#include "lifecycle_hooks.h"
 #include "lifecycle_pair.h"
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -48,11 +50,20 @@
  * here. The two threads share only read-only config (hook_dir, cfg_path,
  * role) plus lc_hooks_dispatch(), which is already fork-per-call with no
  * shared mutable state, so both can call it concurrently safely.
+ *
+ * A press counts on release, so a hold can mean something else: held for
+ * LC_BIND_LONGPRESS_S or longer, it runs hooks.d/longpress instead of
+ * pairing -- dispatched the moment the threshold is reached, while the
+ * button is still down, so the board's hook can show it (LED) before the
+ * user lets go. What a long press does is entirely the board's hook
+ * (caddx-ascent-lite: toggle the USB port between RNDIS and the CADDX PC
+ * tool updater mode).
  */
 
 #define LC_BIND_POLL_MS     100
 #define LC_BIND_DEBOUNCE_MS 50
 #define LC_BIND_LOCKOUT_S   5
+#define LC_BIND_LONGPRESS_S 5
 
 struct lifecycle_bind_ctx {
     lc_config_t cfg;
@@ -101,11 +112,25 @@ void* lifecycle_bind_thread_main(void* arg)
         }
 
         lc_log("lifecycle: bind: button pressed, waiting for release");
+        struct timespec t0, now;
+        int             longpress = 0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
         while (read_button(gpio) == 0 && !lifecycle_shutdown_requested()) {
             usleep(LC_BIND_POLL_MS * 1000);
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (!longpress && now.tv_sec - t0.tv_sec >= LC_BIND_LONGPRESS_S) {
+                longpress = 1;
+                lc_log("lifecycle: bind: held %ds, running hooks.d/longpress instead of pairing", LC_BIND_LONGPRESS_S);
+                lc_hooks_dispatch(ctx->cfg.hook_dir, "longpress", ctx->cfg.role, -1, NULL);
+            }
         }
         if (lifecycle_shutdown_requested()) {
             break;
+        }
+        if (longpress) {
+            lc_log("lifecycle: bind: released after long press");
+            sleep(LC_BIND_LOCKOUT_S);
+            continue;
         }
 
         lc_log("lifecycle: bind: button released, pairing");

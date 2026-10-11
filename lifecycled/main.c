@@ -65,6 +65,7 @@ static void print_help(const char* argv0)
     printf("                            (leave the chip's config-file power alone)\n");
     printf("                            (default: air 400 mW = 26 dBm, ground 500 mW)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
+    printf("                            (press: pair; hold 5 s: hooks.d/longpress)\n");
     printf("                            (default: none -- no physical button on this board)\n");
     printf("  --http-port <n>           start the HTTP control API on this port\n");
     printf("                            (default: 0 -- disabled; see README's \"HTTP\n");

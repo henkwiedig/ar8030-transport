@@ -1879,12 +1879,12 @@ for why) that owns the AR8030 chip's whole lifecycle from outside: an
 initial hardware reset, following the daemon's `BB_EVENT_LINK_STATE`
 events (plus a `BB_GET_STATUS` fallback poll) to notice a real
 connect/drop, re-applying persisted bandwidth tuning, and running
-`hooks.d/<event>/*` scripts (`connected`/`dropped`/`idle`/`pairing`) on
-each real transition -- a board's own overlay drops executable scripts
-under a configured `--hook-dir` to react to any of these (LED state,
-bringing a TUN interface up/down, starting/stopping a video bridge)
-without this binary needing to know anything about what a given board
-actually wants to do.
+`hooks.d/<event>/*` scripts (`connected`/`dropped`/`idle`/`pairing`, plus
+`longpress` below) on each real transition -- a board's own overlay drops
+executable scripts under a configured `--hook-dir` to react to any of these
+(LED state, bringing a TUN interface up/down, starting/stopping a video
+bridge) without this binary needing to know anything about what a given
+board actually wants to do.
 
 Built and installed on both sides exactly like `ar8030-linkctl` is (see
 "Build" above and each Buildroot package's own `.mk`) -- against the
@@ -1912,6 +1912,10 @@ watching a board's physical bind button directly (`lifecycle_bind.c`),
 running the SDK's own `ar8030-pair` binary (`dev_helper/bb_pair`,
 `package/ar8030` -- not reimplemented here) on a debounced press, and
 driving `hooks.d/pairing`/`connected`/`idle` directly from its result.
+Holding the button for 5 s or longer does not pair: `hooks.d/longpress`
+runs the moment the 5 s are up (button still down, so a hook can light an
+LED before the release), and the release is ignored. What a long press
+means is up to the board's hook.
 This used to be a separate shell script with no shared state with this
 daemon, which caused its own bug: a rebind to an already-connected peer
 produced no observable transition in `lifecycle_thread_main`'s state
