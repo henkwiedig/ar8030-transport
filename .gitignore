@@ -3,6 +3,8 @@
 /tx/ar8030-transport-tx
 /rx/build/
 /rx/ar8030-transport-rx
+/still/build/
+/still/ar8030-still
 /test/build/
 /test/roundtrip_test
 /test/timing_test

@@ -67,9 +67,9 @@ TX_MAKE_VARS := $(if $(TX_CC),CC=$(TX_CC)) $(if $(TX_SDK_INC),AR8030_SDK_INC=$(T
 RX_MAKE_VARS := $(if $(RX_CC),CC=$(RX_CC)) $(if $(RX_SDK_INC),AR8030_SDK_INC=$(RX_SDK_INC)) \
 	$(if $(RX_SDK_LIB),AR8030_SDK_LIB=$(RX_SDK_LIB))
 
-.PHONY: all tx rx audio-tx audio-rx linkctl linkctl-tx linkctl-rx lifecycled lifecycled-tx lifecycled-rx test check clean print-config
+.PHONY: all tx rx still audio-tx audio-rx linkctl linkctl-tx linkctl-rx lifecycled lifecycled-tx lifecycled-rx test check clean print-config
 
-all: tx rx audio-tx audio-rx linkctl lifecycled
+all: tx rx still audio-tx audio-rx linkctl lifecycled
 
 tx:
 	@echo "== tx: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
@@ -78,6 +78,12 @@ tx:
 rx:
 	@echo "== rx: CC=$(if $(RX_CC),$(RX_CC),<default: host gcc -- see 'make print-config'>)"
 	$(MAKE) -C rx $(RX_MAKE_VARS)
+
+# ar8030-still (see still/main.c) -- air side, stands in for waybeam on
+# the frame-shm ring with one stored picture while waybeam is stopped.
+still:
+	@echo "== still: CC=$(if $(TX_CC),$(TX_CC),<default: host gcc -- see 'make print-config'>)"
+	$(MAKE) -C still $(if $(TX_CC),CC=$(TX_CC))
 
 # ar8030-transport-audio-{tx,rx} (see audio_tx/main.c, audio_rx/main.c) --
 # the Majestic-style embedded-audio path, built with the same per-side
@@ -135,6 +141,7 @@ test check:
 clean:
 	$(MAKE) -C tx clean
 	$(MAKE) -C rx clean
+	$(MAKE) -C still clean
 	$(MAKE) -C audio_tx clean
 	$(MAKE) -C audio_rx clean
 	$(MAKE) -C linkctl clean BUILD_DIR=build-tx TARGET=ar8030-linkctl-tx

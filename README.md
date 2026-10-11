@@ -513,6 +513,32 @@ calls afterward: no crash, brief ring-fill spike immediately
 absorbed by the existing backlog throttle, streaming back to the
 pre-restart bitrate within a few seconds each time.
 
+### `ar8030-still`: a stored picture while waybeam is stopped
+
+`still/` builds `ar8030-still -f <frame.h265> [-F fps] [-r ring]`: it
+creates the frame-shm ring under waybeam's name and writes one stored
+H.265 access unit into it, 5 times a second by default, until SIGTERM
+removes the ring again. To tx it looks like a restarted waybeam (the
+reattach above), and the ground decodes it like any other keyframe, so
+the goggles show e.g. "VTX OVERHEAT" instead of freezing on the last live
+frame. Confirmed on the Ascent: tx picks the ring up within 2 s and sends
+0.35 Mbit/s; PixelPilot reports the stream back with the keyframe
+received and no decode stalls.
+
+The frame has to be a keyframe carrying its own VPS/SPS/PPS, in Main
+profile, ideally at the live stream's size: `still/make-still.sh` renders
+a text card that way with ffmpeg/libx265 (an all-intra x265 encode is
+marked RExt, which hardware decoders may refuse -- the script avoids it),
+and the result (`still/overheat.h265`, ~9 KB) is committed so builds
+don't need ffmpeg.
+
+Never run it next to waybeam: both own the ring name, and each removes
+the other's ring when it starts or exits. Switching over: stop waybeam
+(it removes its ring on SIGTERM), then start the still; back: stop the
+still, then start waybeam -- tx only looks for a replaced ring after a
+200 ms gap in frames, so it would keep reading a still that is still
+writing.
+
 ## ar8030d connection: surviving a daemon restart
 
 Both `tx/main.c` and `rx/main.c` only ever called `ar8030_link_connect_retry()`
@@ -1881,7 +1907,7 @@ initial hardware reset, following the daemon's `BB_EVENT_LINK_STATE`
 events (plus a `BB_GET_STATUS` fallback poll) to notice a real
 connect/drop, re-applying persisted bandwidth tuning, and running
 `hooks.d/<event>/*` scripts (`connected`/`dropped`/`idle`/`pairing`, plus
-`longpress` below) on each real transition -- a board's own overlay drops
+`longpress` and `overheat`/`resume` below) on each real transition -- a board's own overlay drops
 executable scripts under a configured `--hook-dir` to react to any of these
 (LED state, bringing a TUN interface up/down, starting/stopping a video
 bridge) without this binary needing to know anything about what a given
@@ -1928,6 +1954,18 @@ the hooks it needs directly instead of hoping the reconnect-follower
 thread notices. Omit `--bind-gpio` (the default) on a board with no
 physical bind button; nothing about the reconnect-following/tuning/hook
 machinery above depends on it.
+
+**Heat (air):** `--standby-dbm` is stock's low-power radio mode while the
+flight controller is disarmed (see `/api/v1/armed` below). The camera
+stack heats the SoC far more than the radio, though -- on the Ascent Lite
+without airflow, starting the encoder took the die from 109 to 122 degC
+in about 13 s -- so `--soc-temp-cmd <cmd>` (a board command printing
+degC, run every 2 s) plus `--overheat-c <C>` pause the video: disarmed
+at or above `C` runs `hooks.d/overheat`, the next arm `hooks.d/resume`.
+Only arming resumes, not cooling down: on the ground a resumed encoder
+would hit the limit again within seconds. What pausing means is the
+board's hook -- the Ascent's stops waybeam and starts `ar8030-still`
+(next section) in its place.
 
 ## HTTP control API
 
@@ -2120,8 +2158,9 @@ design rationale):
   leaves the chip's config-file power alone). GET:
   ```
   curl http://<host>:8899/api/v1/power
-  {"ok":true,"power":400,"power_dbm":26,"power_levels":[400,200,100,25]}
+  {"ok":true,"power":400,"power_dbm":26,"power_levels":[400,200,100,25],"armed":true,"standby":null}
   ```
+  `armed`/`standby`: see `/api/v1/armed` below.
   Saved to an `ar8030.power` sidecar next to `cfg_path`, applied at
   startup (before any link, so the power used while searching is right
   too), on every connect and immediately on change. mW map to the chip's
@@ -2149,6 +2188,31 @@ design rationale):
   3): built against an SDK without it (`BB_HAVE_PWR_AUTO_BOUNDS` unset)
   lifecycled refuses to touch power instead of sending the truncated
   payload.
+- **`GET|POST /api/v1/armed[?state=<0|1>]`** (air) -- the flight
+  controller's arm state, which drives stock's low-power mode when
+  lifecycled runs with `--standby-dbm <dBm>` (Ascent Lite stock: 10).
+  Stock (`ar_ldyhs_sky` `fpv_sky_standby_mode_thread`) drops the air
+  unit to that power whenever the FC isn't armed, against overheating
+  on the ground (after a crash, too): `BB_SET_POWER_AUTO {3, 0, 0}`,
+  `{2, 10, 10}`, `BB_SET_POWER` 10 dBm on user 8 and the fem ctrl bit
+  off; on arm it goes back to the wanted level with `{3, 1, 1}`. Like
+  stock, it is entered only with a link up and kept across a drop;
+  unlike stock, it is left on arm even without a link. The camera stack
+  keeps running (stock's sensor "low power" call is an empty stub) --
+  pausing it is `--overheat-c`'s job (see `ar8030-lifecycled` above).
+  ```
+  curl -X POST 'http://<host>:8899/api/v1/armed?state=0'
+  curl http://<host>:8899/api/v1/armed
+  {"ok":true,"armed":false,"standby":true,"standby_dbm":10,"soc_temp_c":104.2,"overheat":false,"overheat_c":105}
+  ```
+  Whatever reads the FC (msposd's MSP_STATUS) posts the state; nothing
+  is persisted and every start assumes armed, so without a reporter the
+  air unit never sits at standby power in flight. A power change made
+  in standby is saved and applied on arm. `standby` is `null` without
+  `--standby-dbm`. The same reply carries `soc_temp_c` (from
+  `--soc-temp-cmd`, also in `/api/v1/status`), `overheat` (video paused,
+  `null` without `--overheat-c`, also in `/api/v1/status`) and
+  `overheat_c`.
 - **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
   -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
   the windowed retransmission controller's own tuning parameters

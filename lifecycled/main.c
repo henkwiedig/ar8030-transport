@@ -92,6 +92,15 @@ static void print_help(const char* argv0)
     printf("                            connect (default: none -- ar8030.json's tables)\n");
     printf("  --fem-ctrl                air, Ascent Lite: stock's power extras -- power-auto\n");
     printf("                            mode 3 and the FEM bit at >= 24 dBm\n");
+    printf("  --standby-dbm <dBm>       air: stock's low-power mode -- this chip dBm target\n");
+    printf("                            while the FC reports disarmed (POST /api/v1/armed),\n");
+    printf("                            entered with a link up, left on arm (Ascent Lite\n");
+    printf("                            stock: 10) (default: off)\n");
+    printf("  --soc-temp-cmd <cmd>      air: command printing the SoC temperature in degC,\n");
+    printf("                            run every 2 s (default: none)\n");
+    printf("  --overheat-c <C>          air: pause the video while disarmed at or above this\n");
+    printf("                            SoC temperature -- hooks.d/overheat, hooks.d/resume\n");
+    printf("                            on arm (needs --soc-temp-cmd) (default: off)\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -132,6 +141,9 @@ enum {
     OPT_BATT_OFFSET_MV,
     OPT_BATT_FILE,
     OPT_RF_PATH_B_OFF,
+    OPT_STANDBY_DBM,
+    OPT_SOC_TEMP_CMD,
+    OPT_OVERHEAT_C,
 };
 
 static void handle_sigterm(int sig)
@@ -165,6 +177,9 @@ int main(int argc, char** argv)
         .batt_offset_mv    = AR8030_BATT_DEFAULT_OFFSET_MV,
         .batt_file         = "",
         .link_policy       = -1,
+        .standby_dbm       = -1,
+        .soc_temp_cmd      = "",
+        .overheat_c        = -1,
     };
 
     static struct option long_options[] = {
@@ -191,6 +206,9 @@ int main(int argc, char** argv)
         {"rf-path-b-off",     no_argument,       0, OPT_RF_PATH_B_OFF    },
         {"link-policy",       required_argument, 0, OPT_LINK_POLICY      },
         {"fem-ctrl",          no_argument,       0, OPT_FEM_CTRL         },
+        {"standby-dbm",       required_argument, 0, OPT_STANDBY_DBM      },
+        {"soc-temp-cmd",      required_argument, 0, OPT_SOC_TEMP_CMD     },
+        {"overheat-c",        required_argument, 0, OPT_OVERHEAT_C       },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -283,6 +301,27 @@ int main(int argc, char** argv)
         case OPT_FEM_CTRL:
             cfg.fem_ctrl = 1;
             break;
+        case OPT_STANDBY_DBM: {
+            char* end;
+            cfg.standby_dbm = (int)strtol(optarg, &end, 10);
+            if (end == optarg || *end || cfg.standby_dbm < 0 || cfg.standby_dbm > 30) {
+                fprintf(stderr, "invalid --standby-dbm '%s' (0..30)\n", optarg);
+                return 1;
+            }
+            break;
+        }
+        case OPT_SOC_TEMP_CMD:
+            snprintf(cfg.soc_temp_cmd, sizeof(cfg.soc_temp_cmd), "%s", optarg);
+            break;
+        case OPT_OVERHEAT_C: {
+            char* end;
+            cfg.overheat_c = (int)strtol(optarg, &end, 10);
+            if (end == optarg || *end || cfg.overheat_c < 50 || cfg.overheat_c > 150) {
+                fprintf(stderr, "invalid --overheat-c '%s' (50..150)\n", optarg);
+                return 1;
+            }
+            break;
+        }
         case 'h':
             print_help(argv[0]);
             return 0;
@@ -292,6 +331,10 @@ int main(int argc, char** argv)
     }
 
     openlog("ar8030-lifecycled", LOG_PID, LOG_USER);
+
+    if (cfg.overheat_c >= 0 && !cfg.soc_temp_cmd[0]) {
+        lc_log("ar8030-lifecycled: --overheat-c without --soc-temp-cmd never triggers");
+    }
 
     signal(SIGTERM, handle_sigterm);
     signal(SIGINT, handle_sigterm);

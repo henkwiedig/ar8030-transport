@@ -368,8 +368,10 @@ static void format_channel_fields(const lc_status_t* st, char* out, size_t out_s
 }
 
 /* "power" (wanted: mW, "auto" or null for LC_POWER_NONE), "power_dbm"
- * (chip's dBm target, null until read) and "power_levels" (this role's
- * choices, highest first). */
+ * (chip's dBm target, null until read), "power_levels" (this role's
+ * choices, highest first), "armed" (last reported flight controller arm
+ * state) and "standby" (low-power mode applied, null when not enabled --
+ * --standby-dbm). */
 static void format_power_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz)
 {
     char level[16], dbm[16], levels[96];
@@ -385,9 +387,14 @@ static void format_power_fields(const lifecycle_http_ctx* http, const lc_status_
     } else {
         snprintf(dbm, sizeof(dbm), "null");
     }
-    lc_power_levels_json(lifecycle_get_config(http->lc)->role == LC_ROLE_AP, levels, sizeof(levels));
-    snprintf(out, out_sz, "\"power\":%s,\"power_dbm\":%s,\"power_levels\":[%s]", level, dbm, levels);
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+    lc_power_levels_json(cfg->role == LC_ROLE_AP, levels, sizeof(levels));
+    const char* standby = cfg->standby_dbm < 0 ? "null" : st->standby ? "true" : "false";
+    snprintf(out, out_sz, "\"power\":%s,\"power_dbm\":%s,\"power_levels\":[%s],\"armed\":%s,\"standby\":%s",
+             level, dbm, levels, st->armed ? "true" : "false", standby);
 }
+
+static void format_heat_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz);
 
 static void handle_status(lifecycle_http_ctx* http, int fd)
 {
@@ -411,8 +418,10 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
 
     char chan[96];
     format_channel_fields(&st, chan, sizeof(chan));
-    char power[192];
+    char power[256];
     format_power_fields(http, &st, power, sizeof(power));
+    char heat[64];
+    format_heat_fields(http, &st, heat, sizeof(heat));
     char dist[16];
     if (st.distance_m >= 0) {
         snprintf(dist, sizeof(dist), "%d", st.distance_m);
@@ -420,12 +429,12 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
         snprintf(dist, sizeof(dist), "null");
     }
 
-    char json[8950];
+    char json[9050];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,"
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,%s,"
               "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"batt_v\":%s,\"linkctl_exit_code\":%d,"
               "\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, dist,
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, heat, dist,
              st.paired ? "true" : "false", rf_temp, batt_v, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
@@ -707,9 +716,64 @@ static void handle_power(lifecycle_http_ctx* http, int fd, const char* method, c
 
     lc_status_t st;
     lifecycle_get_status(http->lc, &st);
-    char fields[192], json[220];
+    char fields[256], json[280];
     format_power_fields(http, &st, fields, sizeof(fields));
     snprintf(json, sizeof(json), "{\"ok\":true,%s}", fields);
+    send_json(fd, 200, "OK", json);
+}
+
+/* "soc_temp_c" (null without --soc-temp-cmd or a reading) and
+ * "overheat" (video paused for heat, null without --overheat-c). */
+static void format_heat_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz)
+{
+    char temp[16];
+    if (st->soc_temp_valid) {
+        snprintf(temp, sizeof(temp), "%.1f", st->soc_temp_c10 / 10.0);
+    } else {
+        snprintf(temp, sizeof(temp), "null");
+    }
+    const char* overheat = lifecycle_get_config(http->lc)->overheat_c < 0 ? "null" : st->overheat ? "true" : "false";
+    snprintf(out, out_sz, "\"soc_temp_c\":%s,\"overheat\":%s", temp, overheat);
+}
+
+/* GET /api/v1/armed -- the arm state and what it drives: low-power mode
+ * (as in /api/v1/power) and the video pause for heat. POST
+ * /api/v1/armed?state=<0|1> -- the flight controller's arm state, from
+ * whatever on the board reads it; applied on the lifecycle thread's next
+ * tick. */
+static void handle_armed(lifecycle_http_ctx* http, int fd, const char* method, const char* query)
+{
+    if (strcmp(method, "POST") == 0) {
+        int armed;
+        if (query_param_int(query, "state", &armed) != 0 || lifecycle_request_armed(http->lc, armed) != 0) {
+            send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"'state' must be 0 or 1\"}");
+            return;
+        }
+        char json[48];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":%d}", armed);
+        send_json(fd, 202, "Accepted", json);
+        return;
+    }
+
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+    char               dbm[16], overheat_c[16], heat[64], json[256];
+    if (cfg->standby_dbm >= 0) {
+        snprintf(dbm, sizeof(dbm), "%d", cfg->standby_dbm);
+    } else {
+        snprintf(dbm, sizeof(dbm), "null");
+    }
+    if (cfg->overheat_c >= 0) {
+        snprintf(overheat_c, sizeof(overheat_c), "%d", cfg->overheat_c);
+    } else {
+        snprintf(overheat_c, sizeof(overheat_c), "null");
+    }
+    format_heat_fields(http, &st, heat, sizeof(heat));
+    snprintf(json, sizeof(json),
+             "{\"ok\":true,\"armed\":%s,\"standby\":%s,\"standby_dbm\":%s,%s,\"overheat_c\":%s}",
+             st.armed ? "true" : "false", cfg->standby_dbm < 0 ? "null" : st.standby ? "true" : "false", dbm, heat,
+             overheat_c);
     send_json(fd, 200, "OK", json);
 }
 
@@ -1059,6 +1123,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_retx_tuning(http, fd, query);
     } else if (strcmp(path, "/api/v1/power") == 0) {
         handle_power(http, fd, method, query);
+    } else if (strcmp(path, "/api/v1/armed") == 0) {
+        handle_armed(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/channel") == 0) {
         handle_channel(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/link") == 0) {

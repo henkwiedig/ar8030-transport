@@ -125,6 +125,23 @@ typedef struct {
      * BB_SET_POWER_AUTO mode 3 {1, 1} and the fem ctrl bit at >= 24 dBm.
      * See common/ar8030_link_policy.h. */
     int  fem_ctrl;
+    /* AP: stock's low-power mode -- while the flight controller reports
+     * disarmed, hold this chip dBm target (Ascent Lite stock: 10) with the
+     * power-auto mode 3 and fem ctrl bit off; back to the wanted level on
+     * arm. Entered only with a link up, left at once (stock does the
+     * same, ar_ldyhs_sky fpv_sky_standby_mode_thread). -1 = off. Who
+     * reports the arm state is up to the board: lifecycle_request_armed(),
+     * POST /api/v1/armed. */
+    int  standby_dbm;
+    /* AP: SoC temperature source, a command printing degC (e.g. "109.9"),
+     * run every LC_SOC_TEMP_POLL_S; "" = none. Board-specific, hence a
+     * command (Ascent Lite: caddx-ascent-lite-temp). */
+    char soc_temp_cmd[256];
+    /* AP: pause the video while disarmed at or above this SoC temperature
+     * (degC): hooks.d/overheat, and hooks.d/resume on arm -- the board's
+     * scripts stop the camera stack and stand in a still frame. Needs
+     * soc_temp_cmd and an arm-state reporter; -1 = off. */
+    int  overheat_c;
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;
@@ -163,6 +180,11 @@ typedef struct {
     int        work_chan;      /* chip-reported working channel, -1 if not read yet */
     int        power;          /* wanted: mW level, LC_POWER_AUTO or LC_POWER_NONE */
     int        power_dbm;      /* chip-reported dBm target, -1 if not read yet */
+    int        armed;          /* last reported arm state; 1 until told otherwise */
+    int        standby;        /* low-power mode applied (cfg standby_dbm >= 0 only) */
+    int        soc_temp_valid; /* non-zero once soc_temp_cmd gave a reading */
+    int        soc_temp_c10;   /* SoC temperature, 0.1 degC */
+    int        overheat;       /* video paused for heat (cfg overheat_c >= 0 only) */
     int        distance_m;     /* link distance in metres, -1 without a link/result */
     int        chan_table_n;   /* channel table size, 0 until read at startup */
     uint32_t   chan_table_khz[LC_MAX_CHANNELS];
@@ -284,6 +306,13 @@ int lifecycle_request_channel(lifecycle_ctx* ctx, int chan);
  * chip-wide and needs no link. Returns 0 if queued, -1 if level is not
  * one of this role's levels. */
 int lifecycle_request_power(lifecycle_ctx* ctx, int level);
+
+/* Same mailbox pattern, for the flight controller's arm state (0 or 1),
+ * which drives the low-power mode (lc_config_t.standby_dbm). Not
+ * persisted: every start assumes armed, so a missing reporter never
+ * leaves the air unit at standby power in flight. Returns 0 if queued, -1
+ * for a value other than 0/1. */
+int lifecycle_request_armed(lifecycle_ctx* ctx, int armed);
 
 /* Same mailbox pattern, for forgetting remembered air units on the DEV
  * (multi-bind, see lifecycle_pair.h): one by MAC (8 hex digits), or with

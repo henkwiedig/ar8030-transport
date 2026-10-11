@@ -560,6 +560,33 @@ static int power_auto_ioctl(bb_dev_handle_t* handle, int mode, int max, int min)
 }
 #endif
 
+#ifdef BB_HAVE_PWR_AUTO_BOUNDS
+/* The air side's sequence (see lc_power_apply() below), with stock's
+ * power-auto mode 3 switched on (normal) or off (standby) first. */
+static int ap_power_apply_dbm(bb_dev_handle_t* handle, int dbm, int auto3, int fem_ctrl)
+{
+    int ret = 0;
+    if (fem_ctrl) {
+        /* Mode 3 isn't in bb_pwr_auto_mode_e: stock sends {3, 1, 1}
+         * before every power set in its normal (flying) mode and
+         * {3, 0, 0} before its low-power one. */
+        ret |= power_auto_ioctl(handle, 3, auto3, auto3);
+    }
+    ret |= power_auto_ioctl(handle, BB_PWR_AUTO_DISCONNECT, dbm, dbm);
+
+    bb_set_pwr_in_t sp = {.usr = BB_USER_BR_CS, .pwr = (uint8_t)dbm};
+    int             r  = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
+    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", BB_USER_BR_CS, dbm, r);
+    if (fem_ctrl) {
+        int on = dbm >= AR8030_FEM_CTRL_MIN_DBM;
+        int rf = ar8030_set_fem_ctrl(handle, on);
+        lc_log("lifecycle: tuning: fem ctrl %d (%d dBm) ret=%d", on, dbm, rf);
+        r |= rf;
+    }
+    return ret | r;
+}
+#endif
+
 /* Stock's sequences (see lifecycle_tuning.h):
  *  air:    {DISCONNECT, dbm, dbm}, then BB_SET_POWER(BR/CS user, dbm) --
  *          the AP's own power is set on the BR/CS user, not user 0
@@ -575,42 +602,43 @@ int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level, int fem_ctrl)
         lc_log("lifecycle: tuning: power level %d is not valid for this role, not applying", level);
         return -1;
     }
-    int ret = 0;
-    int target;
-    int usr;
     if (is_ap) {
-        usr    = BB_USER_BR_CS;
-        target = dbm;
-        if (fem_ctrl) {
-            /* Mode 3 isn't in bb_pwr_auto_mode_e: stock sends {3, 1, 1}
-             * before every power set in its normal (flying) mode. */
-            ret |= power_auto_ioctl(handle, 3, 1, 1);
-        }
+        return ap_power_apply_dbm(handle, dbm, 1, fem_ctrl);
+    }
+    int ret = 0;
+    if (level == LC_POWER_AUTO) {
+        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_ON, DEV_AUTO_MAX_DBM, DEV_AUTO_MIN_DBM);
     } else {
-        usr    = BB_USER_0;
-        target = dbm + DEV_TARGET_OFFSET_DBM;
-        if (level == LC_POWER_AUTO) {
-            ret |= power_auto_ioctl(handle, BB_PWR_AUTO_ON, DEV_AUTO_MAX_DBM, DEV_AUTO_MIN_DBM);
-        } else {
-            ret |= power_auto_ioctl(handle, BB_PWR_AUTO_OFF, DEV_AUTO_MIN_DBM + 3, DEV_AUTO_MIN_DBM);
-        }
+        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_OFF, DEV_AUTO_MIN_DBM + 3, DEV_AUTO_MIN_DBM);
     }
     ret |= power_auto_ioctl(handle, BB_PWR_AUTO_DISCONNECT, dbm, dbm);
 
-    bb_set_pwr_in_t sp = {.usr = (uint8_t)usr, .pwr = (uint8_t)target};
-    int             r  = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
-    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", usr, target, r);
-    if (is_ap && fem_ctrl) {
-        int on = target >= AR8030_FEM_CTRL_MIN_DBM;
-        int rf = ar8030_set_fem_ctrl(handle, on);
-        lc_log("lifecycle: tuning: fem ctrl %d (%d dBm) ret=%d", on, target, rf);
-        r |= rf;
-    }
+    int             target = dbm + DEV_TARGET_OFFSET_DBM;
+    bb_set_pwr_in_t sp     = {.usr = BB_USER_0, .pwr = (uint8_t)target};
+    int             r      = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
+    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", BB_USER_0, target, r);
     return ret | r;
 #else
     (void)handle;
     (void)is_ap;
     (void)level;
+    (void)fem_ctrl;
+    lc_log("lifecycle: tuning: SDK lacks the BB_SET_POWER_AUTO size fix, not touching output power");
+    return -1;
+#endif
+}
+
+/* Stock's low-power sequence (ar_ldyhs_sky fpv_sky_standby_mode_thread on
+ * the Lite): {3, 0, 0}, then fpv_bb_set_local_power(10) -- values below 20
+ * are taken as dBm -- i.e. {DISCONNECT, 10, 10}, BB_SET_POWER(BR/CS, 10)
+ * and the fem ctrl bit off. */
+int lc_power_apply_standby(bb_dev_handle_t* handle, int dbm, int fem_ctrl)
+{
+#ifdef BB_HAVE_PWR_AUTO_BOUNDS
+    return ap_power_apply_dbm(handle, dbm, 0, fem_ctrl);
+#else
+    (void)handle;
+    (void)dbm;
     (void)fem_ctrl;
     lc_log("lifecycle: tuning: SDK lacks the BB_SET_POWER_AUTO size fix, not touching output power");
     return -1;

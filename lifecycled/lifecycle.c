@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,6 +40,10 @@
  */
 
 #define LC_POLL_FALLBACK_S     5
+/* cfg.soc_temp_cmd: how often, and how long one run may take before it is
+ * killed (it runs on the lifecycle thread). */
+#define LC_SOC_TEMP_POLL_S     2
+#define LC_SOC_TEMP_TIMEOUT_MS 1000
 #define LC_ESTABLISH_RETRY_S   3
 
 /* Vendor's own shipped defaults for the windowed retransmission
@@ -188,6 +193,21 @@ struct lifecycle_ctx {
     int power;
     int power_dbm;
 
+    /* lifecycle_request_armed()'s mailbox, same cmd_lock; -1 = nothing
+     * queued. */
+    int pending_armed;
+    /* Last reported arm state and whether the low-power mode is applied
+     * (cfg.standby_dbm), status_lock. */
+    int armed;
+    int standby;
+
+    /* SoC temperature (lc_poll_soc_temp()) and the video pause it drives
+     * (lc_overheat_update()), status_lock. */
+    time_t soc_temp_last;
+    int    soc_temp_valid;
+    int    soc_temp_c10;
+    int    overheat;
+
     /* lifecycle_request_channel()'s mailbox, same cmd_lock. */
     int pending_channel_valid;
     int pending_channel;
@@ -226,6 +246,7 @@ struct lifecycle_ctx {
 };
 
 static void lc_apply_power(lifecycle_ctx* ctx);
+static void lc_poll_power(lifecycle_ctx* ctx);
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -301,6 +322,8 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->chan_auto            = -1;
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
+    ctx->pending_armed        = -1;
+    ctx->armed                = 1;
     ctx->distance_m           = -1;
     ctx->batt_arm_ret         = 1; /* not an ioctl result: logs the first arm */
     if (cfg->role != LC_ROLE_AP) {
@@ -648,12 +671,160 @@ static const char* lc_power_str(int level, char* buf, size_t buf_sz)
     return buf;
 }
 
+/* The wanted level, or the standby target while the low-power mode is on
+ * -- also on the connect-time re-assert and a power change requested in
+ * standby (persisted, applied on arm). */
 static void lc_apply_power(lifecycle_ctx* ctx)
 {
+    if (ctx->standby) {
+        lc_power_apply_standby(ctx->client.handle, ctx->cfg.standby_dbm, ctx->cfg.fem_ctrl);
+        return;
+    }
     if (ctx->power == LC_POWER_NONE) {
         return;
     }
     lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, ctx->power, ctx->cfg.fem_ctrl);
+}
+
+/* Drains lifecycle_request_armed()'s mailbox, then enters or leaves the
+ * low-power mode: entered while disarmed with a link up (stock waits for
+ * the link first), left as soon as armed, link or not. A drop keeps it, so
+ * the chip reconnects at standby power, as stock's does. */
+static void lc_standby_update(lifecycle_ctx* ctx)
+{
+    pthread_mutex_lock(&ctx->cmd_lock);
+    int armed          = ctx->pending_armed;
+    ctx->pending_armed = -1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (armed >= 0 && armed != ctx->armed) {
+        lc_log("lifecycle: flight controller %s", armed ? "armed" : "disarmed");
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->armed = armed;
+        pthread_mutex_unlock(&ctx->status_lock);
+    }
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.standby_dbm < 0) {
+        return;
+    }
+
+    int want = ctx->standby;
+    if (ctx->armed) {
+        want = 0;
+    } else if (ctx->state == LC_STATE_CONNECTED) {
+        want = 1;
+    }
+    if (want == ctx->standby) {
+        return;
+    }
+    if (want) {
+        lc_log("lifecycle: low-power mode on (%d dBm)", ctx->cfg.standby_dbm);
+    } else {
+        lc_log("lifecycle: low-power mode off");
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->standby = want;
+    pthread_mutex_unlock(&ctx->status_lock);
+    lc_apply_power(ctx);
+    lc_poll_power(ctx);
+}
+
+/* Runs cfg.soc_temp_cmd through /bin/sh and parses its first number as
+ * degC, every LC_SOC_TEMP_POLL_S. Killed after LC_SOC_TEMP_TIMEOUT_MS so a
+ * hung command can't stall the lifecycle thread; no waitpid() needed, see
+ * lc_hooks_init() (SIGCHLD ignored, children reaped by the kernel). */
+static void lc_poll_soc_temp(lifecycle_ctx* ctx)
+{
+    if (!ctx->cfg.soc_temp_cmd[0]) {
+        return;
+    }
+    time_t now = time(NULL);
+    if (now - ctx->soc_temp_last < LC_SOC_TEMP_POLL_S) {
+        return;
+    }
+    ctx->soc_temp_last = now;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execl("/bin/sh", "sh", "-c", ctx->cfg.soc_temp_cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(pipefd[1]);
+
+    char   out[64];
+    size_t total = 0;
+    int    timed_out = 0;
+    while (total + 1 < sizeof(out)) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(pipefd[0], &rfds);
+        struct timeval tv = {.tv_sec = LC_SOC_TEMP_TIMEOUT_MS / 1000, .tv_usec = (LC_SOC_TEMP_TIMEOUT_MS % 1000) * 1000};
+        if (select(pipefd[0] + 1, &rfds, NULL, NULL, &tv) <= 0) {
+            timed_out = 1;
+            break;
+        }
+        ssize_t n = read(pipefd[0], out + total, sizeof(out) - 1 - total);
+        if (n <= 0) {
+            break;
+        }
+        total += (size_t)n;
+    }
+    out[total] = '\0';
+    close(pipefd[0]);
+    if (timed_out) {
+        kill(pid, SIGKILL);
+    }
+
+    char*  end;
+    double c     = strtod(out, &end);
+    int    valid = !timed_out && end != out && c > -60.0 && c < 200.0;
+    if (!valid && ctx->soc_temp_valid) {
+        lc_log("lifecycle: soc temp: '%s' gave no reading%s", ctx->cfg.soc_temp_cmd, timed_out ? " (timeout)" : "");
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->soc_temp_valid = valid;
+    if (valid) {
+        ctx->soc_temp_c10 = (int)(c * 10.0 + (c >= 0 ? 0.5 : -0.5));
+    }
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
+/* Pauses the video while disarmed at or above cfg.overheat_c and resumes
+ * it on arm -- only via hooks.d/overheat and hooks.d/resume: what pausing
+ * means (stop the camera stack, stand in a still frame) is the board's
+ * business. Resumes on arm only, not on cooling: the encoder heats the
+ * die by more than 10 degC within seconds, so a cooled-down resume on
+ * the ground would pause again almost at once. No reading, no pause. */
+static void lc_overheat_update(lifecycle_ctx* ctx)
+{
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.overheat_c < 0) {
+        return;
+    }
+    if (!ctx->overheat && !ctx->armed && ctx->soc_temp_valid && ctx->soc_temp_c10 >= ctx->cfg.overheat_c * 10) {
+        lc_log("lifecycle: overheat: SoC %d.%d degC >= %d while disarmed, pausing video", ctx->soc_temp_c10 / 10,
+               ctx->soc_temp_c10 % 10, ctx->cfg.overheat_c);
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->overheat = 1;
+        pthread_mutex_unlock(&ctx->status_lock);
+        lc_hooks_dispatch(ctx->cfg.hook_dir, "overheat", ctx->cfg.role, ctx->connected_slot, NULL);
+    } else if (ctx->overheat && ctx->armed) {
+        lc_log("lifecycle: overheat: armed, resuming video");
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->overheat = 0;
+        pthread_mutex_unlock(&ctx->status_lock);
+        lc_hooks_dispatch(ctx->cfg.hook_dir, "resume", ctx->cfg.role, ctx->connected_slot, NULL);
+    }
 }
 
 /* Refreshes lifecycle_get_status()'s power_dbm, once per fallback poll. */
@@ -1215,6 +1386,12 @@ void* lifecycle_thread_main(void* arg)
             break;
         }
 
+        /* After the switch: a link that just came up has had the wanted
+         * power re-asserted (lc_apply_tuning_on_connect()) by now. */
+        lc_standby_update(ctx);
+        lc_poll_soc_temp(ctx);
+        lc_overheat_update(ctx);
+
         sleep(1);
     }
 
@@ -1237,6 +1414,11 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->work_chan      = ctx->work_chan;
     out->power          = ctx->power;
     out->power_dbm      = ctx->power_dbm;
+    out->armed          = ctx->armed;
+    out->standby        = ctx->standby;
+    out->soc_temp_valid = ctx->soc_temp_valid;
+    out->soc_temp_c10   = ctx->soc_temp_c10;
+    out->overheat       = ctx->overheat;
     out->distance_m     = ctx->distance_m;
     out->sock_port_bmp  = ctx->sock_port_bmp;
     memcpy(out->sock_rx_bytes, ctx->sock_rx_bytes, sizeof(out->sock_rx_bytes));
@@ -1317,6 +1499,17 @@ int lifecycle_request_power(lifecycle_ctx* ctx, int level)
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_power       = level;
     ctx->pending_power_valid = 1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_armed(lifecycle_ctx* ctx, int armed)
+{
+    if (armed != 0 && armed != 1) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_armed = armed;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }
