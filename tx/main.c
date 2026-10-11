@@ -782,7 +782,7 @@ int main(int argc, char **argv)
      * flight logs (tools/bc_replay): same mean bitrate as the rules mode,
      * about half the dropped frames and delay spikes. */
     bc_cfg.mode = args.bc_mode;
-    bc_cfg.pi_delay_set_ms = 10; /* link-side queueing delay, not capture -> write */
+    bc_cfg.pi_delay_set_ms = 15; /* link-side queueing delay, not capture -> write */
     bc_cfg.pi_kp_up = 0.006;
     bc_cfg.pi_kp_down = 0.02;
     bc_cfg.pi_ki_up = 0.01;

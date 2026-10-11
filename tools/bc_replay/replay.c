@@ -427,7 +427,7 @@ static void defaults(int mode)
     cfg.severe_backoff = 0.4;
     cfg.retx_event_backoff = 0.85;
     /* = tx/main.c's PI defaults */
-    cfg.pi_delay_set_ms = 10;
+    cfg.pi_delay_set_ms = 15;
     cfg.pi_kp_up = 0.006;
     cfg.pi_kp_down = 0.02;
     cfg.pi_ki_up = 0.01;
