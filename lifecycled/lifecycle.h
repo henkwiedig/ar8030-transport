@@ -130,7 +130,8 @@ typedef struct {
      * disarmed, hold this chip dBm target (Ascent Lite stock: 10) with the
      * power-auto mode 3 and fem ctrl bit off; back to the wanted level on
      * arm. Entered only with a link up, left at once (stock does the
-     * same, ar_ldyhs_sky fpv_sky_standby_mode_thread). -1 = off. Who
+     * same, ar_ldyhs_sky fpv_sky_standby_mode_thread). Also held, armed
+     * or not, while the video is paused for heat (overheat_c). -1 = off. Who
      * reports the arm state is up to the board: lifecycle_request_armed(),
      * POST /api/v1/armed. */
     int  standby_dbm;

@@ -687,8 +687,9 @@ static void lc_apply_power(lifecycle_ctx* ctx)
 }
 
 /* Drains lifecycle_request_armed()'s mailbox, then enters or leaves the
- * low-power mode: entered while disarmed with a link up (stock waits for
- * the link first), left as soon as armed, link or not. A drop keeps it, so
+ * low-power mode: entered while disarmed or paused for heat
+ * (lc_overheat_update()) with a link up (stock waits for the link first),
+ * left as soon as armed and not paused, link or not. A drop keeps it, so
  * the chip reconnects at standby power, as stock's does. */
 static void lc_standby_update(lifecycle_ctx* ctx)
 {
@@ -708,7 +709,7 @@ static void lc_standby_update(lifecycle_ctx* ctx)
     }
 
     int want = ctx->standby;
-    if (ctx->armed) {
+    if (ctx->armed && !ctx->overheat) {
         want = 0;
     } else if (ctx->state == LC_STATE_CONNECTED) {
         want = 1;
@@ -717,7 +718,8 @@ static void lc_standby_update(lifecycle_ctx* ctx)
         return;
     }
     if (want) {
-        lc_log("lifecycle: low-power mode on (%d dBm)", ctx->cfg.standby_dbm);
+        lc_log("lifecycle: low-power mode on (%d dBm, %s)", ctx->cfg.standby_dbm,
+               ctx->overheat ? "overheat" : "disarmed");
     } else {
         lc_log("lifecycle: low-power mode off");
     }
@@ -801,9 +803,10 @@ static void lc_poll_soc_temp(lifecycle_ctx* ctx)
 }
 
 /* Pauses the video at or above cfg.overheat_c, armed or not, and resumes
- * it once the SoC has cooled to cfg.overheat_resume_c -- only via
- * hooks.d/overheat and hooks.d/resume: what pausing means (stop the camera
- * stack, stand in a still frame) is the board's business. Stock reboots at
+ * it once the SoC has cooled to cfg.overheat_resume_c (the low-power mode
+ * follows, lc_standby_update()) -- only via hooks.d/overheat and
+ * hooks.d/resume: what pausing means (stop the camera stack, stand in a
+ * still frame) is the board's business. Stock reboots at
  * 110 degC whatever the arm state; a pause keeps the link and the OSD up
  * instead. The two thresholds are far apart because the encoder heats the
  * die by more than 10 degC within seconds: on the ground without airflow
@@ -1391,10 +1394,11 @@ void* lifecycle_thread_main(void* arg)
         }
 
         /* After the switch: a link that just came up has had the wanted
-         * power re-asserted (lc_apply_tuning_on_connect()) by now. */
-        lc_standby_update(ctx);
+         * power re-asserted (lc_apply_tuning_on_connect()) by now. The
+         * overheat state first, the low-power mode follows it. */
         lc_poll_soc_temp(ctx);
         lc_overheat_update(ctx);
+        lc_standby_update(ctx);
 
         sleep(1);
     }

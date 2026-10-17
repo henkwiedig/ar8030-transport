@@ -1965,7 +1965,9 @@ above `C` lifecycled runs `hooks.d/overheat`, armed or not, and
 `hooks.d/resume` once the SoC has cooled to `--overheat-resume-c`
 (default `C` - 10). Stock reboots at 110 degC whatever the arm state
 (`fpv_sys_detect_cpu_temp_thread`); the pause keeps the link and OSD up
-and brings the picture back by itself. The gap is wide because the
+and brings the picture back by itself. With `--standby-dbm`, the radio
+drops to that power for the pause too, armed or not, and goes back to
+the wanted level on resume (if armed). The gap is wide because the
 encoder heats the die by more than 10 degC within seconds: on the ground
 without airflow the video comes back for a while and pauses again. No
 reading, no pause; a reading lost while paused keeps the pause. What
@@ -2204,7 +2206,8 @@ design rationale):
   stock, it is entered only with a link up and kept across a drop;
   unlike stock, it is left on arm even without a link. The camera stack
   keeps running (stock's sensor "low power" call is an empty stub) --
-  pausing it is `--overheat-c`'s job (see `ar8030-lifecycled` above).
+  pausing it is `--overheat-c`'s job (see `ar8030-lifecycled` above),
+  and while that pause lasts the low-power mode holds even when armed.
   ```
   curl -X POST 'http://<host>:8899/api/v1/armed?state=0'
   curl http://<host>:8899/api/v1/armed
@@ -2212,8 +2215,9 @@ design rationale):
   ```
   Whatever reads the FC (msposd's MSP_STATUS) posts the state; nothing
   is persisted and every start assumes armed, so without a reporter the
-  air unit never sits at standby power in flight. A power change made
-  in standby is saved and applied on arm. `standby` is `null` without
+  air unit sits at standby power in flight only during an overheat
+  pause. A power change made in standby is saved and applied when
+  standby ends. `standby` is `null` without
   `--standby-dbm`. The same reply carries `soc_temp_c` (from
   `--soc-temp-cmd`, also in `/api/v1/status`), `overheat` (video paused,
   `null` without `--overheat-c`, also in `/api/v1/status`),
