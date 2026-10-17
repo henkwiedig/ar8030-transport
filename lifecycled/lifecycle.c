@@ -116,6 +116,10 @@ struct lifecycle_ctx {
      * fail right after CONNECT (ret -2, seen 2026-10-03 with --fem-ctrl:
      * MCS 10 then gives 19.5 instead of 27.7 Mbit/s), retried per poll. */
     int frame_change_pending;
+    /* g_link_connect_gen when the link tuning was last applied -- a
+     * different value while in LC_STATE_CONNECTED means the chip relinked
+     * inside the drop debounce (see g_link_connect_gen). */
+    unsigned connect_gen;
 
     /* Consecutive main-loop ticks (1s each) the link has read as CONNECT
      * while in LC_STATE_IDLE -- every CONNECT this process ever observes
@@ -247,6 +251,7 @@ struct lifecycle_ctx {
 
 static void lc_apply_power(lifecycle_ctx* ctx);
 static void lc_poll_power(lifecycle_ctx* ctx);
+static void lc_apply_link_tuning(lifecycle_ctx* ctx);
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -255,6 +260,14 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
 static pthread_mutex_t g_link_state_lock  = PTHREAD_MUTEX_INITIALIZER;
 static bb_link_state_e g_link_state       = BB_LINK_STATE_IDLE;
 static int             g_link_state_valid = 0;
+/* CONNECT entries reported by BB_EVENT_LINK_STATE, same lock. The chip can
+ * drop and relink well inside LC_DROP_CONFIRM_TICKS, so the main loop
+ * never leaves LC_STATE_CONNECTED -- every bandwidth switch to or from
+ * 40 MHz does this on purpose (its firmware forces a link loss on both
+ * sides, relinked ~0.65 s later; ar8030-rtos notes/open_issues.md §7),
+ * and the relink drops the frame change back to mode 0 and resets the
+ * chip's output power. Only the event shows it; the 5 s poll misses it. */
+static unsigned        g_link_connect_gen = 0;
 
 void lifecycle_request_shutdown(void)
 {
@@ -284,6 +297,14 @@ static int lc_get_link_state(bb_link_state_e* out)
     return ok;
 }
 
+static unsigned lc_get_connect_gen(void)
+{
+    pthread_mutex_lock(&g_link_state_lock);
+    unsigned gen = g_link_connect_gen;
+    pthread_mutex_unlock(&g_link_state_lock);
+    return gen;
+}
+
 void lc_on_link_state_event(void* arg, void* user)
 {
     (void)user;
@@ -292,6 +313,11 @@ void lc_on_link_state_event(void* arg, void* user)
         return;
     }
     lc_log("lifecycle: link state event slot=%d cur=%d prev=%d", evt->slot, evt->cur_state, evt->prev_state);
+    if (evt->cur_state == BB_LINK_STATE_CONNECT && evt->prev_state != BB_LINK_STATE_CONNECT) {
+        pthread_mutex_lock(&g_link_state_lock);
+        g_link_connect_gen++;
+        pthread_mutex_unlock(&g_link_state_lock);
+    }
     lc_set_link_state((bb_link_state_e)evt->cur_state);
 }
 
@@ -413,6 +439,15 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
     ctx->last_bandwidth = bandwidth;
     pthread_mutex_unlock(&ctx->status_lock);
 
+    lc_apply_link_tuning(ctx);
+}
+
+/* The part of the connect tuning a relink can lose: also re-run when the
+ * chip relinks while this process stays in LC_STATE_CONNECTED (see
+ * g_link_connect_gen). Not bandwidth: the chip keeps it across a relink,
+ * and a 40 MHz switch is what caused that relink in the first place. */
+static void lc_apply_link_tuning(lifecycle_ctx* ctx)
+{
     /* Chip-wide, not tied to `slot` -- but only worth applying once a
      * link has actually formed (mirrors bandwidth's own "connect first,
      * tune second" ordering). Unlike bandwidth's own persisted-value-or-
@@ -1294,6 +1329,8 @@ void* lifecycle_thread_main(void* arg)
                 ctx->state          = LC_STATE_CONNECTED;
                 pthread_mutex_unlock(&ctx->status_lock);
                 lc_hooks_dispatch(ctx->cfg.hook_dir, "connected", ctx->cfg.role, ctx->connected_slot, NULL);
+                /* Before the tuning: a relink from here on re-applies it. */
+                ctx->connect_gen = lc_get_connect_gen();
                 lc_apply_tuning_on_connect(ctx, ctx->connected_slot);
                 lc_channel_on_connect(ctx);
                 /* A fresh pair rewrote ap_mac: remember it for multi-bind. */
@@ -1354,6 +1391,17 @@ void* lifecycle_thread_main(void* arg)
                 break;
             }
             ctx->drop_miss_count = 0;
+            /* A relink the debounce above absorbed (g_link_connect_gen):
+             * no hooks, the link never went down for long, but the frame
+             * change and the power need re-applying. */
+            {
+                unsigned gen = lc_get_connect_gen();
+                if (gen != ctx->connect_gen) {
+                    ctx->connect_gen = gen;
+                    lc_log("lifecycle: chip relinked while connected, re-applying link tuning");
+                    lc_apply_link_tuning(ctx);
+                }
+            }
             /* Re-apply (never persist) when the chip reports another TX
              * bandwidth than wanted: a fresh CONNECT can sit at a narrow
              * bandwidth (e.g. 2.5M) for a while before the two sides finish

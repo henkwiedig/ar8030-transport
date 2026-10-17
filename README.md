@@ -2133,6 +2133,17 @@ design rationale):
   the same reasoning rules out a second thread in *this* process making
   concurrent `bb_ioctl` calls on the same handle).
   `curl -X POST 'http://<host>:8899/api/v1/bandwidth?mhz=20'`.
+  A switch to or from 40 MHz makes the chip firmware drop the link on
+  both sides on purpose. The link comes back after about 0.65 s, but in
+  frame mode 0 and with the chip's power reset (ar8030-rtos
+  `notes/open_issues.md` §7). That is too short for the drop debounce,
+  so lifecycled counts the chip's CONNECT events instead, and on such a
+  relink re-applies the link tuning without running the hooks: retx,
+  power, `BB_SET_FRAME_CHANGE(1)` on the AP, the MCS table on the DEV.
+  Without the frame change the 40 MHz link reports 34.5 Mbit/s at MCS 12,
+  less than 20 MHz with it (36.7); with it, 54.1. The host write path
+  caps a bulk writer at about 40 Mbit/s anyway (blast), so 40 MHz buys
+  little until that path gets faster.
 - **`GET|POST /api/v1/channel[?chan=<index|auto>]`** -- the *persisted*
   channel, owned by the AP. GET returns the wanted channel (AP; `null`
   on the DEV) plus what the chip last reported on a live link:
