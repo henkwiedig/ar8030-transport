@@ -1960,12 +1960,17 @@ flight controller is disarmed (see `/api/v1/armed` below). The camera
 stack heats the SoC far more than the radio, though -- on the Ascent Lite
 without airflow, starting the encoder took the die from 109 to 122 degC
 in about 13 s -- so `--soc-temp-cmd <cmd>` (a board command printing
-degC, run every 2 s) plus `--overheat-c <C>` pause the video: disarmed
-at or above `C` runs `hooks.d/overheat`, the next arm `hooks.d/resume`.
-Only arming resumes, not cooling down: on the ground a resumed encoder
-would hit the limit again within seconds. What pausing means is the
-board's hook -- the Ascent's stops waybeam and starts `ar8030-still`
-(next section) in its place.
+degC, run every 2 s) plus `--overheat-c <C>` pause the video: at or
+above `C` lifecycled runs `hooks.d/overheat`, armed or not, and
+`hooks.d/resume` once the SoC has cooled to `--overheat-resume-c`
+(default `C` - 10). Stock reboots at 110 degC whatever the arm state
+(`fpv_sys_detect_cpu_temp_thread`); the pause keeps the link and OSD up
+and brings the picture back by itself. The gap is wide because the
+encoder heats the die by more than 10 degC within seconds: on the ground
+without airflow the video comes back for a while and pauses again. No
+reading, no pause; a reading lost while paused keeps the pause. What
+pausing means is the board's hook -- the Ascent's stops waybeam and
+starts `ar8030-still` (next section) in its place.
 
 ## HTTP control API
 
@@ -2203,7 +2208,7 @@ design rationale):
   ```
   curl -X POST 'http://<host>:8899/api/v1/armed?state=0'
   curl http://<host>:8899/api/v1/armed
-  {"ok":true,"armed":false,"standby":true,"standby_dbm":10,"soc_temp_c":104.2,"overheat":false,"overheat_c":105}
+  {"ok":true,"armed":false,"standby":true,"standby_dbm":10,"soc_temp_c":104.2,"overheat":false,"overheat_c":105,"overheat_resume_c":95}
   ```
   Whatever reads the FC (msposd's MSP_STATUS) posts the state; nothing
   is persisted and every start assumes armed, so without a reporter the
@@ -2211,8 +2216,9 @@ design rationale):
   in standby is saved and applied on arm. `standby` is `null` without
   `--standby-dbm`. The same reply carries `soc_temp_c` (from
   `--soc-temp-cmd`, also in `/api/v1/status`), `overheat` (video paused,
-  `null` without `--overheat-c`, also in `/api/v1/status`) and
-  `overheat_c`.
+  `null` without `--overheat-c`, also in `/api/v1/status`),
+  `overheat_c` and `overheat_resume_c` -- the pause itself does not
+  depend on the arm state.
 - **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
   -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
   the windowed retransmission controller's own tuning parameters

@@ -98,9 +98,11 @@ static void print_help(const char* argv0)
     printf("                            stock: 10) (default: off)\n");
     printf("  --soc-temp-cmd <cmd>      air: command printing the SoC temperature in degC,\n");
     printf("                            run every 2 s (default: none)\n");
-    printf("  --overheat-c <C>          air: pause the video while disarmed at or above this\n");
-    printf("                            SoC temperature -- hooks.d/overheat, hooks.d/resume\n");
-    printf("                            on arm (needs --soc-temp-cmd) (default: off)\n");
+    printf("  --overheat-c <C>          air: pause the video at or above this SoC\n");
+    printf("                            temperature, armed or not -- hooks.d/overheat\n");
+    printf("                            (needs --soc-temp-cmd) (default: off)\n");
+    printf("  --overheat-resume-c <C>   air: hooks.d/resume once cooled to this (default:\n");
+    printf("                            --overheat-c - %d)\n", LC_OVERHEAT_HYST_C);
     printf("  -h, --help                this help\n");
 }
 
@@ -144,6 +146,7 @@ enum {
     OPT_STANDBY_DBM,
     OPT_SOC_TEMP_CMD,
     OPT_OVERHEAT_C,
+    OPT_OVERHEAT_RESUME_C,
 };
 
 static void handle_sigterm(int sig)
@@ -180,6 +183,7 @@ int main(int argc, char** argv)
         .standby_dbm       = -1,
         .soc_temp_cmd      = "",
         .overheat_c        = -1,
+        .overheat_resume_c = -1,
     };
 
     static struct option long_options[] = {
@@ -209,6 +213,7 @@ int main(int argc, char** argv)
         {"standby-dbm",       required_argument, 0, OPT_STANDBY_DBM      },
         {"soc-temp-cmd",      required_argument, 0, OPT_SOC_TEMP_CMD     },
         {"overheat-c",        required_argument, 0, OPT_OVERHEAT_C       },
+        {"overheat-resume-c", required_argument, 0, OPT_OVERHEAT_RESUME_C},
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -322,11 +327,30 @@ int main(int argc, char** argv)
             }
             break;
         }
+        case OPT_OVERHEAT_RESUME_C: {
+            char* end;
+            cfg.overheat_resume_c = (int)strtol(optarg, &end, 10);
+            if (end == optarg || *end || cfg.overheat_resume_c < 40 || cfg.overheat_resume_c > 150) {
+                fprintf(stderr, "invalid --overheat-resume-c '%s' (40..150)\n", optarg);
+                return 1;
+            }
+            break;
+        }
         case 'h':
             print_help(argv[0]);
             return 0;
         default:
             break;
+        }
+    }
+
+    if (cfg.overheat_c >= 0) {
+        if (cfg.overheat_resume_c < 0) {
+            cfg.overheat_resume_c = cfg.overheat_c - LC_OVERHEAT_HYST_C;
+        } else if (cfg.overheat_resume_c >= cfg.overheat_c) {
+            fprintf(stderr, "--overheat-resume-c %d must be below --overheat-c %d\n", cfg.overheat_resume_c,
+                    cfg.overheat_c);
+            return 1;
         }
     }
 

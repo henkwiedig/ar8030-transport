@@ -26,6 +26,7 @@ extern "C" {
 #define LC_MAX_RESET_GPIOS 8
 #define LC_MAX_CHANNELS    64 /* >= the SDK's BB_CONFIG_MAX_CHAN_NUM (60) */
 #define LC_SOCK_PORTS      8  /* == the SDK's BB_SOCK_INFO_NUM */
+#define LC_OVERHEAT_HYST_C 10 /* default overheat_c - overheat_resume_c */
 
 typedef enum {
     LC_RESET_METHOD_NONE = 0,
@@ -137,11 +138,14 @@ typedef struct {
      * run every LC_SOC_TEMP_POLL_S; "" = none. Board-specific, hence a
      * command (Ascent Lite: caddx-ascent-lite-temp). */
     char soc_temp_cmd[256];
-    /* AP: pause the video while disarmed at or above this SoC temperature
-     * (degC): hooks.d/overheat, and hooks.d/resume on arm -- the board's
-     * scripts stop the camera stack and stand in a still frame. Needs
-     * soc_temp_cmd and an arm-state reporter; -1 = off. */
+    /* AP: pause the video at or above this SoC temperature (degC), armed
+     * or not: hooks.d/overheat, and hooks.d/resume once it has cooled to
+     * overheat_resume_c -- the board's scripts stop the camera stack and
+     * stand in a still frame. Needs soc_temp_cmd; -1 = off. */
     int  overheat_c;
+    /* AP: resume temperature (degC), below overheat_c; main.c defaults it
+     * to overheat_c - LC_OVERHEAT_HYST_C. */
+    int  overheat_resume_c;
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;

@@ -800,26 +800,30 @@ static void lc_poll_soc_temp(lifecycle_ctx* ctx)
     pthread_mutex_unlock(&ctx->status_lock);
 }
 
-/* Pauses the video while disarmed at or above cfg.overheat_c and resumes
- * it on arm -- only via hooks.d/overheat and hooks.d/resume: what pausing
- * means (stop the camera stack, stand in a still frame) is the board's
- * business. Resumes on arm only, not on cooling: the encoder heats the
- * die by more than 10 degC within seconds, so a cooled-down resume on
- * the ground would pause again almost at once. No reading, no pause. */
+/* Pauses the video at or above cfg.overheat_c, armed or not, and resumes
+ * it once the SoC has cooled to cfg.overheat_resume_c -- only via
+ * hooks.d/overheat and hooks.d/resume: what pausing means (stop the camera
+ * stack, stand in a still frame) is the board's business. Stock reboots at
+ * 110 degC whatever the arm state; a pause keeps the link and the OSD up
+ * instead. The two thresholds are far apart because the encoder heats the
+ * die by more than 10 degC within seconds: on the ground without airflow
+ * the video comes back for a while and pauses again. No reading, no pause;
+ * a reading lost while paused keeps the pause. */
 static void lc_overheat_update(lifecycle_ctx* ctx)
 {
-    if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.overheat_c < 0) {
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.overheat_c < 0 || !ctx->soc_temp_valid) {
         return;
     }
-    if (!ctx->overheat && !ctx->armed && ctx->soc_temp_valid && ctx->soc_temp_c10 >= ctx->cfg.overheat_c * 10) {
-        lc_log("lifecycle: overheat: SoC %d.%d degC >= %d while disarmed, pausing video", ctx->soc_temp_c10 / 10,
-               ctx->soc_temp_c10 % 10, ctx->cfg.overheat_c);
+    if (!ctx->overheat && ctx->soc_temp_c10 >= ctx->cfg.overheat_c * 10) {
+        lc_log("lifecycle: overheat: SoC %d.%d degC >= %d (%s), pausing video", ctx->soc_temp_c10 / 10,
+               ctx->soc_temp_c10 % 10, ctx->cfg.overheat_c, ctx->armed ? "armed" : "disarmed");
         pthread_mutex_lock(&ctx->status_lock);
         ctx->overheat = 1;
         pthread_mutex_unlock(&ctx->status_lock);
         lc_hooks_dispatch(ctx->cfg.hook_dir, "overheat", ctx->cfg.role, ctx->connected_slot, NULL);
-    } else if (ctx->overheat && ctx->armed) {
-        lc_log("lifecycle: overheat: armed, resuming video");
+    } else if (ctx->overheat && ctx->soc_temp_c10 <= ctx->cfg.overheat_resume_c * 10) {
+        lc_log("lifecycle: overheat: SoC %d.%d degC <= %d, resuming video", ctx->soc_temp_c10 / 10,
+               ctx->soc_temp_c10 % 10, ctx->cfg.overheat_resume_c);
         pthread_mutex_lock(&ctx->status_lock);
         ctx->overheat = 0;
         pthread_mutex_unlock(&ctx->status_lock);

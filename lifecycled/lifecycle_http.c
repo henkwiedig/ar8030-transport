@@ -736,8 +736,9 @@ static void format_heat_fields(const lifecycle_http_ctx* http, const lc_status_t
     snprintf(out, out_sz, "\"soc_temp_c\":%s,\"overheat\":%s", temp, overheat);
 }
 
-/* GET /api/v1/armed -- the arm state and what it drives: low-power mode
- * (as in /api/v1/power) and the video pause for heat. POST
+/* GET /api/v1/armed -- the arm state and what it drives, low-power mode
+ * (as in /api/v1/power), next to the video pause for heat (which ignores
+ * the arm state). POST
  * /api/v1/armed?state=<0|1> -- the flight controller's arm state, from
  * whatever on the board reads it; applied on the lifecycle thread's next
  * tick. */
@@ -758,7 +759,7 @@ static void handle_armed(lifecycle_http_ctx* http, int fd, const char* method, c
     lc_status_t st;
     lifecycle_get_status(http->lc, &st);
     const lc_config_t* cfg = lifecycle_get_config(http->lc);
-    char               dbm[16], overheat_c[16], heat[64], json[256];
+    char               dbm[16], overheat_c[16], resume_c[16], heat[64], json[256];
     if (cfg->standby_dbm >= 0) {
         snprintf(dbm, sizeof(dbm), "%d", cfg->standby_dbm);
     } else {
@@ -766,14 +767,17 @@ static void handle_armed(lifecycle_http_ctx* http, int fd, const char* method, c
     }
     if (cfg->overheat_c >= 0) {
         snprintf(overheat_c, sizeof(overheat_c), "%d", cfg->overheat_c);
+        snprintf(resume_c, sizeof(resume_c), "%d", cfg->overheat_resume_c);
     } else {
         snprintf(overheat_c, sizeof(overheat_c), "null");
+        snprintf(resume_c, sizeof(resume_c), "null");
     }
     format_heat_fields(http, &st, heat, sizeof(heat));
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"armed\":%s,\"standby\":%s,\"standby_dbm\":%s,%s,\"overheat_c\":%s}",
+             "{\"ok\":true,\"armed\":%s,\"standby\":%s,\"standby_dbm\":%s,%s,\"overheat_c\":%s,"
+             "\"overheat_resume_c\":%s}",
              st.armed ? "true" : "false", cfg->standby_dbm < 0 ? "null" : st.standby ? "true" : "false", dbm, heat,
-             overheat_c);
+             overheat_c, resume_c);
     send_json(fd, 200, "OK", json);
 }
 
