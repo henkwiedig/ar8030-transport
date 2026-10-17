@@ -147,6 +147,9 @@ typedef struct {
     /* AP: resume temperature (degC), below overheat_c; main.c defaults it
      * to overheat_c - LC_OVERHEAT_HYST_C. */
     int  overheat_resume_c;
+    /* ar8030d's global log level (print_level) set once connected:
+     * LC_DAEMON_LOG_DEBUG..ERROR, or -1 = leave ar8030d's own (debug). */
+    int daemon_log;
 } lc_config_t;
 
 typedef struct lifecycle_ctx lifecycle_ctx;

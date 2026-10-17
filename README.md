@@ -459,6 +459,24 @@ tx `-v` adds "capture->write start" and "frame write" (first to last
 `bb_socket_write()` of a frame): ~7.5 ms for a 25 KB frame at 20 MHz, about
 1.8 ms fixed plus 0.22 ms/KB.
 
+Where a write's time goes (2026-10-17, Ascent Lite, 40 MHz + frame change,
+radio not the limit): `blast -c 26000 -i 10000 -T FILE` (video-like, one
+26 KB write per 10 ms, each call's CLOCK_REALTIME start / end) joined with
+ar8030d's debug log by ar8030-rtos `tools/rtt_breakdown.py`. Per write:
+client -> ar8030d has the message 0.75 ms, ar8030d queueing 0.2 ms, SDIO
+frames + chip acks 4.3 ms (three ≤ 10 KB frames, ~1.4 ms each), reply ->
+`bb_socket_write()` returns 0.5 ms; 6.3 ms in all. The reply is not on a
+frame's own path to the chip, only on the next write's.
+
+ar8030d's own debug logging was the cheapest part to remove. At its default
+print_level (debug) it formats 3-4 lines per WRITE frame on the data path
+(~1150 lines/s during video on the air). At info (`ar8030-linkctl
+daemon-log info`, lifecycled's `--daemon-log`, default info): paced 26 KB
+writes 6.30 -> 5.36 ms, bulk 64 KB 39.0 -> 46.3 Mbit/s, and on live video
+the PI controller settles at 22.8 instead of 19.9 Mbit/s (k 0.80 vs 0.71).
+`ar8030-linkctl daemon-log debug` brings the lines back for an analysis
+(ar8030-rtos `tools/sockwr_timeline.py`).
+
 Bench breakdown, 1080p100 at ~20 Mbit/s, 20 MHz (2026-09-30): capture ->
 encode done 12.2 ms (sensor readout 8.3 ms + encoder), -> frame written
 ~21 ms, -> reassembled on the ground ~38-40 ms; with PixelPilot's

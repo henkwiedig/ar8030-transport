@@ -96,6 +96,22 @@ int lc_channel_load(const char* cfg_path, int* out);
  * file next to cfg_path. Returns 0 on success. */
 int lc_channel_save(const char* cfg_path, int chan);
 
+/* ar8030d's global log level (com_log's print_level): a module's lines
+ * appear when its level is at least this. ar8030d starts at debug, where
+ * the socket data path logs 3-4 lines per WRITE frame (sock-dat); info
+ * drops those and keeps socket / connection events. */
+#define LC_DAEMON_LOG_DEBUG 0
+#define LC_DAEMON_LOG_INFO  1
+#define LC_DAEMON_LOG_WARN  2
+#define LC_DAEMON_LOG_ERROR 3
+
+/* "debug".."error" -> level, "keep" -> -1, anything else -> -2. */
+int lc_daemon_log_parse(const char* s);
+
+/* bb_daemon_set_dbg_level("print_level", level); logs what ar8030d
+ * reports back. Returns 0 if it took. */
+int lc_daemon_log_apply(bb_host_t* host, int level);
+
 /* BB_GET_CHAN_INFO: fills auto_mode (1 = adaptive), work_chan and
  * chan_num (size of the chip's channel table). Returns 0 on success. */
 int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num);

@@ -1291,6 +1291,10 @@ void* lifecycle_thread_main(void* arg)
         return NULL;
     }
 
+    if (ctx->cfg.daemon_log >= 0) {
+        lc_daemon_log_apply(ctx->client.host, ctx->cfg.daemon_log);
+    }
+
     /* Stock's own ar_ldy_gnd does exactly this, unconditionally, once at
      * every startup (fpv_gnd_read_factory_user_cfg() feeding
      * fpv_bb_set_ap_candidate_mac(), confirmed via decompile) -- the

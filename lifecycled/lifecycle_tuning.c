@@ -320,6 +320,34 @@ int lc_channel_save(const char* cfg_path, int chan)
     return 0;
 }
 
+static const char* const DAEMON_LOG_NAMES[] = {"debug", "info", "warn", "error"};
+
+int lc_daemon_log_parse(const char* s)
+{
+    if (!strcmp(s, "keep")) {
+        return -1;
+    }
+    for (int i = 0; i < (int)(sizeof(DAEMON_LOG_NAMES) / sizeof(DAEMON_LOG_NAMES[0])); i++) {
+        if (!strcmp(s, DAEMON_LOG_NAMES[i])) {
+            return i;
+        }
+    }
+    return -2;
+}
+
+int lc_daemon_log_apply(bb_host_t* host, int level)
+{
+    daemon_dbg_ctrl c;
+    memset(&c, 0, sizeof(c));
+    snprintf(c.names, sizeof(c.names), "print_level");
+    c.level = level;
+    bb_daemon_set_dbg_level(host, &c);
+    c = bb_daemon_get_dbg_level(host, "print_level");
+    lc_log("lifecycle: ar8030d log level %s (wanted %s)", c.level >= 0 && c.level <= 3 ? DAEMON_LOG_NAMES[c.level] : "?",
+           DAEMON_LOG_NAMES[level]);
+    return c.level == level ? 0 : -1;
+}
+
 int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num)
 {
     bb_get_chan_info_out_t out;

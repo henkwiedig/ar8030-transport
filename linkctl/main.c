@@ -60,13 +60,19 @@ static void usage(const char *argv0)
             "      of every bb_socket write/read (RPC + SDIO/USB). Prints min,\n"
             "      median, p90, p99 and max in microseconds.\n"
             "\n"
-            "  blast [-o port] [-t seconds] [-c bytes] [-B tx_buf]\n"
+            "  blast [-o port] [-t seconds] [-c bytes] [-B tx_buf] [-i us] [-T file]\n"
             "      Write bulk data to the connected peer on bb_socket <port> (default\n"
             "      2, the video port: stop ar8030-transport-tx first) as fast as it is\n"
             "      accepted, for <seconds> (default 5), <bytes> per write (default\n"
             "      65535, as tx). Reports throughput and per-write call times --\n"
             "      compare across bandwidths to tell a radio limit from a host\n"
-            "      (RPC/daemon/SDIO) limit.\n"
+            "      (RPC/daemon/SDIO) limit. -i paces the writes (one per <us>, e.g.\n"
+            "      10000 for 100 fps video); -T writes each call's CLOCK_REALTIME\n"
+            "      start and end to <file>, the clock ar8030d's log uses.\n"
+            "\n"
+            "  daemon-log [debug|info|warn|error]\n"
+            "      Show or set ar8030d's global log level (print_level). At debug\n"
+            "      (its default) it logs 3-4 lines per socket WRITE frame.\n"
             "\n"
             "  bandwidth <mhz> [-d tx|rx] [-s slot] [-w seconds]\n"
             "      Manually set channel bandwidth. <mhz> is one of\n"
@@ -590,17 +596,27 @@ static int cmd_rtt(int argc, char **argv)
     return 0;
 }
 
+static uint64_t realtime_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
 static int cmd_blast(int argc, char **argv)
 {
     int port = 2, secs = 5;
-    uint32_t chunk = 65535, tx_buf = 64 * 1024;
+    uint32_t chunk = 65535, tx_buf = 64 * 1024, interval_us = 0;
+    const char *times_path = NULL;
     int opt;
-    while ((opt = getopt(argc, argv, "o:t:c:B:")) != -1) {
+    while ((opt = getopt(argc, argv, "o:t:c:B:i:T:")) != -1) {
         switch (opt) {
         case 'o': port = atoi(optarg); break;
         case 't': secs = atoi(optarg); break;
         case 'c': chunk = (uint32_t)strtoul(optarg, NULL, 0); break;
         case 'B': tx_buf = (uint32_t)strtoul(optarg, NULL, 0); break;
+        case 'i': interval_us = (uint32_t)strtoul(optarg, NULL, 0); break;
+        case 'T': times_path = optarg; break;
         default: return 1;
         }
     }
@@ -623,10 +639,13 @@ static int cmd_blast(int argc, char **argv)
     uint8_t *buf = malloc(chunk);
     enum { MAX_CALLS = 200000 };
     uint32_t *call_us = malloc(MAX_CALLS * sizeof(*call_us));
-    if (!buf || !call_us) {
+    /* -T: each call's CLOCK_REALTIME start / end, the clock ar8030d's log uses */
+    uint64_t *times = times_path ? malloc(MAX_CALLS * 2 * sizeof(*times)) : NULL;
+    if (!buf || !call_us || (times_path && !times)) {
         bb_socket_close(fd);
         free(buf);
         free(call_us);
+        free(times);
         return 1;
     }
     memset(buf, 0x55, chunk);
@@ -635,9 +654,21 @@ static int cmd_blast(int argc, char **argv)
     uint64_t bytes = 0, calls = 0, partial = 0, fails = 0;
     double elapsed = 0;
     while (elapsed < secs) {
+        if (interval_us) {                          /* -i: one write per interval, like video frames */
+            uint64_t due = calls * (uint64_t)interval_us, now;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            now = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
+            if (now < due)
+                usleep((useconds_t)(due - now));
+        }
+        uint64_t rt0 = times ? realtime_us() : 0;
         clock_gettime(CLOCK_MONOTONIC, &a);
         int wr = bb_socket_write(fd, buf, chunk, 2500);
         clock_gettime(CLOCK_MONOTONIC, &b);
+        if (times && calls < MAX_CALLS) {
+            times[calls * 2]     = rt0;
+            times[calls * 2 + 1] = realtime_us();
+        }
         if (calls < MAX_CALLS)
             call_us[calls] = (uint32_t)(((int64_t)(b.tv_sec - a.tv_sec) * 1000000000 + (b.tv_nsec - a.tv_nsec)) / 1000);
         calls++;
@@ -653,6 +684,19 @@ static int cmd_blast(int argc, char **argv)
     }
     bb_socket_close(fd);
     uint64_t n = calls < MAX_CALLS ? calls : MAX_CALLS;
+    if (times) {
+        FILE *f = fopen(times_path, "w");
+        if (f) {
+            for (uint64_t i = 0; i < n; i++)
+                fprintf(f, "%llu.%06llu %llu.%06llu\n", (unsigned long long)(times[i * 2] / 1000000u),
+                        (unsigned long long)(times[i * 2] % 1000000u), (unsigned long long)(times[i * 2 + 1] / 1000000u),
+                        (unsigned long long)(times[i * 2 + 1] % 1000000u));
+            fclose(f);
+        } else {
+            fprintf(stderr, "linkctl: cannot write %s\n", times_path);
+        }
+        free(times);
+    }
     qsort(call_us, n, sizeof(*call_us), cmp_u32);
     printf("blast: slot %d port %d, %u B per write: %.2f Mbit/s over %.1f s | %llu calls (%llu partial, %llu "
            "failed), %.1f KB per call | call us: min %u median %u p90 %u max %u\n",
@@ -1456,6 +1500,29 @@ static int cmd_rate(int argc, char **argv)
     return 0;
 }
 
+static int cmd_daemon_log(int argc, char **argv)
+{
+    static const char *const names[] = { "debug", "info", "warn", "error" };
+    daemon_dbg_ctrl c;
+    if (argc >= 2) {
+        int lv = -1;
+        for (int i = 0; i < 4; i++)
+            if (!strcmp(argv[1], names[i]))
+                lv = i;
+        if (lv < 0) {
+            fprintf(stderr, "linkctl: daemon-log needs debug, info, warn or error\n");
+            return 1;
+        }
+        memset(&c, 0, sizeof(c));
+        snprintf(c.names, sizeof(c.names), "print_level");
+        c.level = lv;
+        bb_daemon_set_dbg_level(g_phost, &c);
+    }
+    c = bb_daemon_get_dbg_level(g_phost, "print_level");
+    printf("ar8030d print_level: %s (%d)\n", c.level >= 0 && c.level < 4 ? names[c.level] : "?", c.level);
+    return 0;
+}
+
 static int cmd_frame_change(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1897,6 +1964,8 @@ int main(int argc, char **argv)
         rc = cmd_mcs_table_air();
     else if (!strcmp(cmd, "rate"))
         rc = cmd_rate(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "daemon-log"))
+        rc = cmd_daemon_log(argc - 1, argv + 1);
     else if (!strcmp(cmd, "frame-change"))
         rc = cmd_frame_change(argc - 1, argv + 1);
     else if (!strcmp(cmd, "cfg-dump"))

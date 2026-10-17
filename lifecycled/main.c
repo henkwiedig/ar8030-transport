@@ -103,6 +103,10 @@ static void print_help(const char* argv0)
     printf("                            --standby-dbm (needs --soc-temp-cmd) (default: off)\n");
     printf("  --overheat-resume-c <C>   air: hooks.d/resume once cooled to this (default:\n");
     printf("                            --overheat-c - %d)\n", LC_OVERHEAT_HYST_C);
+    printf("  --daemon-log <level>      ar8030d's log level once connected: debug, info,\n");
+    printf("                            warn, error or keep (default: info). ar8030d's own\n");
+    printf("                            debug logs 3-4 lines per socket WRITE frame, which\n");
+    printf("                            on the air costs ~1 ms per video frame\n");
     printf("  -h, --help                this help\n");
 }
 
@@ -147,6 +151,7 @@ enum {
     OPT_SOC_TEMP_CMD,
     OPT_OVERHEAT_C,
     OPT_OVERHEAT_RESUME_C,
+    OPT_DAEMON_LOG,
 };
 
 static void handle_sigterm(int sig)
@@ -184,6 +189,7 @@ int main(int argc, char** argv)
         .soc_temp_cmd      = "",
         .overheat_c        = -1,
         .overheat_resume_c = -1,
+        .daemon_log        = LC_DAEMON_LOG_INFO,
     };
 
     static struct option long_options[] = {
@@ -214,6 +220,7 @@ int main(int argc, char** argv)
         {"soc-temp-cmd",      required_argument, 0, OPT_SOC_TEMP_CMD     },
         {"overheat-c",        required_argument, 0, OPT_OVERHEAT_C       },
         {"overheat-resume-c", required_argument, 0, OPT_OVERHEAT_RESUME_C},
+        {"daemon-log",        required_argument, 0, OPT_DAEMON_LOG       },
         {"help",              no_argument,       0, 'h'                  },
         {0,                   0,                 0, 0                    },
     };
@@ -336,6 +343,13 @@ int main(int argc, char** argv)
             }
             break;
         }
+        case OPT_DAEMON_LOG:
+            cfg.daemon_log = lc_daemon_log_parse(optarg);
+            if (cfg.daemon_log == -2) {
+                fprintf(stderr, "invalid --daemon-log '%s' (debug, info, warn, error or keep)\n", optarg);
+                return 1;
+            }
+            break;
         case 'h':
             print_help(argv[0]);
             return 0;
