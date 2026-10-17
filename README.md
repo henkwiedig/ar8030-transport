@@ -529,7 +529,7 @@ The frame has to be a keyframe carrying its own VPS/SPS/PPS, in Main
 profile, ideally at the live stream's size: `still/make-still.sh` renders
 a text card that way with ffmpeg/libx265 (an all-intra x265 encode is
 marked RExt, which hardware decoders may refuse -- the script avoids it),
-and the result (`still/overheat.h265`, ~9 KB) is committed so builds
+and the result (`still/overheat.h265`, ~10 KB) is committed so builds
 don't need ffmpeg.
 
 Never run it next to waybeam: both own the ring name, and each removes

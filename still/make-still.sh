@@ -6,7 +6,7 @@
 #
 #   ./make-still.sh <out.h265> "<title>" "<subtitle>" [WxH]
 #   ./make-still.sh overheat.h265 "VTX OVERHEAT" \
-#       "video paused to cool down - arm to resume"
+#       "video paused to cool down - resumes automatically"
 #
 # Main profile on purpose: x265 marks an all-intra stream (keyint=1) as
 # RExt, which hardware decoders may refuse -- one frame with the default
