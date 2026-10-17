@@ -655,9 +655,9 @@ static int cmd_blast(int argc, char **argv)
     double elapsed = 0;
     while (elapsed < secs) {
         if (interval_us) {                          /* -i: one write per interval, like video frames */
-            uint64_t due = calls * (uint64_t)interval_us, now;
+            int64_t due = (int64_t)calls * interval_us, now;
             clock_gettime(CLOCK_MONOTONIC, &t1);
-            now = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec) / 1000u;
+            now = (int64_t)(t1.tv_sec - t0.tv_sec) * 1000000 + (t1.tv_nsec - t0.tv_nsec) / 1000;
             if (now < due)
                 usleep((useconds_t)(due - now));
         }
