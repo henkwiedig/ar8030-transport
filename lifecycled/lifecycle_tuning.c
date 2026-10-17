@@ -333,6 +333,21 @@ int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int
     return 0;
 }
 
+int lc_channel_read_link_khz(bb_dev_handle_t* handle, uint32_t* down, uint32_t* up)
+{
+    bb_get_status_in_t  in = {0xffff};
+    bb_get_status_out_t out;
+    memset(&out, 0, sizeof(out));
+
+    *down = *up = 0;
+    if (bb_ioctl(handle, BB_GET_STATUS, &in, &out) != 0) {
+        return -1;
+    }
+    *down = out.user_status[BB_USER_BR_CS].tx_status.freq_khz;
+    *up   = out.user_status[BB_USER_0].rx_status.freq_khz;
+    return 0;
+}
+
 int lc_channel_read_table(bb_dev_handle_t* handle, uint32_t* khz, int max)
 {
     bb_get_chan_info_out_t out;
@@ -361,11 +376,17 @@ int lc_channel_matches(int chan, int auto_mode, int work_chan)
     return !auto_mode && work_chan == chan;
 }
 
-int lc_channel_apply_local(bb_dev_handle_t* handle, int chan)
+int lc_channel_apply_mode(bb_dev_handle_t* handle, int chan)
 {
     bb_set_chan_mode_t cm = {.auto_mode = (uint8_t)(chan == LC_CHANNEL_AUTO)};
     int                ret = bb_ioctl(handle, BB_SET_CHAN_MODE, &cm, NULL);
     lc_log("lifecycle: tuning: BB_SET_CHAN_MODE(auto_mode=%u) ret=%d", cm.auto_mode, ret);
+    return ret;
+}
+
+int lc_channel_apply_local(bb_dev_handle_t* handle, int chan)
+{
+    int ret = lc_channel_apply_mode(handle, chan);
     if (ret != 0 || chan == LC_CHANNEL_AUTO) {
         return ret;
     }

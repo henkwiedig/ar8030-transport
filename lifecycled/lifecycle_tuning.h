@@ -100,6 +100,15 @@ int lc_channel_save(const char* cfg_path, int chan);
  * chan_num (size of the chip's channel table). Returns 0 on success. */
 int lc_channel_read(bb_dev_handle_t* handle, int* auto_mode, int* work_chan, int* chan_num);
 
+/* AP: where the link really is, from BB_GET_STATUS in kHz -- down = the
+ * downlink's (BR/CS user) transmit, up = user 0's receive (the uplink in
+ * single-user mode); 0 where unreadable. Returns 0 on success. Not what
+ * work_chan above says: work_chan is the PHY's own channel setting, a
+ * local BB_SET_CHAN(rx) retunes the AP's receivers only (the firmware's
+ * hop carries the slot-rx and BR-rx bits, not BR tx), and the downlink
+ * follows only a hop of the peer, i.e. BB_SET_REMOTE. */
+int lc_channel_read_link_khz(bb_dev_handle_t* handle, uint32_t* down, uint32_t* up);
+
 /* The chip's channel table (BB_GET_CHAN_INFO freq[], kHz): fills up to
  * max entries of khz and returns how many, or -1 on failure. */
 int lc_channel_read_table(bb_dev_handle_t* handle, uint32_t* khz, int max);
@@ -108,10 +117,15 @@ int lc_channel_read_table(bb_dev_handle_t* handle, uint32_t* khz, int max);
  * asks for -- in auto mode any working channel counts. */
 int lc_channel_matches(int chan, int auto_mode, int work_chan);
 
+/* BB_SET_CHAN_MODE only: auto for LC_CHANNEL_AUTO, else manual. */
+int lc_channel_apply_mode(bb_dev_handle_t* handle, int chan);
+
 /* Retunes this radio only: BB_SET_CHAN_MODE, plus BB_SET_CHAN(rx, index)
- * in manual mode. Meant for before a link exists, so both ends (each
- * applying its own persisted value at startup) meet on the same channel.
- * Returns 0 if every ioctl succeeded. */
+ * in manual mode. The firmware skips a BB_SET_CHAN to the channel its PHY
+ * already has (bb_phy_cfg_apply: cur_chan != value), so calling this
+ * before a link exists leaves the PHY "on" a channel the link may never
+ * reach, and later pushes of that channel do nothing locally. Returns 0
+ * if every ioctl succeeded. */
 int lc_channel_apply_local(bb_dev_handle_t* handle, int chan);
 
 /* Retunes both ends of a live link: the local change above, then

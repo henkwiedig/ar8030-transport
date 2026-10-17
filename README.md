@@ -2154,14 +2154,27 @@ design rationale):
   POST queues a change the same way `/api/v1/bandwidth` does, applied to
   both ends at once while connected (`BB_SET_CHAN_MODE` + `BB_SET_CHAN`
   + `BB_SET_REMOTE`, i.e. `linkctl channel`'s own synchronized hop), or
-  on the AP while idle to its own radio only.
+  on the AP while idle as the channel mode only (the channel follows once
+  linked, see below).
   `curl -X POST 'http://<host>:8899/api/v1/channel?chan=32'`,
   `...?chan=auto` for the chip's own channel adaptation.
   Only the AP keeps a channel: it saves it to an `ar8030.channel`
   sidecar next to `cfg_path` (`auto` or the index; without one,
   `--default-channel` applies -- default `25` (5805 MHz), or `auto`, or `none` for
-  "leave the chip's startup channel alone"), puts its own radio there at
-  startup, and pushes it once on connect if the link came up elsewhere.
+  "leave the chip's startup channel alone"), and puts the link there
+  about 3 s after each connect or relink, once the connect tuning's
+  bandwidth switch is through (`lc_channel_check_link()`). The check
+  compares the downlink's TX and the uplink's RX frequency
+  (`BB_GET_STATUS`), not only the chip's channel setting: after a cold
+  start the AP's link comes up on the channel the chip's startup scan
+  picked, a local `BB_SET_CHAN(rx)` moves only the AP's receivers and the
+  peer's uplink, and only the peer's hop (`BB_SET_REMOTE`) moves the
+  downlink. The firmware also skips a `BB_SET_CHAN` to the channel its PHY
+  already has, so lifecycled no longer sets the channel before a link
+  exists. Earlier versions did that: their link ran the downlink on the
+  scan channel (e.g. 39/40, 6.3 GHz) while the uplink was on the wanted 25.
+  When the chip already reports the wanted channel but the link is
+  elsewhere, the check re-tunes through the nearest other channel.
   The DEV never pins a channel: while idle its chip hops through the
   whole channel table looking for the AP (`ar8030d` log:
   `bb_link_node_br_idle_proc`), and that search is what finds the AP's

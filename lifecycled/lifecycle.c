@@ -97,6 +97,13 @@
 #define LC_CONNECT_CONFIRM_TICKS 3
 #define LC_DROP_CONFIRM_TICKS    6
 
+/* lc_channel_check_link(): how long after a connect / relink / push
+ * (past the connect tuning's bandwidth switch and its relink, ~1.5 s),
+ * and how many pushes per connection (a re-tune through another channel
+ * takes two). */
+#define LC_CHAN_CHECK_DELAY_S 3
+#define LC_CHAN_PUSHES        4
+
 
 struct lifecycle_ctx {
     lc_config_t cfg;
@@ -233,6 +240,11 @@ struct lifecycle_ctx {
      * made on this connection -- only then does a divergence mean the
      * peer moved the link (lc_channel_track()). */
     int chan_settled;
+    /* AP: when to compare the link's channel with ctx->channel
+     * (lc_channel_check_link()), 0 = not armed; and how many pushes it may
+     * still make on this connection. */
+    time_t chan_check_at;
+    int    chan_pushes_left;
 
     /* RF-board temperature (lc_poll_rf_temp()), guarded by status_lock
      * like the rest of what lifecycle_get_status() exposes. */
@@ -623,7 +635,9 @@ static void lc_drain_channel_request(lifecycle_ctx* ctx)
     if (ctx->state == LC_STATE_CONNECTED) {
         lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, chan);
     } else {
-        lc_channel_apply_local(ctx->client.handle, chan);
+        /* The mode only; the channel itself once linked, through
+         * lc_channel_check_link() (see lc_channel_apply_local()). */
+        lc_channel_apply_mode(ctx->client.handle, chan);
     }
 }
 
@@ -640,8 +654,9 @@ static void lc_drain_channel_request(lifecycle_ctx* ctx)
  * wherever that search left it -- an earlier version adopted those
  * readings on the DEV and saved channels nobody asked for. The AP is the
  * one whose channel the DEV searches for, so it is the only side that
- * keeps one. No re-pushing on a mismatch either: the AP pushes once per
- * connect (lc_channel_on_connect()) and otherwise leaves the link alone. */
+ * keeps one. No re-pushing on a mismatch either: the AP pushes after a
+ * connect or relink (lc_channel_check_link()) and otherwise leaves the
+ * link alone. */
 static void lc_channel_track(lifecycle_ctx* ctx)
 {
     int auto_mode, work_chan, chan_num;
@@ -673,25 +688,95 @@ static void lc_channel_track(lifecycle_ctx* ctx)
     lc_set_channel(ctx, observed);
 }
 
-/* IDLE -> CONNECTED, AP only: pushes ctx->channel once if the link came
- * up anywhere else (e.g. the pre-link lc_channel_apply_local() didn't
- * take). */
+/* IDLE -> CONNECTED: the AP's channel check (lc_channel_check_link()) runs
+ * once the connect tuning is through, not here: the connect tuning's
+ * bandwidth switch to or from 40 MHz relinks ~1.5 s later, and a channel
+ * push in the middle of that can leave the two ends apart. */
 static void lc_channel_on_connect(lifecycle_ctx* ctx)
 {
-    ctx->chan_settled = 0;
-    if (ctx->channel == LC_CHANNEL_NONE) {
+    ctx->chan_settled     = 0;
+    ctx->chan_pushes_left = LC_CHAN_PUSHES;
+    ctx->chan_check_at    = time(NULL) + LC_CHAN_CHECK_DELAY_S;
+}
+
+/* The table entry nearest in frequency to chan (other than chan), -1 if none. */
+static int lc_channel_neighbour(const lifecycle_ctx* ctx, int chan)
+{
+    int      best = -1;
+    uint32_t best_d = 0;
+    for (int i = 0; i < ctx->chan_table_n; i++) {
+        if (i == chan) {
+            continue;
+        }
+        uint32_t f = ctx->chan_table_khz[i], w = ctx->chan_table_khz[chan];
+        uint32_t d = f > w ? f - w : w - f;
+        if (best < 0 || d < best_d) {
+            best   = i;
+            best_d = d;
+        }
+    }
+    return best;
+}
+
+/* AP, after a connect or relink: puts the link on ctx->channel. The chip's
+ * channel setting (work_chan) is not enough to go by: after a cold start
+ * the downlink comes up on the channel the chip's startup scan picked, and
+ * only a peer hop (BB_SET_REMOTE) moves it, while a local BB_SET_CHAN(rx)
+ * moves the AP's receivers and the peer's uplink (bench 2026-10-17: wanted
+ * 25, link on 39 / 40, 6.325 / 6.36 GHz). So the downlink's and uplink's
+ * frequencies are compared too, and a mismatch gets the push of an HTTP
+ * channel change. If the chip already believes it is on the channel, its
+ * local half would do nothing (see lc_channel_apply_local()), so the link
+ * first moves through the nearest other channel. One push per run,
+ * re-checked LC_CHAN_CHECK_DELAY_S later, at most LC_CHAN_PUSHES per
+ * connection. */
+static void lc_channel_check_link(lifecycle_ctx* ctx)
+{
+    ctx->chan_check_at = 0;
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->channel == LC_CHANNEL_NONE) {
         return;
     }
     int auto_mode, work_chan, chan_num = 0;
-    if (lc_channel_read(ctx->client.handle, &auto_mode, &work_chan, &chan_num) == 0 &&
-        lc_channel_matches(ctx->channel, auto_mode, work_chan)) {
+    if (lc_channel_read(ctx->client.handle, &auto_mode, &work_chan, &chan_num) != 0) {
         return;
     }
     if (ctx->channel >= 0 && chan_num > 0 && ctx->channel >= chan_num) {
         lc_log("lifecycle: channel %d is outside the chip's %d-entry table, not applying", ctx->channel, chan_num);
         return;
     }
-    lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, ctx->channel);
+    int      chan_ok = lc_channel_matches(ctx->channel, auto_mode, work_chan);
+    uint32_t want = 0, down = 0, up = 0;
+    if (ctx->channel >= 0 && ctx->channel < ctx->chan_table_n) {
+        want = ctx->chan_table_khz[ctx->channel];
+        lc_channel_read_link_khz(ctx->client.handle, &down, &up);
+    }
+    int link_ok = want == 0 || ((down == 0 || down == want) && (up == 0 || up == want));
+    if (chan_ok && link_ok) {
+        return;
+    }
+    char buf[16];
+    if (ctx->chan_pushes_left <= 0) {
+        lc_log("lifecycle: link still not on channel %s (down %u, up %u kHz); giving up on this connection",
+               lc_channel_str(ctx->channel, buf, sizeof(buf)), down, up);
+        return;
+    }
+    ctx->chan_pushes_left--;
+    ctx->chan_settled = 0; /* lc_channel_track() must not adopt a channel on the way */
+    int target = ctx->channel;
+    if (chan_ok) {
+        target = lc_channel_neighbour(ctx, ctx->channel);
+        if (target < 0) {
+            return;
+        }
+        lc_log("lifecycle: link on down %u / up %u kHz, chip already set to channel %d (%u kHz) -- re-tuning "
+               "through channel %d",
+               down, up, ctx->channel, want, target);
+    } else {
+        lc_log("lifecycle: link on channel %d (down %u / up %u kHz), want %s -- pushing it to both sides", work_chan,
+               down, up, lc_channel_str(ctx->channel, buf, sizeof(buf)));
+    }
+    lc_channel_apply_linked(ctx->client.handle, ctx->connected_slot, target);
+    ctx->chan_check_at = time(NULL) + LC_CHAN_CHECK_DELAY_S;
 }
 
 static const char* lc_power_str(int level, char* buf, size_t buf_sz)
@@ -1233,15 +1318,18 @@ void* lifecycle_thread_main(void* arg)
     }
 
     /* The chip boots on whatever ar8030.json says (currently manual mode
-     * on the table's first channel). Only the AP moves itself to its
-     * persisted/default channel before any link exists -- the DEV finds
-     * it there with its own idle channel search (see lc_channel_track()),
-     * which pinning the DEV to a fixed channel would only get in the way
-     * of. ctx->channel is always LC_CHANNEL_NONE on the DEV. */
+     * on the table's first channel), and the AP's link then comes up on
+     * the channel its startup scan picks; the DEV finds it there with its
+     * own idle channel search (see lc_channel_track()). Before any link
+     * the AP sets the channel mode only: a BB_SET_CHAN(rx) now would move
+     * only its own receivers, not the downlink, and leave the PHY "on" the
+     * wanted channel so the push after connect (lc_channel_check_link())
+     * could not move the uplink any more. ctx->channel is always
+     * LC_CHANNEL_NONE on the DEV. */
     if (ctx->channel != LC_CHANNEL_NONE) {
         char buf[16];
-        lc_log("lifecycle: startup channel %s", lc_channel_str(ctx->channel, buf, sizeof(buf)));
-        lc_channel_apply_local(ctx->client.handle, ctx->channel);
+        lc_log("lifecycle: startup channel %s (applied once linked)", lc_channel_str(ctx->channel, buf, sizeof(buf)));
+        lc_channel_apply_mode(ctx->client.handle, ctx->channel);
     }
 
     /* Single-PA boards (see lc_config_t.rf_path_b_off): stock's
@@ -1400,7 +1488,11 @@ void* lifecycle_thread_main(void* arg)
                     ctx->connect_gen = gen;
                     lc_log("lifecycle: chip relinked while connected, re-applying link tuning");
                     lc_apply_link_tuning(ctx);
+                    ctx->chan_check_at = time(NULL) + LC_CHAN_CHECK_DELAY_S;
                 }
+            }
+            if (ctx->chan_check_at && now >= ctx->chan_check_at) {
+                lc_channel_check_link(ctx);
             }
             /* Re-apply (never persist) when the chip reports another TX
              * bandwidth than wanted: a fresh CONNECT can sit at a narrow
