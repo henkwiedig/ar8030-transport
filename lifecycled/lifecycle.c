@@ -40,6 +40,13 @@
  */
 
 #define LC_POLL_FALLBACK_S     5
+/* This many fallback polls failing in a row (15 s) = the session to ar8030d
+ * is gone: ar8030d closes its clients when it loses the SDIO device (the
+ * chip re-enumerating), after which every ioctl on the old handle fails and
+ * no event arrives any more. lifecycled then restarts itself
+ * (lifecycle_request_restart()). Seen 2026-10-18 on an S65 restart: the old
+ * binary died silently instead (SIGPIPE, now ignored in main.c). */
+#define LC_SESSION_LOST_POLLS  3
 /* cfg.soc_temp_cmd: how often, and how long one run may take before it is
  * killed (it runs on the lifecycle thread). */
 #define LC_SOC_TEMP_POLL_S     2
@@ -281,9 +288,22 @@ static int             g_link_state_valid = 0;
  * chip's output power. Only the event shows it; the 5 s poll misses it. */
 static unsigned        g_link_connect_gen = 0;
 
+static volatile sig_atomic_t g_restart_requested = 0;
+
 void lifecycle_request_shutdown(void)
 {
     g_shutdown_requested = 1;
+}
+
+void lifecycle_request_restart(void)
+{
+    g_restart_requested  = 1;
+    g_shutdown_requested = 1;
+}
+
+int lifecycle_restart_requested(void)
+{
+    return g_restart_requested;
 }
 
 int lifecycle_shutdown_requested(void)
@@ -1368,6 +1388,7 @@ void* lifecycle_thread_main(void* arg)
     lc_log("lifecycle: thread running (role=%d)", (int)ctx->cfg.role);
 
     time_t last_fallback_poll = 0;
+    int    poll_fails         = 0;
 
     while (!lifecycle_shutdown_requested()) {
         time_t now              = time(NULL);
@@ -1376,8 +1397,14 @@ void* lifecycle_thread_main(void* arg)
             bb_link_state_e polled;
             if (lc_poll_link_state(ctx, &polled) == 0) {
                 lc_set_link_state(polled);
+                poll_fails = 0;
             } else {
                 lc_log("lifecycle: BB_GET_STATUS fallback poll failed");
+                if (++poll_fails >= LC_SESSION_LOST_POLLS) {
+                    lc_log("lifecycle: %d status polls failed in a row, ar8030d session lost -- restarting",
+                           poll_fails);
+                    lifecycle_request_restart();
+                }
             }
             last_fallback_poll = now;
             did_fallback_poll  = 1;

@@ -37,6 +37,8 @@
 #include "../common/ar8030_batt.h"
 #include <getopt.h>
 #include <pthread.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -376,6 +378,11 @@ int main(int argc, char** argv)
 
     signal(SIGTERM, handle_sigterm);
     signal(SIGINT, handle_sigterm);
+    /* A send() on a connection ar8030d has closed (it drops its clients when
+     * it loses the SDIO device) must fail, not kill the process: the SDK
+     * client library sends without MSG_NOSIGNAL. Seen 2026-10-18, lifecycled
+     * gone mid-subscribe without a log line. */
+    signal(SIGPIPE, SIG_IGN);
 
     lifecycle_ctx* ctx = lifecycle_init(&cfg);
     if (!ctx) {
@@ -412,5 +419,16 @@ int main(int argc, char** argv)
     pthread_join(lc_thread, NULL);
     lifecycle_http_stop(http_ctx);
 
+    if (lifecycle_restart_requested()) {
+        /* Nothing open may survive into the new image (the HTTP port would
+         * stay bound): mark every inherited descriptor close-on-exec. */
+        lc_log("ar8030-lifecycled: restarting");
+        for (int fd = 3; fd < 1024; fd++) {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        execv("/proc/self/exe", argv);
+        lc_log("ar8030-lifecycled: re-exec failed: %s", strerror(errno));
+        return 1;
+    }
     return 0;
 }

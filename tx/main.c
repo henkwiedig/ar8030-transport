@@ -652,6 +652,10 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    /* ar8030d closing the connection must make bb_socket_write() fail, not kill
+     * the process (the SDK sends without MSG_NOSIGNAL): a failing tx is
+     * restarted by the S65 watchdog, a dead one is not. */
+    signal(SIGPIPE, SIG_IGN);
 
     fprintf(stderr, "tx: waiting for frame-shm ring '%s'...\n", args.ring_name);
     venc_frame_ring_t *ring = NULL;

@@ -330,6 +330,9 @@ int main(int argc, char **argv)
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    /* ar8030d closing the connection must make the SDK calls fail, not kill the
+     * process (the SDK client sends without MSG_NOSIGNAL). */
+    signal(SIGPIPE, SIG_IGN);
 
     ar8030_link_t link;
     fprintf(stderr, "rx: connecting to ar8030d at %s:%d...\n", args.daemon_ip, args.daemon_port);

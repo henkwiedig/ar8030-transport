@@ -245,6 +245,13 @@ void lifecycle_request_shutdown(void);
  * lifecycle.c. */
 int lifecycle_shutdown_requested(void);
 
+/* A shutdown after which main() re-executes the binary (same pid, same
+ * arguments): the lifecycle thread asks for it when its session to ar8030d
+ * is gone (LC_SESSION_LOST_POLLS in lifecycle.c), so the whole startup --
+ * connect, subscribe, the chip settings -- runs again. */
+void lifecycle_request_restart(void);
+int lifecycle_restart_requested(void);
+
 /*
  * BB_EVENT_LINK_STATE / BB_EVENT_PAIR_RESULT callbacks (bb_event_callback
  * signature: void(*)(void* arg, void* user)) -- implemented in lifecycle.c,

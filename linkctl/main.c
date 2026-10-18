@@ -70,6 +70,13 @@ static void usage(const char *argv0)
             "      10000 for 100 fps video); -T writes each call's CLOCK_REALTIME\n"
             "      start and end to <file>, the clock ar8030d's log uses.\n"
             "\n"
+            "  chip-cli [-w ms] <command>\n"
+            "      Type one line into the chip's own console (query-heap, task-stats,\n"
+            "      frame, ...) over ar8030d's debug channel and print what the chip\n"
+            "      answers within <ms> (default 1500) -- the UART console without\n"
+            "      the UART. ar8030d also mirrors it into daemon_log/<chip id>.log.\n"
+            "      Avoid commands that return -1: they hang the chip console.\n"
+            "\n"
             "  daemon-log [debug|info|warn|error]\n"
             "      Show or set ar8030d's global log level (print_level). At debug\n"
             "      (its default) it logs 3-4 lines per socket WRITE frame.\n"
@@ -1500,6 +1507,52 @@ static int cmd_rate(int argc, char **argv)
     return 0;
 }
 
+/* The SDK's debug-client session (com/debug_rpc.h, exported by libar8030_client but not installed): the chip's
+ * console output arrives in the callback, dbg_write types into its console input. */
+struct dbg_hdl;
+typedef void (*dbg_recv)(struct dbg_hdl *hdl, void *priv, unsigned char *buff, int len);
+void dbg_write(struct dbg_hdl *hdl, unsigned char *buff, int len);
+struct dbg_hdl *dbg_setup(struct bb_dev_handle_t *pdev, dbg_recv recv, void *priv, int timeout);
+
+static void chip_cli_recv(struct dbg_hdl *hdl, void *priv, unsigned char *buff, int len)
+{
+    (void)hdl;
+    (void)priv;
+    if (len > 0) {
+        fwrite(buff, 1, (size_t)len, stdout);
+        fflush(stdout);
+    }
+}
+
+static int cmd_chip_cli(int argc, char **argv)
+{
+    int wait_ms = 1500, opt;
+    while ((opt = getopt(argc, argv, "w:")) != -1) {
+        if (opt == 'w')
+            wait_ms = atoi(optarg);
+        else
+            return 1;
+    }
+    if (optind >= argc) {
+        fprintf(stderr, "linkctl: chip-cli needs a command\n");
+        return 1;
+    }
+    struct dbg_hdl *d = dbg_setup(g_hbb, chip_cli_recv, NULL, 2000);
+    if (!d) {
+        fprintf(stderr, "linkctl: debug channel setup failed\n");
+        return 1;
+    }
+    char line[256];
+    int n = snprintf(line, sizeof(line), "%s\r", argv[optind]);
+    if (n <= 1 || n >= (int)sizeof(line)) {
+        fprintf(stderr, "linkctl: chip-cli command too long\n");
+        return 1;
+    }
+    dbg_write(d, (unsigned char *)line, n);
+    usleep((useconds_t)wait_ms * 1000);
+    return 0;                                   /* exit closes the session */
+}
+
 static int cmd_daemon_log(int argc, char **argv)
 {
     static const char *const names[] = { "debug", "info", "warn", "error" };
@@ -1964,6 +2017,8 @@ int main(int argc, char **argv)
         rc = cmd_mcs_table_air();
     else if (!strcmp(cmd, "rate"))
         rc = cmd_rate(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "chip-cli"))
+        rc = cmd_chip_cli(argc - 1, argv + 1);
     else if (!strcmp(cmd, "daemon-log"))
         rc = cmd_daemon_log(argc - 1, argv + 1);
     else if (!strcmp(cmd, "frame-change"))
