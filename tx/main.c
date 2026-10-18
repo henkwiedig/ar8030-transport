@@ -103,6 +103,14 @@
  * notice a daemon restart promptly without adding meaningful RPC load
  * next to the actual video traffic. */
 #define DAEMON_HEALTH_CHECK_INTERVAL_S 3.0
+/* ...but BB_GET_STATUS alone misses an ar8030d restart: the SDK client
+ * reconnects the device handle by itself, so the probe passes again, while
+ * the data socket from the old session stays dead and every
+ * bb_socket_write() on it fails at once with -1 (a saturated link times out
+ * with 0 instead). Seen 2026-10-18: ~95 failed writes/s, no reconnect, and
+ * the S65 watchdog missed it too. This many frames in a row whose first
+ * write failed with an error = connection lost, same reconnect path. */
+#define SOCKET_DEAD_AFTER_FRAMES 50
 /* Confirmed live: reopening the data socket -- at startup or after a
  * reconnect -- can still fail even with
  * ar8030_link_force_close_all_sockets() called first. The single-socket
@@ -361,6 +369,7 @@ struct tx_stats {
 struct tx_send_ctx {
     ar8030_link_t *link;
     int write_timeout_ms;
+    int last_write_ret; /* write_all()'s last failing bb_socket_write() result, 0 if none */
     const volatile int *stop_flag;
     struct tx_stats *stats;
     /* Non-video chunks (tx/outq.h) ride in the same bb_socket_write() as
@@ -393,6 +402,7 @@ static int write_all(struct tx_send_ctx *sc, const uint8_t *buf, uint32_t len)
 
         int wr = bb_socket_write(sc->link->sockfd, buf + sent, len - sent, sc->write_timeout_ms);
         if (wr <= 0) {
+            sc->last_write_ret = wr;
             fprintf(stderr, "tx: bb_socket_write made no progress (len=%u, sent=%u, ret=%d)\n", len,
                     sent, wr);
             return -1;
@@ -545,6 +555,39 @@ static double now_monotonic_s(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+/* Opens the data socket: the scoped force-close, then up to
+ * SOCKET_REOPEN_MAX_ATTEMPTS tries; if none succeeds, once more after
+ * BB_FORCE_CLS_SOCKET_ALL. The chip implements only the "all" variant (its
+ * bb_ioctl has no BB_FORCE_CLS_SOCKET case -- ar8030-rtos
+ * src/api/bb_ioctl.c; ar8030d returns -2), so after an ar8030d restart the
+ * scoped close never frees the port the old session left open ("already
+ * opened"; seen 2026-10-18 in 5 of 5 restarts). "All" also closes a
+ * concurrently running audio_tx's socket, which then has to reopen its own
+ * -- still better than stopping and leaving no video until the next
+ * connect. Returns ar8030_link_open_socket()'s last result; *attempts gets
+ * the number of tries. */
+static int open_data_socket(ar8030_link_t *link, bb_slot_e slot, uint32_t port, uint32_t flags,
+                            bb_sock_opt_t *opt, const volatile int *stop_flag, int *attempts)
+{
+    int ret = -1, n = 0;
+    ar8030_link_force_close_socket(link, slot, port);
+    for (int round = 0; round < 2 && ret != 0; round++) {
+        if (round == 1) {
+            fprintf(stderr, "tx: port %u still taken after %d tries, force-closing all sockets\n", port, n);
+            ar8030_link_force_close_all_sockets(link);
+        }
+        for (int i = 0; i < SOCKET_REOPEN_MAX_ATTEMPTS && !*stop_flag; i++) {
+            n++;
+            ret = ar8030_link_open_socket(link, slot, port, flags, opt);
+            if (ret == 0)
+                break;
+            usleep(SOCKET_REOPEN_RETRY_MS * 1000);
+        }
+    }
+    *attempts = n;
+    return ret;
 }
 
 /* Scans BB_GET_STATUS for whichever slot is actually BB_LINK_STATE_CONNECT,
@@ -721,18 +764,12 @@ int main(int argc, char **argv)
      * clear a stale post-crash state on its own (see this project's earlier
      * history), so this may reintroduce that specific failure mode; the
      * retry loop below is the mitigation until/unless that's confirmed to
-     * still be a problem now that force-close is scoped. */
-    ar8030_link_force_close_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port);
-    int startup_open_ret = -1;
-    int startup_open_attempt;
-    for (startup_open_attempt = 0; startup_open_attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop;
-         startup_open_attempt++) {
-        startup_open_ret = ar8030_link_open_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port,
-                                                    sock_flags, &sock_opt);
-        if (startup_open_ret == 0)
-            break;
-        usleep(SOCKET_REOPEN_RETRY_MS * 1000);
-    }
+     * still be a problem now that force-close is scoped. Confirmed
+     * 2026-10-18 (the chip has no scoped close at all), so
+     * open_data_socket() falls back to "all" when the retries fail. */
+    int startup_open_attempts;
+    int startup_open_ret = open_data_socket(&link, (bb_slot_e)args.slot, (uint32_t)args.port, sock_flags,
+                                            &sock_opt, &g_stop, &startup_open_attempts);
     if (startup_open_ret != 0) {
         ar8030_link_close(&link);
         venc_frame_ring_destroy(ring);
@@ -884,6 +921,9 @@ int main(int argc, char **argv)
      * chunks before failing resets this: that is ordinary loss, not
      * sustained saturation. */
     int consecutive_stalls = 0;
+    /* Consecutive frames whose first write failed with an error -- see
+     * SOCKET_DEAD_AFTER_FRAMES. */
+    int consecutive_dead_writes = 0;
     double last_health_check_s = now_monotonic_s();
 
     uint16_t frame_seq = 0;
@@ -921,8 +961,14 @@ int main(int argc, char **argv)
         double now_health = now_monotonic_s();
         if (now_health - last_health_check_s >= DAEMON_HEALTH_CHECK_INTERVAL_S) {
             last_health_check_s = now_health;
-            if (!ar8030_link_is_alive(&link)) {
-                fprintf(stderr, "tx: ar8030d connection lost, reconnecting...\n");
+            int socket_dead = consecutive_dead_writes >= SOCKET_DEAD_AFTER_FRAMES;
+            if (socket_dead || !ar8030_link_is_alive(&link)) {
+                if (socket_dead)
+                    fprintf(stderr, "tx: data socket dead (%d frames failed with an error), reconnecting...\n",
+                            consecutive_dead_writes);
+                else
+                    fprintf(stderr, "tx: ar8030d connection lost, reconnecting...\n");
+                consecutive_dead_writes = 0;
                 if (ar8030_link_reconnect_retry(&link, args.daemon_ip, args.daemon_port, RETRY_MS,
                                                  &g_stop) != 0)
                     break; /* stopped while waiting for the daemon to come back */
@@ -956,21 +1002,15 @@ int main(int argc, char **argv)
                  * the retry loop below is the real, checked,
                  * fatal-on-failure step.
                  *
-                 * Scoped, not "all" -- see the startup call's own comment
-                 * above on why the broader ioctl can no longer be used
-                 * here now that audio_tx may be running concurrently on a
-                 * different port of this device. */
-                ar8030_link_force_close_socket(&link, (bb_slot_e)slot, (uint32_t)args.port);
-
-                int open_ret = -1;
+                 * Scoped first, "all" only as the fallback -- see the
+                 * startup call's own comment above on why the broader
+                 * ioctl is no longer the first choice now that audio_tx
+                 * may be running concurrently on a different port of this
+                 * device, and open_data_socket() for why it is still
+                 * needed. */
                 int attempt;
-                for (attempt = 0; attempt < SOCKET_REOPEN_MAX_ATTEMPTS && !g_stop; attempt++) {
-                    open_ret = ar8030_link_open_socket(&link, (bb_slot_e)slot, (uint32_t)args.port,
-                                                        sock_flags, &sock_opt);
-                    if (open_ret == 0)
-                        break;
-                    usleep(SOCKET_REOPEN_RETRY_MS * 1000);
-                }
+                int open_ret = open_data_socket(&link, (bb_slot_e)slot, (uint32_t)args.port, sock_flags,
+                                                &sock_opt, &g_stop, &attempt);
                 if (open_ret != 0) {
                     fprintf(stderr, "tx: failed to reopen bb_socket after reconnect (%d attempts), stopping\n",
                             attempt);
@@ -1072,6 +1112,7 @@ int main(int argc, char **argv)
         uint32_t expected_chunks = 0;
         uint64_t write_start_us = now_monotonic_us();
         stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
+        send_ctx.last_write_ret = 0;
         int sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
                                        meta.pts, frame_data, frame_len, args.chunk_payload,
                                        chunk_send_to_socket, &send_ctx, &expected_chunks, chunk_scratch,
@@ -1108,6 +1149,11 @@ int main(int argc, char **argv)
         else
             stats.frames_incomplete++;
         frame_seq++;
+
+        if (sent == 0 && send_ctx.last_write_ret < 0)
+            consecutive_dead_writes++;
+        else if (sent > 0)
+            consecutive_dead_writes = 0;
 
         if (sent == 0) {
             consecutive_stalls++;
