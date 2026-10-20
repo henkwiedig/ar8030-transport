@@ -423,28 +423,14 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
                                   (last_urgent_cut_ms == 0 ||
                                    (now - last_urgent_cut_ms) >= (uint64_t)RING_CUT_HOLDOFF_MS);
 
-                /* Centre-priority ROI (waybeam's fpv.roiEnabled) is a
-                 * last-resort measure, not a routine reaction to this
-                 * same backlog signal on its own -- see
-                 * bitrate_ctl.h's own comment on roi_max_kbps for why
-                 * it's additionally gated on already being squeezed down
-                 * near the bitrate floor. A backlog blip at a comfortable
-                 * bitrate (a keyframe-sized burst, say) skips ROI
-                 * entirely, paying none of its documented ~1.4x
-                 * bitrate-overshoot risk for nothing; only once
-                 * last_applied_kbps is already below roi_max_kbps does
-                 * standing backlog also mean "turn ROI on". Only ever
-                 * toggled via /api/v1/live/set (never persisted) at
-                 * waybeam's own shipped-default roiQp/roiSteps/roiCenter
-                 * -- this codebase sets none of those itself, and that
-                 * default is exactly what HTTP_API_CONTRACT.md documents
-                 * as calibrated safe (~1.4x overshoot) against CV610's
-                 * own default max_qp ceiling, not the 5.8-12x blowup
-                 * measured once max_qp is also lowered elsewhere --
-                 * something this codebase never does. Any residual
-                 * overshoot from turning ROI on is just more backlog,
-                 * handled by this same loop on its next tick like any
-                 * other overshoot source; no separate compensation needed. */
+                /* Focus mode (waybeam's fpv.roiEnabled) is gated on
+                 * already being squeezed below roi_max_kbps, not on this
+                 * backlog signal alone: a keyframe-sized burst at a
+                 * comfortable bitrate should not cost the edges their
+                 * detail -- see bitrate_ctl.h's own comment on
+                 * roi_max_kbps. Only ever toggled via /api/v1/live/set
+                 * (never persisted) at waybeam's own shipped-default
+                 * roiQp/roiSteps/roiCenter. */
                 if (roi_enabled && (now - roi_enabled_ms) >= (uint64_t)ROI_BACKLOG_ABORT_MS) {
                     int st = http_get_status(cfg->waybeam_host, cfg->waybeam_port,
                                              "/api/v1/live/set?fpv.roiEnabled=false", 1000);
@@ -762,7 +748,9 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
  *         asymmetric gains (back off fast, creep up slowly), no D term;
  *   disturbance feedforward: severe LDPC / RETX bursts clamp the
  *         integrator at once, milder ones trim it; ring backlog stays as
- *         a hard backstop.
+ *         a hard backstop;
+ *   focus mode -- waybeam's fpv.roiEnabled below roi_max_kbps, see
+ *         pi_focus().
  * Anti-windup: the integrator doesn't climb while the rate is held by
  * the ceiling or the slew limit, and doesn't sink while at waybeam's
  * floor.
@@ -774,6 +762,43 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
 #define PI_STALE_MS           150  /* no frame finished this long: D grows with it */
 #define PI_MIN_UP_STEP        0.05 /* send increases of at least 5% ... */
 #define PI_MIN_DOWN_STEP      0.03 /* ... and decreases of at least 3% */
+#define PI_FOCUS_RETRY_MS     1000 /* a refused fpv.roiEnabled is retried this often */
+
+/* Focus mode in PI mode (see bitrate_ctl.h on roi_max_kbps): on as soon as
+ * the applied rate is below roi_max_kbps, off only once it has stayed at or
+ * above it for roi_recovery_ms. Off is therefore only ever switched at a
+ * comfortable rate: at 250 kbps switching ROI off made the encoder overshoot
+ * 2-3x for seconds while CBR re-settled, from 1000 kbps up it went straight
+ * back to target (bench 2026-10-20). *focus is -1 while waybeam's state is
+ * unknown (start, waybeam restarted); the wanted state is then sent at once. */
+static void pi_focus(const bitrate_ctl_cfg_t *cfg, uint32_t applied_kbps, uint64_t now, int *focus,
+                     uint64_t *above_since_ms, uint64_t *last_try_ms)
+{
+    int want;
+
+    if (!cfg->roi_max_kbps || !applied_kbps)
+        return;
+    if (applied_kbps < cfg->roi_max_kbps) {
+        *above_since_ms = 0;
+        want = 1;
+    } else {
+        if (!*above_since_ms)
+            *above_since_ms = now;
+        want = *focus == 1 && now - *above_since_ms < (uint64_t)cfg->roi_recovery_ms;
+    }
+    if (want == *focus || now - *last_try_ms < PI_FOCUS_RETRY_MS)
+        return;
+    *last_try_ms = now;
+
+    const char *path = want ? "/api/v1/live/set?fpv.roiEnabled=true" : "/api/v1/live/set?fpv.roiEnabled=false";
+    int status = http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+    if (status < 200 || status >= 300) {
+        fprintf(stderr, "bitrate_ctl: pi waybeam %s returned status=%d\n", path, status);
+        return;
+    }
+    fprintf(stderr, "bitrate_ctl: pi focus %s at %u kbps\n", want ? "on" : "off", applied_kbps);
+    *focus = want;
+}
 
 static int run_pi(const bitrate_ctl_cfg_t *cfg)
 {
@@ -790,12 +815,24 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
     unsigned retx_event_pos = 0;
     sig_atomic_t retx_counted = 0, retx_seen = 0;
     uint64_t last_tick_ms = now_ms();
+    uint32_t ring_gen = __atomic_load_n(&cfg->ring_generation, __ATOMIC_ACQUIRE);
+    int focus = -1;                  /* waybeam's fpv.roiEnabled as last set, -1 = unknown */
+    uint64_t focus_above_since_ms = 0, focus_try_ms = 0;
 
     while (!*cfg->stop_flag) {
         usleep(PI_TICK_MS * 1000);
         uint64_t now = now_ms();
         double dt = (double)(now - last_tick_ms) / 1000.0;
         last_tick_ms = now;
+
+        /* waybeam restarted: it is back at its configured bitrate and
+         * fpv.roiEnabled, so forget what was applied and send both again. */
+        uint32_t gen = __atomic_load_n(&cfg->ring_generation, __ATOMIC_ACQUIRE);
+        if (gen != ring_gen) {
+            ring_gen = gen;
+            applied_kbps = 0;
+            focus = -1;
+        }
 
         /* Measured delay; if nothing finished for a while, the frame in
          * flight is at least that old. */
@@ -873,6 +910,8 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
             last_backlog_ms = now;
             why = "backlog";
         }
+
+        pi_focus(cfg, applied_kbps, now, &focus, &focus_above_since_ms, &focus_try_ms);
 
         /* PI on the delay. */
         double e = cfg->pi_delay_set_ms - d_ms;

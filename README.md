@@ -293,31 +293,34 @@ limited to once per 250ms rather than the normal path's 1500ms. Logged
 with an `URGENT` tag in stderr / `-v` output to distinguish it from an
 ordinary MCS-driven change.
 
-**Last-resort measure: centre-priority ROI.** waybeam supports
+**Focus mode: centre-priority ROI below `-F` kbps.** waybeam supports
 centre-priority horizontal delta-QP bands (`fpv.roiEnabled`/`roiQp`/
-`roiSteps`/`roiCenter` — concentrates bits on the middle of frame, where a
-pilot is actually looking, at the expense of the edges). `bitrate_ctl.c`
-engages it (`fpv.roiEnabled=true`, via `/api/v1/live/set`, at waybeam's
-own shipped-default `roiQp`/`roiSteps`/`roiCenter` — this project sets
-none of those itself) only when *both* the standing-backlog signal above
-*and* `last_applied_kbps < roi_max_kbps` (default 3000, i.e. below
-~3Mbit/s) are true — deliberately not on every backlog blip, since
-`HTTP_API_CONTRACT.md` documents a real bitrate-overshoot risk from
-turning ROI on (`roi_qp`'s delta is subtracted from frame QP, so CBR pays
-for it by raising the base QP roughly 1:1, and once `base_qp +
-|roi_qp|` passes the encoder's QP ceiling the rate controller saturates
-and the target is missed by multiples — measured on this same CV610
-backend at ~1.4x at the default `max_qp` ceiling this project leaves
-untouched, but 5.8x-12x once `max_qp` is *also* lowered elsewhere, which
-this codebase never does). A keyframe-sized burst at an otherwise-healthy
-bitrate skips ROI entirely and pays none of that risk; it only engages
-once the link has already forced bitrate down near the floor. Disengages
-(`fpv.roiEnabled=false`) once backlog has been clear *and*
-`last_applied_kbps` has recovered back above `roi_max_kbps` for
-`roi_recovery_ms` (default 5000) — hysteresis against flapping right at
-the boundary. Any residual overshoot from turning ROI on is just more
-backlog, handled by this same loop on its next tick like any other
-overshoot source; no separate bitrate compensation is attempted.
+`roiSteps`/`roiCenter` — the middle of the frame, where a pilot looks, keeps
+more detail at the expense of the edges). With `-F <kbps>` (default 0 = off,
+the Ascent runs `-F 3000`) `bitrate_ctl.c` switches it via
+`/api/v1/live/set`, at waybeam's own shipped-default
+`roiQp`/`roiSteps`/`roiCenter` — this project sets none of those itself:
+
+- **PI mode** (`pi_focus()`): on as soon as the applied rate drops below
+  `-F`, off once the rate has stayed at or above it for `roi_recovery_ms`
+  (5 s). Off is only ever switched at a comfortable rate on purpose: at
+  250 kbps, switching ROI off made the encoder overshoot 2-3x for seconds
+  while CBR re-settled; from 1000 kbps up it went straight back to target
+  (bench 2026-10-20). After a waybeam restart (which comes back with ROI
+  off and its configured bitrate) both are sent again.
+- **Rules mode**: on only while a standing ring backlog (above) is seen
+  below `-F`; off once backlog has been clear and the rate back above `-F`
+  for 5 s. A ROI that still has the ring backlogged 2 s after switching it
+  on is switched off for the rest of the run.
+
+**Needs waybeam 0.84.2 or later.** Before that a negative `roiQp` was a
+discount on the centre, CBR raised the frame QP to pay for it and pinned at
+QP 51, and the target was missed by multiples (bench 2026-10-02: ~23 Mbit/s
+at a 1058 kbps target, ring jammed; 2026-10-20: 25x). 0.84.2 programs the
+edges coarser instead, and held 98-100% of target from 1000 to 20000 kbps
+with the frame QP 1.3-3 lower (= more detail in the centre). In replays of
+the 2026-10-02/03 flights (`tools/bc_replay`, `roi_max_kbps=3000`) PI mode
+switched focus 19-41 times per flight, on in every fade, at 1.0-2.8 Mbit/s.
 
 **Third signal: LDPC block-error ratio.** MCS and ring backlog above are
 both blind to a real failure mode an external firmware
@@ -530,6 +533,12 @@ pointer. Confirmed clean across two consecutive real `waybeam restart`
 calls afterward: no crash, brief ring-fill spike immediately
 absorbed by the existing backlog throttle, streaming back to the
 pre-restart bitrate within a few seconds each time.
+
+A restarted waybeam is back at its configured `video0.bitrate` and
+`fpv.roiEnabled`, and the PI controller only sends a rate when it changes,
+so it could keep a restarted waybeam at its boot bitrate for a while. The
+read loop bumps `ring_generation` after each reattach; PI mode then sends
+its current rate and focus state again.
 
 ### `ar8030-still`: a stored picture while waybeam is stopped
 

@@ -15,7 +15,8 @@
  *  - encoder: 100 fps, output rate follows the set rate with a 300 ms
  *    first-order lag, a keyframe every 100 frames (gopSize 1.0 s) at 4x
  *    the average frame, the other frames scaled so the mean stays at the
- *    rate; waybeam refuses rates below 1000 kbps (409);
+ *    rate; waybeam refuses rates below its floor (409, wb_floor=, default
+ *    1000);
  *  - encode latency 12 ms (healthy "pts age" on the bench);
  *  - frame-shm ring of 8 slots between encoder and transmitter, a frame
  *    arriving at a full ring is dropped (waybeam full_drops);
@@ -93,7 +94,7 @@ int clock_gettime(clockid_t id, struct timespec *ts)
 #define ENC_LAG_S    0.3
 #define ENC_LAT_MS   20.0
 #define RING_SLOTS   8
-#define WB_FLOOR     1000
+static int wb_floor = 1000; /* waybeam's floor (300 on CV610 from 0.84.3), override wb_floor= */
 /* calibrated against the recorded flights, overridable via env for that */
 static double IDR_FACTOR = 4.0;
 static double DRAIN_EFF = 0.72; /* calibrated: rules replay vs recorded 03.10 flights */
@@ -387,7 +388,7 @@ int http_get_status(const char *host, int port, const char *path, int timeout_ms
     if (!b)
         return 200;
     unsigned v = (unsigned)atoi(b + 8);
-    if (v < WB_FLOOR)
+    if (v < (unsigned)wb_floor)
         return 409;
     set_kbps = v;
     return 200;
@@ -457,7 +458,9 @@ static void apply_override(const char *kv)
     D(pi_delay_set_ms); D(pi_kp_up); D(pi_kp_down); D(pi_ki_up); D(pi_ki_down); D(pi_k_min); D(pi_k_max);
     D(pi_slew_up); D(pi_severe_k); D(pi_mild_trim); D(margin); D(ramp_step); D(severe_backoff);
     D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events); I(pi_retx_severe_events); D(pi_recover_per_s);
-    I(max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
+    I(max_kbps); I(min_kbps); I(roi_max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
+    else if (!strcmp(key, "wb_floor"))
+        wb_floor = (int)v;
     else {
         fprintf(stderr, "unknown key %s\n", key);
         exit(1);

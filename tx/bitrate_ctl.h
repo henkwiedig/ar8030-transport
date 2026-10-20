@@ -76,21 +76,18 @@ typedef struct {
                                         * backlogged, e.g. 0.85 -- applied instead
                                         * of (never above) the MCS-derived target */
 
-    /* Centre-priority ROI (waybeam's fpv.roiEnabled) is a last-resort
-     * measure, not a response to every backlog blip -- intended for when
-     * the link itself has already forced bitrate down near the floor and
-     * we need to squeeze what little there is toward the part of frame a
-     * pilot is actually looking at, not a routine reaction to a
-     * keyframe-sized burst at an otherwise-comfortable bitrate (which
-     * would just pay ROI's own ~1.4x overshoot risk for nothing -- see
-     * bitrate_ctl.c's own comment at the call site). Gated on *both*
-     * signals: engages only when a standing ring backlog (the same
-     * condition that drives ring_backoff above) is observed while
-     * last_applied_kbps is already below roi_max_kbps, e.g. 3000 (this
-     * project's own "below 2-4Mbit/s" call); disengages once backlog has
-     * been clear *and* last_applied_kbps has recovered back above
-     * roi_max_kbps for roi_recovery_ms, e.g. 5000 -- hysteresis against
-     * flapping on/off right at the boundary. */
+    /* Focus mode: centre-priority ROI (waybeam's fpv.roiEnabled) once the
+     * link has forced the bitrate below roi_max_kbps, e.g. 3000 -- the
+     * centre of the frame, where a pilot looks, keeps more detail at the
+     * expense of the edges. 0 = never touch fpv.roiEnabled. Needs waybeam
+     * 0.84.2 or later: earlier versions overran the bitrate target by
+     * multiples with ROI on.
+     *
+     * PI mode: on as soon as the applied rate is below roi_max_kbps, off
+     * once it has stayed at or above it for roi_recovery_ms, e.g. 5000.
+     * Rules mode: on only while a standing ring backlog is observed below
+     * roi_max_kbps; off once backlog has been clear and the rate back
+     * above it for roi_recovery_ms. */
     uint32_t roi_max_kbps;
     int roi_recovery_ms;
 
@@ -168,8 +165,8 @@ typedef struct {
     /* BITRATE_CTL_MODE_RULES (default) or BITRATE_CTL_MODE_PI, see
      * bitrate_ctl.c. The PI mode uses margin, min/max_kbps,
      * poll_interval_ms, ring/ring_backlog_high_slots/ring_backoff,
-     * ldpc_ratio_high, ldpc_severe_ratio and the
-     * pi_* fields below; the ramp/settle/unstable/backoff factors are
+     * ldpc_ratio_high, ldpc_severe_ratio, roi_max_kbps/roi_recovery_ms and
+     * the pi_* fields below; the ramp/settle/unstable/backoff factors are
      * rules-mode only. */
     int mode;
 
@@ -180,6 +177,11 @@ typedef struct {
      * PI mode only. */
     uint32_t delay_us;
     uint64_t last_tx_done_ms;
+
+    /* Bumped by tx/main.c (__atomic) each time it reattaches to the ring
+     * of a restarted waybeam. waybeam comes back with its configured
+     * bitrate and fpv.roiEnabled, so PI mode sends both again. */
+    uint32_t ring_generation;
 
     double pi_delay_set_ms;  /* queueing-delay setpoint, e.g. 10 */
     double pi_kp_up, pi_kp_down; /* proportional gain per ms of error */

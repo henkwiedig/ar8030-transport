@@ -147,6 +147,7 @@ struct tx_args {
     double margin;
     uint32_t min_kbps;
     uint32_t max_kbps;
+    uint32_t focus_kbps; /* -F, bitrate_ctl_cfg_t.roi_max_kbps */
     /* Socket experiment knobs (stock's video socket is opened RX|TX with
      * options {5, 0x800} on port 3 -- see README/docs; these let that be
      * tried without a rebuild). Defaults keep the previous behaviour. */
@@ -179,6 +180,9 @@ static void usage(const char *argv0)
             "  -m <fraction>  bitrate margin applied to link throughput (default 0.545)\n"
             "  -n <kbps>      minimum bitrate floor (default 512)\n"
             "  -x <kbps>      maximum bitrate ceiling (default 35000)\n"
+            "  -F <kbps>      focus mode: switch waybeam's centre-priority ROI (fpv.roiEnabled) on\n"
+            "                 below this bitrate, off again above it; needs waybeam 0.84.2+\n"
+            "                 (default 0 = never touch fpv.roiEnabled)\n"
             "  -Q <slots>     ring backlog that triggers an URGENT bitrate cut (default 6; the\n"
             "                 ring has 8 slots, one frame each -- higher reacts later, tolerates bursts)\n"
             "  -K <fraction>  bitrate multiplier applied per URGENT cut (default 0.92)\n"
@@ -239,6 +243,7 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->margin = 0.545; /* 20 Mbit/s of the 36.7 Mbit/s frame-changed link: the real drain rate is ~21.5, stock holds 21.3 */
     a->min_kbps = 512;
     a->max_kbps = 35000;
+    a->focus_kbps = 0;
     a->verbose = 0;
     a->sock_tx_buf = 64 * 1024;
     a->sock_rx_buf = 1024;
@@ -251,7 +256,7 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->n_pi_params = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
@@ -291,6 +296,9 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'x':
             a->max_kbps = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'F':
+            a->focus_kbps = (uint32_t)strtoul(optarg, NULL, 10);
             break;
         case 'B':
             a->sock_tx_buf = (uint32_t)strtoul(optarg, NULL, 0);
@@ -747,8 +755,8 @@ int main(int argc, char **argv)
     const uint32_t sock_flags = args.sock_bidir ? (BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX) : BB_SOCK_FLAG_TX;
     fprintf(stderr, "tx: socket flags=0x%x tx_buf=%u rx_buf=%u write_timeout=%dms port=%d\n", sock_flags,
             sock_opt.tx_buf_size, sock_opt.rx_buf_size, args.write_timeout_ms, args.port);
-    fprintf(stderr, "tx: bitrate control margin=%.3f min=%u max=%u kbps backlog_slots=%u backoff=%.2f\n", args.margin,
-            args.min_kbps, args.max_kbps, args.ring_backlog_slots, args.ring_backoff);
+    fprintf(stderr, "tx: bitrate control margin=%.3f min=%u max=%u focus=%u kbps backlog_slots=%u backoff=%.2f\n",
+            args.margin, args.min_kbps, args.max_kbps, args.focus_kbps, args.ring_backlog_slots, args.ring_backoff);
     /* Same force-close + retry as the reconnect path below (see its own,
      * longer comment) -- confirmed live that this exact failure isn't
      * specific to reconnecting: it also hit a genuinely fresh startup
@@ -800,11 +808,10 @@ int main(int argc, char **argv)
     bc_cfg.unstable_ramp_step = 0.10; /* ... only +10% per increase, no recovery jump */
     bc_cfg.probe_ceiling_frac = 0.95; /* after a backlog cut, stay <95% of the offending rate ... */
     bc_cfg.probe_hold_ms = 15000;     /* ... for 15s, then probe above it again */
-    bc_cfg.roi_max_kbps = 0;       /* ROI off: at the bitrate floor it made the encoder overshoot
-                                     * ~22x (1058 kbps set, ~23 Mbit/s out, bench 2026-10-02) and
-                                     * jam the ring. Was 3000 (last-resort measure below ~3 Mbit/s). */
-    bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of clear backlog + recovered bitrate before
-                                     * switching it back off */
+    bc_cfg.roi_max_kbps = args.focus_kbps; /* -F; waybeam before 0.84.2 overshot ~22x with ROI on
+                                             * at the floor (bench 2026-10-02), so it was 0 */
+    bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of recovered bitrate (rules: and clear
+                                     * backlog) before switching it back off */
     /* LDPC off (0): BB_GET_USER_QUALITY on the air reports the air's own
      * receive side -- the uplink. Bench walk 2026-10-03 14:25-14:27: every
      * LDPC-only clamp (62-100%) coincided with uplink LDPC errors
@@ -1090,6 +1097,7 @@ int main(int argc, char **argv)
                  * atomically rather than a plain store, matching how it
                  * loads it (see bitrate_ctl.c's own comment). */
                 __atomic_store_n(&bc_cfg.ring, ring, __ATOMIC_RELEASE);
+                __atomic_add_fetch(&bc_cfg.ring_generation, 1, __ATOMIC_RELEASE);
             }
             continue; /* timeout (or just reattached), loop back and re-check g_stop */
         }
