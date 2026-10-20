@@ -91,6 +91,21 @@ typedef struct {
     uint32_t roi_max_kbps;
     int roi_recovery_ms;
 
+    /* Frame-rate stages below the bitrate floor (waybeam's
+     * video0.fpsDivisor, CV610, waybeam 0.85.0 or later). waybeam's floor
+     * is per frame -- encoding every Nth frame it is floor / N -- so once
+     * the PI wants less than the floor, the encoder takes every 2nd frame
+     * and the floor halves, down to every fps_div_max-th frame: 1 (off), 2
+     * or 4. A frame keeps the size it had at the floor, so the only cost
+     * is the longer frame interval, paid only where the link cannot carry
+     * the full frame rate's floor -- where the queue would otherwise grow
+     * and frames be dropped. A stage up once the PI has wanted at least
+     * 1.25 x that stage's floor for fps_recovery_ms. k's lower bound
+     * becomes pi_k_min / fps_div_max, so the PI can ask for those rates.
+     * PI mode only. */
+    int fps_div_max;
+    int fps_recovery_ms;
+
     /* Stepwise ramp-up: any increase toward the MCS-derived target is
      * capped at last_applied * (1 + ramp_step) per apply, instead of
      * jumping straight there (which overshot, backlogged, and got cut
@@ -165,9 +180,9 @@ typedef struct {
     /* BITRATE_CTL_MODE_RULES (default) or BITRATE_CTL_MODE_PI, see
      * bitrate_ctl.c. The PI mode uses margin, min/max_kbps,
      * poll_interval_ms, ring/ring_backlog_high_slots/ring_backoff,
-     * ldpc_ratio_high, ldpc_severe_ratio, roi_max_kbps/roi_recovery_ms and
-     * the pi_* fields below; the ramp/settle/unstable/backoff factors are
-     * rules-mode only. */
+     * ldpc_ratio_high, ldpc_severe_ratio, roi_max_kbps/roi_recovery_ms,
+     * fps_div_max/fps_recovery_ms and the pi_* fields below; the
+     * ramp/settle/unstable/backoff factors are rules-mode only. */
     int mode;
 
     /* Link-side queueing delay, written by tx/main.c's send loop
@@ -180,7 +195,8 @@ typedef struct {
 
     /* Bumped by tx/main.c (__atomic) each time it reattaches to the ring
      * of a restarted waybeam. waybeam comes back with its configured
-     * bitrate and fpv.roiEnabled, so PI mode sends both again. */
+     * bitrate and fpv.roiEnabled and at the full frame rate, so PI mode
+     * sends all three again. */
     uint32_t ring_generation;
 
     double pi_delay_set_ms;  /* queueing-delay setpoint, e.g. 10 */

@@ -322,6 +322,37 @@ with the frame QP 1.3-3 lower (= more detail in the centre). In replays of
 the 2026-10-02/03 flights (`tools/bc_replay`, `roi_max_kbps=3000`) PI mode
 switched focus 19-41 times per flight, on in every fade, at 1.0-2.8 Mbit/s.
 
+**Fewer frames below the floor: `-D <1|2|4>`.** waybeam's bitrate floor
+(300 kbps on CV610) is per frame: encoding every Nth frame
+(`video0.fpsDivisor`, waybeam 0.85.0+) it is 300 / N. With `-D 2` or `-D 4`
+(default 1 = off; PI mode only) the PI controller goes below the floor that
+way instead of overrunning the link: as soon as it wants less than the floor
+in force, waybeam encodes every 2nd frame (then every 4th) and the bitrate
+is sent with it in one request -- 150 kbps at 50 fps is the same frame size
+as 300 at 100. A stage up once the PI has wanted 1.25x that stage's floor
+for 1 s (`fps_recovery_ms`). The sensor keeps running at 100 fps and frames
+keep their size, so the only cost is the frame interval (on average 5 ms
+older at 50 fps, 15 ms at 25), paid only where the link can't carry the
+full rate's floor.
+
+k's lower bound becomes `pi_k_min / -D`: at the lowest MCS (2286 kbps in
+every recorded flight) k = 0.2 alone stops the PI at ~250 kbps, above the
+stages' floors.
+
+Bench, OS02K10 1080p100, static scene (2026-10-20): the colortrans bin holds
+~237 kbps at 50 fps (P-frame QP ~40) and ~120 at 25 fps (QP 38-42); the day
+bin, which can't go below ~500 kbps / QP 51 at 100 fps, delivers ~250 at
+50 fps and 120-155 at 25 fps. Capture -> encode stays ~12 ms. Replays of the
+2026-10-02/03 flights (`tools/bc_replay`, `fps_div_max=`, an encoder floor of
+500 kbps at 100 fps): dropped frames over the 10 flights 651 (`-D 1`) -> 415
+(`-D 2`) -> 280 (`-D 4`), p99 delay down in most flights (e.g. 286 -> 207,
+186 -> 140 ms), median unchanged; each stage active 0-4.5% of a flight.
+
+At start tx resets waybeam to every frame at the floor (a previous tx may
+have left a divisor and a rate only valid with it); a restarted waybeam
+comes back at every frame and gets its stage again; a waybeam without the
+field (before 0.85.0, or not CV610) is noticed once and left alone.
+
 **Third signal: LDPC block-error ratio.** MCS and ring backlog above are
 both blind to a real failure mode an external firmware
 reverse-engineering analysis (static analysis of the AR8030 baseband
@@ -535,10 +566,11 @@ absorbed by the existing backlog throttle, streaming back to the
 pre-restart bitrate within a few seconds each time.
 
 A restarted waybeam is back at its configured `video0.bitrate` and
-`fpv.roiEnabled`, and the PI controller only sends a rate when it changes,
-so it could keep a restarted waybeam at its boot bitrate for a while. The
-read loop bumps `ring_generation` after each reattach; PI mode then sends
-its current rate and focus state again.
+`fpv.roiEnabled` and at the full frame rate, and the PI controller only
+sends a rate when it changes, so it could keep a restarted waybeam at its
+boot bitrate for a while. The read loop bumps `ring_generation` after each
+reattach; PI mode then sends its current rate, focus state and frame-rate
+divisor again.
 
 ### `ar8030-still`: a stored picture while waybeam is stopped
 

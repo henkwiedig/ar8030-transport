@@ -16,7 +16,12 @@
  *    first-order lag, a keyframe every 100 frames (gopSize 1.0 s) at 4x
  *    the average frame, the other frames scaled so the mean stays at the
  *    rate; waybeam refuses rates below its floor (409, wb_floor=, default
- *    1000);
+ *    1000; divided by video0.fpsDivisor, as waybeam's is); optionally an
+ *    encoder floor (enc_floor=, kbps, default 0 = none): the rate at QP 51,
+ *    which it delivers whatever it is asked for below that -- ~500 on the
+ *    bench with the default bins, more in motion; video0.fpsDivisor=N
+ *    (tx -D) encodes every Nth frame, N times as far apart, and divides the
+ *    encoder floor by N;
  *  - encode latency 12 ms (healthy "pts age" on the bench);
  *  - frame-shm ring of 8 slots between encoder and transmitter, a frame
  *    arriving at a full ring is dropped (waybeam full_drops);
@@ -95,6 +100,10 @@ int clock_gettime(clockid_t id, struct timespec *ts)
 #define ENC_LAT_MS   20.0
 #define RING_SLOTS   8
 static int wb_floor = 1000; /* waybeam's floor (300 on CV610 from 0.84.3), override wb_floor= */
+static int enc_floor = 0;   /* encoder's own floor at the full frame rate, override enc_floor= */
+static int fps_div = 1;     /* video0.fpsDivisor as last set */
+static unsigned n_fps_switch;
+static double n_div_ms[5];  /* connected ms at each divisor */
 /* calibrated against the recorded flights, overridable via env for that */
 static double IDR_FACTOR = 4.0;
 static double DRAIN_EFF = 0.72; /* calibrated: rules replay vs recorded 03.10 flights */
@@ -196,10 +205,15 @@ static void plant_step_1ms(void)
     last_cap = cap;
 
     /* encoder */
-    enc_kbps += (set_kbps - enc_kbps) * (0.001 / ENC_LAG_S);
+    double out_kbps = set_kbps;
+    if (out_kbps < (double)enc_floor / fps_div)
+        out_kbps = (double)enc_floor / fps_div;
+    enc_kbps += (out_kbps - enc_kbps) * (0.001 / ENC_LAG_S);
+    if (s->conn)
+        n_div_ms[fps_div]++;
     if (vt_us >= next_frame_us) {
-        next_frame_us += 1e6 / FPS;
-        double avg = enc_kbps * 1000.0 / FPS;
+        next_frame_us += 1e6 * fps_div / FPS;
+        double avg = enc_kbps * 1000.0 * fps_div / FPS;
         double bits = (frame_no % GOP == 0) ? avg * IDR_FACTOR : avg * (GOP - IDR_FACTOR) / (GOP - 1);
         frame_no++;
         if (s->conn) {
@@ -277,8 +291,8 @@ static void plant_step_1ms(void)
         if (cur_left <= 0) {
             inflight = 0;
             chip_q[(chip_head + chip_n - 1) % CHIP_FRAMES].written = 1;
-            /* what tx/main.c publishes: frames behind x 10 ms + write time */
-            double q_us = cur_behind * (1e6 / FPS) + (double)(vt_us - cur_take_us) + 2000; /* + RPC overhead */
+            /* what tx/main.c publishes: frames behind x frame interval + write time */
+            double q_us = cur_behind * (1e6 * fps_div / FPS) + (double)(vt_us - cur_take_us) + 2000; /* + RPC overhead */
             delay_ewma_us += (q_us - delay_ewma_us) / 8.0;
             __atomic_store_n(&cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
             __atomic_store_n(&cfg.last_tx_done_ms, vt_us / 1000, __ATOMIC_RELEASE);
@@ -384,13 +398,23 @@ int http_get_status(const char *host, int port, const char *path, int timeout_ms
     (void)host;
     (void)port;
     (void)timeout_ms;
+    /* one request is accepted or refused as a whole, like waybeam's */
+    int div = fps_div;
+    const char *d = strstr(path, "fpsDivisor=");
+    if (d) {
+        div = atoi(d + 11);
+        if (div != 1 && div != 2 && div != 4)
+            return 409;
+    }
     const char *b = strstr(path, "bitrate=");
-    if (!b)
-        return 200;
-    unsigned v = (unsigned)atoi(b + 8);
-    if (v < (unsigned)wb_floor)
+    unsigned v = b ? (unsigned)atoi(b + 8) : (unsigned)set_kbps;
+    if (v < (unsigned)wb_floor / (unsigned)div)
         return 409;
-    set_kbps = v;
+    if (div != fps_div)
+        n_fps_switch++;
+    fps_div = div;
+    if (b)
+        set_kbps = v;
     return 200;
 }
 
@@ -421,6 +445,8 @@ static void defaults(int mode)
     cfg.probe_hold_ms = 15000;
     cfg.roi_max_kbps = 0;
     cfg.roi_recovery_ms = 5000;
+    cfg.fps_div_max = 1;
+    cfg.fps_recovery_ms = 1000;
     cfg.ldpc_ratio_high = 0; /* = tx/main.c: off, the air reads its uplink */
     cfg.ldpc_backoff = 0.85;
     cfg.ldpc_severe_ratio = 0;
@@ -459,8 +485,11 @@ static void apply_override(const char *kv)
     D(pi_slew_up); D(pi_severe_k); D(pi_mild_trim); D(margin); D(ramp_step); D(severe_backoff);
     D(ldpc_ratio_high); D(ldpc_severe_ratio); I(retx_severe_events); I(pi_retx_severe_events); D(pi_recover_per_s);
     I(max_kbps); I(min_kbps); I(roi_max_kbps); I(unstable_window_ms); I(ramp_settle_ms);
+    I(fps_div_max); I(fps_recovery_ms);
     else if (!strcmp(key, "wb_floor"))
         wb_floor = (int)v;
+    else if (!strcmp(key, "enc_floor"))
+        enc_floor = (int)v;
     else {
         fprintf(stderr, "unknown key %s\n", key);
         exit(1);
@@ -522,5 +551,8 @@ int main(int argc, char **argv)
            n_delays ? 100.0 * n_late50 / n_delays : 0, n_delays ? 100.0 * n_late100 / n_delays : 0,
            n_set ? sum_set / n_set : 0, n_set_good ? sum_set_good / n_set_good : 0,
            n_set ? sum_sent / (n_set / 1000.0) / 1e6 : 0);
+    if (cfg.fps_div_max > 1)
+        printf("%-6s frame rate 1/2 %.1f%% 1/4 %.1f%% of the time, %u switches\n", argv[2],
+               n_set ? 100.0 * n_div_ms[2] / n_set : 0, n_set ? 100.0 * n_div_ms[4] / n_set : 0, n_fps_switch);
     return 0;
 }

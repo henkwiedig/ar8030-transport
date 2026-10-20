@@ -261,8 +261,10 @@ static uint32_t learn_floor(uint32_t floor_kbps, int status, uint32_t rejected_k
  * 409 the floor is learned and the request retried halfway between the
  * refused value and current_kbps, a few times: bisects onto waybeam's
  * real floor instead of leaving the bitrate where it was. On success
- * *kbps holds what was actually applied. Returns the last HTTP status. */
-static int apply_cut(const bitrate_ctl_cfg_t *cfg, uint32_t *kbps, uint32_t current_kbps, uint32_t *floor_kbps)
+ * *kbps holds what was actually applied. div is waybeam's
+ * video0.fpsDivisor (1 = every frame). Returns the last HTTP status. */
+static int apply_cut(const bitrate_ctl_cfg_t *cfg, uint32_t *kbps, uint32_t current_kbps, uint32_t *floor_kbps,
+                     int div)
 {
     int status = 0;
     for (int attempt = 0; attempt < 5; attempt++) {
@@ -272,7 +274,8 @@ static int apply_cut(const bitrate_ctl_cfg_t *cfg, uint32_t *kbps, uint32_t curr
         if (status != 409)
             return status;
         uint32_t floor_before = *floor_kbps;
-        *floor_kbps = learn_floor(*floor_kbps, status, *kbps);
+        /* *floor_kbps is the full frame rate's; waybeam's is that / div */
+        *floor_kbps = learn_floor(*floor_kbps, status, *kbps * (uint32_t)div);
         if (*floor_kbps != floor_before)
             fprintf(stderr, "bitrate_ctl: waybeam refused %u kbps (409) -> floor >= %u kbps\n", *kbps,
                     *floor_kbps);
@@ -537,7 +540,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
                 uint32_t ldpc_target = clamp_u32((uint32_t)((double)last_applied_kbps * factor),
                                                   floor_kbps, cfg->max_kbps);
                 if (ldpc_target < last_applied_kbps) {
-                    int status = apply_cut(cfg, &ldpc_target, last_applied_kbps, &floor_kbps);
+                    int status = apply_cut(cfg, &ldpc_target, last_applied_kbps, &floor_kbps, 1);
                     if (status >= 200 && status < 300) {
                         fprintf(stderr, "bitrate_ctl: LDPC error ratio=%.1f%% -> video0.bitrate=%u kbps%s\n",
                                 ldpc_ratio * 100.0, ldpc_target, factor == cfg->severe_backoff ? " (severe)" : "");
@@ -590,7 +593,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
                 uint32_t retx_target = clamp_u32((uint32_t)((double)last_applied_kbps * factor),
                                                   floor_kbps, cfg->max_kbps);
                 if (retx_target < last_applied_kbps) {
-                    int status = apply_cut(cfg, &retx_target, last_applied_kbps, &floor_kbps);
+                    int status = apply_cut(cfg, &retx_target, last_applied_kbps, &floor_kbps, 1);
                     if (status >= 200 && status < 300) {
                         fprintf(stderr, "bitrate_ctl: BB_EVENT_RETX_TOO_MANY -> video0.bitrate=%u kbps%s\n",
                                 retx_target, factor == cfg->severe_backoff ? " (severe)" : "");
@@ -708,7 +711,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
          * instead of the configured default. */
         int status;
         if (cutting && have_applied) {
-            status = apply_cut(cfg, &target_kbps, last_applied_kbps, &floor_kbps);
+            status = apply_cut(cfg, &target_kbps, last_applied_kbps, &floor_kbps, 1);
         } else {
             char path[128];
             snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", target_kbps);
@@ -750,7 +753,10 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
  *         integrator at once, milder ones trim it; ring backlog stays as
  *         a hard backstop;
  *   focus mode -- waybeam's fpv.roiEnabled below roi_max_kbps, see
- *         pi_focus().
+ *         pi_focus();
+ *   frame-rate stages -- below the floor, waybeam's video0.fpsDivisor
+ *         halves the frame rate and the floor with it, see bitrate_ctl.h
+ *         on fps_div_max.
  * Anti-windup: the integrator doesn't climb while the rate is held by
  * the ceiling or the slew limit, and doesn't sink while at waybeam's
  * floor.
@@ -763,6 +769,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
 #define PI_MIN_UP_STEP        0.05 /* send increases of at least 5% ... */
 #define PI_MIN_DOWN_STEP      0.03 /* ... and decreases of at least 3% */
 #define PI_FOCUS_RETRY_MS     1000 /* a refused fpv.roiEnabled is retried this often */
+#define PI_FPS_RESTORE        1.25 /* a frame-rate stage up once wanting this x its floor */
 
 /* Focus mode in PI mode (see bitrate_ctl.h on roi_max_kbps): on as soon as
  * the applied rate is below roi_max_kbps, off only once it has stayed at or
@@ -800,6 +807,21 @@ static void pi_focus(const bitrate_ctl_cfg_t *cfg, uint32_t applied_kbps, uint64
     *focus = want;
 }
 
+/* video0.fpsDivisor, with the bitrate in the same request when kbps != 0:
+ * waybeam validates the pair as one, and a rate below the full frame rate's
+ * floor is only valid together with the divisor. Returns the HTTP status;
+ * 404/501 = this waybeam has no such field (before 0.85.0, or not CV610). */
+static int send_fps_div(const bitrate_ctl_cfg_t *cfg, int div, uint32_t kbps)
+{
+    char path[128];
+
+    if (kbps)
+        snprintf(path, sizeof(path), "/api/v1/live/set?video0.fpsDivisor=%d&video0.bitrate=%u", div, kbps);
+    else
+        snprintf(path, sizeof(path), "/api/v1/live/set?video0.fpsDivisor=%d", div);
+    return http_get_status(cfg->waybeam_host, cfg->waybeam_port, path, 1000);
+}
+
 static int run_pi(const bitrate_ctl_cfg_t *cfg)
 {
     uint32_t cap_kbps = 0;           /* last good BB_GET_MCS throughput */
@@ -818,6 +840,11 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
     uint32_t ring_gen = __atomic_load_n(&cfg->ring_generation, __ATOMIC_ACQUIRE);
     int focus = -1;                  /* waybeam's fpv.roiEnabled as last set, -1 = unknown */
     uint64_t focus_above_since_ms = 0, focus_try_ms = 0;
+    /* Frame-rate stages, see bitrate_ctl.h on fps_div_max. floor_kbps above
+     * stays the full frame rate's; the floor in force is floor_kbps / div. */
+    int div_max = cfg->fps_div_max > 1 ? cfg->fps_div_max : 1;
+    int div = div_max > 1 ? -1 : 1;  /* waybeam's video0.fpsDivisor, -1 = unknown */
+    uint64_t div_up_since_ms = 0, div_try_ms = 0;
 
     while (!*cfg->stop_flag) {
         usleep(PI_TICK_MS * 1000);
@@ -826,13 +853,36 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         last_tick_ms = now;
 
         /* waybeam restarted: it is back at its configured bitrate and
-         * fpv.roiEnabled, so forget what was applied and send both again. */
+         * fpv.roiEnabled and at the full frame rate, so forget what was
+         * applied and send all three again (a newer waybeam may now have
+         * the divisor an older one refused). */
         uint32_t gen = __atomic_load_n(&cfg->ring_generation, __ATOMIC_ACQUIRE);
         if (gen != ring_gen) {
             ring_gen = gen;
             applied_kbps = 0;
             focus = -1;
+            div_max = cfg->fps_div_max > 1 ? cfg->fps_div_max : 1;
+            div = 1;
+            div_up_since_ms = 0;
         }
+
+        /* At start waybeam may still run at a divisor a previous tx left,
+         * and at a rate only valid with it: reset both. */
+        if (div < 0 && now - div_try_ms >= PI_FOCUS_RETRY_MS) {
+            div_try_ms = now;
+            int status = send_fps_div(cfg, 1, floor_kbps);
+            if (status == 404 || status == 501) {
+                fprintf(stderr, "bitrate_ctl: pi waybeam has no video0.fpsDivisor (status=%d), full frame rate only\n",
+                        status);
+                div_max = 1;
+                div = 1;
+            } else if (status >= 200 && status < 300) {
+                div = 1; /* applied_kbps stays 0: the first rate is sent unslewed */
+            } else {
+                fprintf(stderr, "bitrate_ctl: pi waybeam video0.fpsDivisor=1 returned status=%d\n", status);
+            }
+        }
+        int cur_div = div > 0 ? div : 1;
 
         /* Measured delay; if nothing finished for a while, the frame in
          * flight is at least that old. */
@@ -918,7 +968,9 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         double kp = e < 0 ? cfg->pi_kp_down : cfg->pi_kp_up;
         double ki = e < 0 ? cfg->pi_ki_down : cfg->pi_ki_up;
         double base = (double)cap_kbps * cfg->margin;
-        int at_floor = applied_kbps && applied_kbps <= floor_kbps;
+        /* The integrator may sink at the floor while a frame-rate stage is
+         * left below it: that is what takes the rate under the floor. */
+        int at_floor = applied_kbps && applied_kbps <= floor_kbps / (uint32_t)cur_div && cur_div >= div_max;
         int held_up = applied_kbps && (double)applied_kbps < base * k * 0.9; /* ceiling or slew holding it */
         if ((e > 0 && !held_up && applied_kbps < cfg->max_kbps) || (e < 0 && !at_floor))
             k_i += ki * e * dt;
@@ -930,31 +982,77 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
         if (cfg->pi_recover_per_s > 0.0 && e > 0 && !held_up && k_i < 1.0 &&
             (!last_disturb_ms || now - last_disturb_ms >= 1000))
             k_i += cfg->pi_recover_per_s * dt;
-        if (k_i < cfg->pi_k_min)
-            k_i = cfg->pi_k_min;
+        /* A frame-rate stage divides the floor, and k's lower bound with it:
+         * at the lowest MCS, k = pi_k_min alone stops the PI at ~250 kbps,
+         * above the stages' floors (tools/bc_replay, 2026-10-20). */
+        double k_min = cfg->pi_k_min / div_max;
+        if (k_i < k_min)
+            k_i = k_min;
         if (k_i > cfg->pi_k_max)
             k_i = cfg->pi_k_max;
         k = k_i + kp * e;
-        if (k < cfg->pi_k_min)
-            k = cfg->pi_k_min;
+        if (k < k_min)
+            k = k_min;
         if (k > cfg->pi_k_max)
             k = cfg->pi_k_max;
 
         if (d_ms > cfg->pi_delay_set_ms * PI_CONGESTED_FACTOR || (last_severe_ms && now - last_severe_ms < 1500))
             mark_congested(now);
 
-        /* Target: capacity feedforward x k, slew-limited upward. */
+        /* Frame-rate stage: a stage down as soon as the PI wants less than
+         * the floor in force, a stage up once it has wanted PI_FPS_RESTORE x
+         * the next stage's floor for fps_recovery_ms. */
         double target = base * k;
-        if (target < floor_kbps)
-            target = floor_kbps;
-        if (target > cfg->max_kbps)
-            target = cfg->max_kbps;
+        int want_div = cur_div;
+        if (div > 0 && div_max > 1) {
+            if (target < (double)floor_kbps / cur_div && cur_div * 2 <= div_max) {
+                want_div = cur_div * 2;
+                div_up_since_ms = 0;
+            } else if (cur_div > 1 && target >= (double)floor_kbps / (cur_div / 2) * PI_FPS_RESTORE) {
+                if (!div_up_since_ms)
+                    div_up_since_ms = now;
+                if (now - div_up_since_ms >= (uint64_t)cfg->fps_recovery_ms)
+                    want_div = cur_div / 2;
+            } else {
+                div_up_since_ms = 0;
+            }
+        }
+
+        /* Target: capacity feedforward x k, slew-limited upward, never below
+         * the floor of the frame rate it is sent with. */
         if (applied_kbps && target > applied_kbps) {
             double cap_up = (double)applied_kbps * (1.0 + cfg->pi_slew_up * dt);
             if (target > cap_up)
                 target = cap_up;
         }
+        if (target < (double)floor_kbps / want_div)
+            target = (double)floor_kbps / want_div;
+        if (target > cfg->max_kbps)
+            target = cfg->max_kbps;
         uint32_t t = (uint32_t)target;
+        if (want_div != cur_div) {
+            int status = send_fps_div(cfg, want_div, t);
+            if (status == 404 || status == 501) {
+                fprintf(stderr, "bitrate_ctl: pi waybeam has no video0.fpsDivisor (status=%d), full frame rate only\n",
+                        status);
+                div_max = 1;
+                continue;
+            }
+            if (status < 200 || status >= 300) {
+                uint32_t floor_before = floor_kbps;
+                floor_kbps = learn_floor(floor_kbps, status, t * (uint32_t)want_div);
+                fprintf(stderr, "bitrate_ctl: pi waybeam video0.fpsDivisor=%d at %u kbps returned status=%d%s\n",
+                        want_div, t, status, floor_kbps != floor_before ? " (floor learned)" : "");
+                continue;
+            }
+            fprintf(stderr, "bitrate_ctl: pi C=%u D=%.1fms k=%.2f -> frame rate 1/%d, floor %u, video0.bitrate=%u kbps\n",
+                    cap_kbps, d_ms, k, want_div, floor_kbps / (uint32_t)want_div, t);
+            div = want_div;
+            div_up_since_ms = 0;
+            applied_kbps = t;
+            last_apply_ms = now;
+            continue;
+        }
         if (applied_kbps) {
             double rel = ((double)t - applied_kbps) / applied_kbps;
             int due = now - last_apply_ms >= 1000;
@@ -966,7 +1064,7 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
 
         int status;
         if (applied_kbps && t < applied_kbps) {
-            status = apply_cut(cfg, &t, applied_kbps, &floor_kbps);
+            status = apply_cut(cfg, &t, applied_kbps, &floor_kbps, cur_div);
         } else {
             char path[128];
             snprintf(path, sizeof(path), "/api/v1/live/set?video0.bitrate=%u", t);

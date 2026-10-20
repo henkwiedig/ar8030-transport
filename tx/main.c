@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -148,6 +149,7 @@ struct tx_args {
     uint32_t min_kbps;
     uint32_t max_kbps;
     uint32_t focus_kbps; /* -F, bitrate_ctl_cfg_t.roi_max_kbps */
+    int fps_div_max; /* -D, bitrate_ctl_cfg_t.fps_div_max */
     /* Socket experiment knobs (stock's video socket is opened RX|TX with
      * options {5, 0x800} on port 3 -- see README/docs; these let that be
      * tried without a rebuild). Defaults keep the previous behaviour. */
@@ -183,6 +185,9 @@ static void usage(const char *argv0)
             "  -F <kbps>      focus mode: switch waybeam's centre-priority ROI (fpv.roiEnabled) on\n"
             "                 below this bitrate, off again above it; needs waybeam 0.84.2+\n"
             "                 (default 0 = never touch fpv.roiEnabled)\n"
+            "  -D <1|2|4>     below the bitrate floor, have waybeam encode every 2nd frame (and\n"
+            "                 then every 4th), which divides its floor by as much; -C pi only,\n"
+            "                 needs waybeam 0.85.0+ on CV610 (default 1 = always every frame)\n"
             "  -Q <slots>     ring backlog that triggers an URGENT bitrate cut (default 6; the\n"
             "                 ring has 8 slots, one frame each -- higher reacts later, tolerates bursts)\n"
             "  -K <fraction>  bitrate multiplier applied per URGENT cut (default 0.92)\n"
@@ -244,6 +249,7 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->min_kbps = 512;
     a->max_kbps = 35000;
     a->focus_kbps = 0;
+    a->fps_div_max = 1;
     a->verbose = 0;
     a->sock_tx_buf = 64 * 1024;
     a->sock_rx_buf = 1024;
@@ -256,7 +262,7 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->n_pi_params = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:D:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
@@ -299,6 +305,13 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'F':
             a->focus_kbps = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 'D':
+            a->fps_div_max = atoi(optarg);
+            if (a->fps_div_max != 1 && a->fps_div_max != 2 && a->fps_div_max != 4) {
+                fprintf(stderr, "tx: -D takes 1, 2 or 4\n");
+                return -1;
+            }
             break;
         case 'B':
             a->sock_tx_buf = (uint32_t)strtoul(optarg, NULL, 0);
@@ -755,8 +768,11 @@ int main(int argc, char **argv)
     const uint32_t sock_flags = args.sock_bidir ? (BB_SOCK_FLAG_TX | BB_SOCK_FLAG_RX) : BB_SOCK_FLAG_TX;
     fprintf(stderr, "tx: socket flags=0x%x tx_buf=%u rx_buf=%u write_timeout=%dms port=%d\n", sock_flags,
             sock_opt.tx_buf_size, sock_opt.rx_buf_size, args.write_timeout_ms, args.port);
-    fprintf(stderr, "tx: bitrate control margin=%.3f min=%u max=%u focus=%u kbps backlog_slots=%u backoff=%.2f\n",
-            args.margin, args.min_kbps, args.max_kbps, args.focus_kbps, args.ring_backlog_slots, args.ring_backoff);
+    fprintf(stderr,
+            "tx: bitrate control margin=%.3f min=%u max=%u focus=%u kbps fps_div_max=%d backlog_slots=%u "
+            "backoff=%.2f\n",
+            args.margin, args.min_kbps, args.max_kbps, args.focus_kbps, args.fps_div_max, args.ring_backlog_slots,
+            args.ring_backoff);
     /* Same force-close + retry as the reconnect path below (see its own,
      * longer comment) -- confirmed live that this exact failure isn't
      * specific to reconnecting: it also hit a genuinely fresh startup
@@ -812,6 +828,8 @@ int main(int argc, char **argv)
                                              * at the floor (bench 2026-10-02), so it was 0 */
     bc_cfg.roi_recovery_ms = 5000; /* hold ROI on for 5s of recovered bitrate (rules: and clear
                                      * backlog) before switching it back off */
+    bc_cfg.fps_div_max = args.fps_div_max; /* -D */
+    bc_cfg.fps_recovery_ms = 1000; /* a stage up after 1 s of wanting 1.25x its floor */
     /* LDPC off (0): BB_GET_USER_QUALITY on the air reports the air's own
      * receive side -- the uplink. Bench walk 2026-10-03 14:25-14:27: every
      * LDPC-only clamp (62-100%) coincided with uplink LDPC errors
@@ -1138,9 +1156,23 @@ int main(int argc, char **argv)
         {
             static double delay_ewma_us, frame_period_us = 10000;
             static uint32_t prev_pts;
+            static int period_off; /* frames in a row off the estimate by > 1/4 */
             uint32_t dpts = meta.pts - prev_pts;
-            if (prev_pts && dpts >= 5000 && dpts <= 50000)
-                frame_period_us += ((double)dpts - frame_period_us) / 16.0;
+            if (prev_pts && dpts >= 5000 && dpts <= 50000) {
+                /* A frame-rate stage (-D) changes the interval at once. Smoothed,
+                 * the old 40 ms of 25 fps still weighed every waiting frame after
+                 * the step to 50 fps, and the PI stepped straight back down
+                 * (bench 2026-10-21); so follow a change that holds 3 frames. */
+                if (fabs((double)dpts - frame_period_us) > frame_period_us / 4.0) {
+                    if (++period_off >= 3) {
+                        frame_period_us = (double)dpts;
+                        period_off = 0;
+                    }
+                } else {
+                    period_off = 0;
+                    frame_period_us += ((double)dpts - frame_period_us) / 16.0;
+                }
+            }
             prev_pts = meta.pts;
             venc_frame_ring_fill_t fill;
             uint32_t behind = venc_frame_ring_get_fill(ring, &fill) == 0 ? fill.used_slots : 0;
