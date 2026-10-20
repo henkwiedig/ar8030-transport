@@ -30,6 +30,7 @@
 #include "../common/ar8030_batt.h"
 #include "../common/ar8030_rftemp.h"
 #include "../common/ar8030_link_policy.h"
+#include "../common/ar8030_retx_event.h"
 
 #include <math.h>
 #include <signal.h>
@@ -234,8 +235,9 @@ static void usage(const char *argv0)
             "      bitrate (independently recovered via Ghidra decompile of\n"
             "      fpv_bb_is_send_retx_too_many(), NOT the same thing as the\n"
             "      `retx` command above; see BB_EVENT_RETX_TOO_MANY's own doc\n"
-            "      comment in bb_api.h). Prints one line per firing plus a 10s\n"
-            "      heartbeat, until Ctrl-C. Unlike every other command here,\n"
+            "      comment in bb_api.h). Prints one line per firing (rise/fall,\n"
+            "      decoded busy_on/conti_on and window, raw bytes 0..12) plus a\n"
+            "      10s heartbeat, until Ctrl-C. Unlike every other command here,\n"
             "      this one does not exit after one bb_ioctl -- it's meant for\n"
             "      watching this fire live while forcing real link stress (e.g.\n"
             "      moving the peer out of range).\n"
@@ -1051,20 +1053,10 @@ static int cmd_retx(int argc, char **argv)
     return 0;
 }
 
-/* Bumped by on_retx_too_many_event() -- see that callback's own comment
- * for why `arg` is never dereferenced. Signal-safe-cheap per
- * bb_event_callback's own "synchronous locally" doc comment in
- * bb_api.h, same constraint tx/bitrate_ctl.c's own callbacks already
- * follow. */
 static volatile sig_atomic_t g_retx_too_many;
+static volatile sig_atomic_t g_retx_rising;
 static volatile sig_atomic_t g_stop_watch;
-
-static void on_retx_too_many_event(void *arg, void *user)
-{
-    (void)arg;
-    (void)user;
-    g_retx_too_many++;
-}
+static ar8030_retx_state_t g_retx_prev; /* callback thread only */
 
 static void on_sigint(int sig)
 {
@@ -1079,17 +1071,48 @@ static uint64_t watch_now_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+/* Prints each firing from the SDK's callback thread, so the timestamps
+ * show the real spacing of the edges (a super-frame is ~5.6 ms). The
+ * decoded fields and the raw bytes 0..12 are printed together so the
+ * layout in ar8030_retx_event.h can be checked against the unit. */
+static void on_retx_too_many_event(void *arg, void *user)
+{
+    const uint8_t *p = arg;
+    ar8030_retx_state_t st;
+    uint64_t now = watch_now_ms();
+    int n = ++g_retx_too_many;
+
+    (void)user;
+    printf("[%llu.%03llus] #%d ", (unsigned long long)(now / 1000), (unsigned long long)(now % 1000), n);
+    if (ar8030_retx_event_decode(arg, &st) == 0) {
+        int rise = ar8030_retx_event_rising(&g_retx_prev, &st);
+        g_retx_prev = st;
+        if (rise)
+            g_retx_rising++;
+        printf("%-4s busy_on=%u conti_on=%u bits=0x%08x pos=%u | win=%u busy=%u idle=%u conti_busy=%u conti_idle=%u",
+               rise ? "rise" : "fall", st.busy_on, st.conti_on, st.bits, st.pos, st.win, st.busy, st.idle,
+               st.conti_busy, st.conti_idle);
+    } else {
+        printf("%s", p ? "payload does not decode" : "no payload");
+    }
+    if (p) {
+        printf(" | raw");
+        for (int i = 0; i < 13; i++)
+            printf(" %02x", p[i]);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
 /* Deliberately NOT one-shot, unlike every other command in this file
  * (see this file's own top-of-file comment on that general design) --
  * a live event monitor is the natural way to actually verify
  * BB_EVENT_RETX_TOO_MANY fires on real link stress (e.g. moving the
  * peer out of range) without digging through ar8030d's own text log
- * (the daemon_log directory). Runs until Ctrl-C, printing one line per firing
- * plus a periodic heartbeat so it's clear the subscription itself is
- * still alive even during a long quiet stretch. See bb_api.h's own
- * BB_EVENT_RETX_TOO_MANY doc comment for what is and isn't confirmed
- * about this event (notably: `arg`'s payload layout is not, so this
- * only ever counts firings, never inspects one). */
+ * (the daemon_log directory). Runs until Ctrl-C, printing one decoded
+ * line per firing (on_retx_too_many_event) plus a periodic heartbeat so
+ * it's clear the subscription itself is still alive even during a long
+ * quiet stretch. Payload layout: common/ar8030_retx_event.h. */
 static int cmd_retx_watch(int argc, char **argv)
 {
     (void)argc;
@@ -1116,17 +1139,16 @@ static int cmd_retx_watch(int argc, char **argv)
         sig_atomic_t now_count = g_retx_too_many;
         uint64_t now = watch_now_ms();
         if (now_count != last_seen) {
-            printf("[%llu.%03llus] BB_EVENT_RETX_TOO_MANY fired (count=%d)\n", (unsigned long long)(now / 1000),
-                   (unsigned long long)(now % 1000), (int)now_count);
             last_seen = now_count;
             last_heartbeat_ms = now;
         } else if (now - last_heartbeat_ms >= 10000) {
             printf("[%llu.%03llus] still watching (count=%d)\n", (unsigned long long)(now / 1000),
                    (unsigned long long)(now % 1000), (int)now_count);
+            fflush(stdout);
             last_heartbeat_ms = now;
         }
     }
-    printf("stopped -- total firings: %d\n", (int)g_retx_too_many);
+    printf("stopped -- total firings: %d, rising edges: %d\n", (int)g_retx_too_many, (int)g_retx_rising);
 
     bb_set_event_callback_t unsub;
     memset(&unsub, 0, sizeof(unsub));

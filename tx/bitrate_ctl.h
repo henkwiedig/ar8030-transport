@@ -148,19 +148,14 @@ typedef struct {
      * bb_event_e entirely and had to be independently recovered via
      * Ghidra decompile, tracing fpv_bb_is_send_retx_too_many() back to
      * its actual trigger -- see BB_EVENT_RETX_TOO_MANY's own doc comment
-     * in bb_api.h). Deliberately NOT parsed for payload: bb_event_callback's
-     * own doc comment says `arg` is event-specific, but this event's
-     * payload layout is only known second-hand (the vendor app's own
-     * local re-derivation after its own internal IPC indirection, not a
-     * directly-confirmed `arg` layout for THIS SDK's own callback
-     * delivery) -- so the callback here only bumps a counter, exactly
-     * like the existing BB_EVENT_MCS_CHANGE/BB_EVENT_LINK_STATE
-     * subscriptions already do, and the main loop treats every firing as
-     * the same conservative "radio is actively under repair pressure"
-     * hint regardless of whatever gating condition the vendor's own
-     * payload parsing might apply. Bypasses hysteresis like the ring/LDPC
-     * paths, with its own rate limit. 0 disables this path entirely. */
-    double retx_event_backoff; /* multiplies last_applied_kbps on every event firing, e.g. 0.85 */
+     * in bb_api.h). The firmware raises it on every busy/conti edge,
+     * recoveries included; the callback decodes `arg`
+     * (common/ar8030_retx_event.h) and counts only the edges where
+     * busy_on or conti_on rose. A payload that does not decode counts
+     * every firing.
+     * Bypasses hysteresis like the ring/LDPC paths, with its own rate
+     * limit. 0 disables this path entirely. */
+    double retx_event_backoff; /* multiplies last_applied_kbps on every counted event, e.g. 0.85 */
 
     /* Severity: a deep fade cuts harder than a marginal one. An LDPC
      * error ratio >= ldpc_severe_ratio, or >= retx_severe_events

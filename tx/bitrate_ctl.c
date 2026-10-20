@@ -1,5 +1,6 @@
 #include "bitrate_ctl.h"
 
+#include "ar8030_retx_event.h"
 #include "http_get.h"
 
 #include <signal.h>
@@ -25,16 +26,40 @@ static void on_link_event(void *arg, void *user)
 /* Separate counter from g_wake above -- this one drives an immediate,
  * rate-limited backoff in the main loop (see the ldpc/ring paths' own
  * shape), not just a "check sooner" hint for the ordinary MCS-driven
- * poll. Deliberately does not touch `arg`: see bitrate_ctl.h's own
- * comment on retx_event_backoff for why this event's payload layout
- * isn't trusted. Same signal-safe-cheap constraint as on_link_event. */
+ * poll. Counts rising edges only: the firmware raises the event on every
+ * busy/conti edge, recoveries included (ar8030_retx_event.h). A payload
+ * that does not decode counts every firing, as before, and is reported
+ * once by retx_check_payload(). Same signal-safe-cheap constraint as
+ * on_link_event. */
 static volatile sig_atomic_t g_retx_too_many;
+static volatile sig_atomic_t g_retx_undecoded;
+static ar8030_retx_state_t g_retx_prev; /* callback thread only */
 
 static void on_retx_too_many_event(void *arg, void *user)
 {
-    (void)arg;
+    ar8030_retx_state_t st;
+
     (void)user;
-    g_retx_too_many++;
+    if (ar8030_retx_event_decode(arg, &st) != 0) {
+        if (arg)
+            g_retx_undecoded = 1;
+        g_retx_too_many++;
+        return;
+    }
+    if (ar8030_retx_event_rising(&g_retx_prev, &st))
+        g_retx_too_many++;
+    g_retx_prev = st;
+}
+
+static void retx_check_payload(void)
+{
+    static int reported;
+
+    if (g_retx_undecoded && !reported) {
+        fprintf(stderr, "bitrate_ctl: BB_EVENT_RETX_TOO_MANY payload does not decode -- "
+                        "counting every firing, recoveries included\n");
+        reported = 1;
+    }
 }
 
 static uint64_t now_ms(void)
@@ -554,6 +579,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
          * file. */
         /* Timestamp every RETX_TOO_MANY event as it is seen, independent
          * of the cut gating below, for the severity count. */
+        retx_check_payload();
         {
             sig_atomic_t c = g_retx_too_many;
             while (retx_counted != c) {
@@ -793,6 +819,7 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
 
         /* Disturbance feedforward: the radio says it is losing frames
          * before the delay can show it. */
+        retx_check_payload();
         {
             sig_atomic_t c = g_retx_too_many;
             while (retx_counted != c) {
