@@ -470,6 +470,9 @@ static const lc_power_level_t DEV_POWER_LEVELS[] = {{500, 24}, {200, 20}, {100, 
 #define DEV_AUTO_DBM     24
 #define DEV_AUTO_MIN_DBM 14
 #define DEV_AUTO_MAX_DBM 27
+/* The level "auto" counts as for --max-power: it starts at the 500 mW
+ * level's target and adapts beyond it, so a lower cap drops it too. */
+#define DEV_AUTO_CAP_MW 500
 
 /* ar_ldy_gnd adds +3 to the ground's own BB_SET_POWER target when the air
  * unit is a type 4/6/7 board (the Lite is 4/7) -- +6 when a config flag we
@@ -523,14 +526,14 @@ int lc_power_parse(const char* s, int* out)
     return 0;
 }
 
-static int power_within(int max_mw, int mw)
+static int power_within(int max_mw, int level)
 {
-    return max_mw <= 0 || mw <= max_mw;
+    return max_mw <= 0 || (level == LC_POWER_AUTO ? DEV_AUTO_CAP_MW : level) <= max_mw;
 }
 
 int lc_power_valid(int is_ap, int max_mw, int level)
 {
-    return power_level_dbm(is_ap, level) >= 0 && (level == LC_POWER_AUTO || power_within(max_mw, level));
+    return power_level_dbm(is_ap, level) >= 0 && power_within(max_mw, level);
 }
 
 int lc_power_default(int is_ap, int max_mw)
@@ -555,7 +558,7 @@ void lc_power_levels_json(int is_ap, int max_mw, char* out, size_t out_sz)
     const lc_power_level_t* t   = power_levels(is_ap, &n);
     size_t                  len = 0;
     out[0]                      = '\0';
-    if (!is_ap) {
+    if (!is_ap && power_within(max_mw, LC_POWER_AUTO)) {
         len += (size_t)snprintf(out, out_sz, "\"auto\"");
     }
     for (size_t i = 0; i < n && len < out_sz; i++) {

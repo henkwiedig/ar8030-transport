@@ -174,7 +174,8 @@ int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan);
 int lc_power_parse(const char* s, int* out);
 
 /* max_mw below: the board's cap (lc_config_t.max_power), 0 for none. It
- * removes the levels above it; LC_POWER_AUTO is not a level and stays. */
+ * removes the levels above it; LC_POWER_AUTO counts as 500 mW (it starts at
+ * that level's target and adapts up to 27 dBm). */
 
 /* Non-zero if level is one of this role's levels within max_mw
  * (LC_POWER_AUTO: ground only). */

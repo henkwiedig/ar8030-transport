@@ -69,8 +69,9 @@ static void print_help(const char* argv0)
     printf("                            highest level within --max-power)\n");
     printf("  --max-power <mW>          highest level this board may use: higher ones are\n");
     printf("                            not offered (GET /api/v1/power), refused and not\n");
-    printf("                            taken from the persisted setting; ground auto stays\n");
-    printf("                            (BetaFPV P1: 200, its PA's calibrated 22 dBm)\n");
+    printf("                            taken from the persisted setting; ground auto counts\n");
+    printf("                            as 500 mW (BetaFPV P1 and VR04: 200, their stock\n");
+    printf("                            22 / 23 dBm)\n");
     printf("                            (default: none)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (press: pair; hold 5 s: hooks.d/longpress)\n");

@@ -2248,9 +2248,11 @@ design rationale):
   leaves the chip's config-file power alone). `--max-power <mW>` caps a
   board's levels: higher ones drop out of `power_levels`, a POST of one is
   answered `400` with the allowed list, a persisted one is ignored for the
-  default, and the role default becomes the highest level left (ground
-  `auto` stays). The BetaFPV P1 runs `--max-power 200`: BetaFPV calibrates
-  and uses its PA up to 22 dBm, the air's 400 mW is 26. GET:
+  default, and the role default becomes the highest level left. Ground
+  `auto` counts as 500 mW: it starts at that level's target and adapts up
+  to 27 dBm. The BetaFPV P1 and VR04 run `--max-power 200`: BetaFPV runs
+  their PAs up to 22 / 23 dBm, the air's 400 mW is 26 and the ground's
+  500 mW 27. GET:
   ```
   curl http://<host>:8899/api/v1/power
   {"ok":true,"power":400,"power_dbm":26,"power_levels":[400,200,100,25],"armed":true,"standby":null}

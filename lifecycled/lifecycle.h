@@ -70,9 +70,10 @@ typedef struct {
      * lifecycle_tuning.h. */
     int default_power;
     /* Highest level in mW this board may use, or 0 (no cap): higher ones
-     * are not offered, refused and not taken from the sidecar. The BetaFPV
-     * P1's PA is calibrated by BetaFPV up to 22 dBm (200 mW), not the
-     * air's 400 mW = 26 dBm. */
+     * (ground "auto" counting as 500 mW) are not offered, refused and not
+     * taken from the sidecar. BetaFPV runs the P1's and the VR04's PA up to
+     * 22 / 23 dBm: 200 mW on either side, not 400 mW = 26 (air) or
+     * 500 mW = 27 (ground). */
     int max_power;
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */
