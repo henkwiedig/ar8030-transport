@@ -173,17 +173,21 @@ int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan);
  * lc_power_valid()'s job. */
 int lc_power_parse(const char* s, int* out);
 
-/* Non-zero if level is one of this role's levels (LC_POWER_AUTO: ground
- * only). */
-int lc_power_valid(int is_ap, int level);
+/* max_mw below: the board's cap (lc_config_t.max_power), 0 for none. It
+ * removes the levels above it; LC_POWER_AUTO is not a level and stays. */
+
+/* Non-zero if level is one of this role's levels within max_mw
+ * (LC_POWER_AUTO: ground only). */
+int lc_power_valid(int is_ap, int max_mw, int level);
 
 /* The role's default level: 400 mW (26 dBm) on the air side, 500 mW on
- * the ground. */
-int lc_power_default(int is_ap);
+ * the ground, or the highest level within max_mw; -1 if max_mw leaves
+ * none. */
+int lc_power_default(int is_ap, int max_mw);
 
-/* Writes this role's levels, highest first, as a JSON array body (e.g.
- * `"auto",500,200,100,25`) into out. */
-void lc_power_levels_json(int is_ap, char* out, size_t out_sz);
+/* Writes this role's levels within max_mw, highest first, as a JSON array
+ * body (e.g. `"auto",500,200,100,25`) into out. */
+void lc_power_levels_json(int is_ap, int max_mw, char* out, size_t out_sz);
 
 /* Sidecar "ar8030.power" next to cfg_path ("auto" or mW). Load returns 0
  * and fills *out, -1 if missing/unreadable; save returns 0 on success. */

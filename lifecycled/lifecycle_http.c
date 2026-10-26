@@ -388,7 +388,7 @@ static void format_power_fields(const lifecycle_http_ctx* http, const lc_status_
         snprintf(dbm, sizeof(dbm), "null");
     }
     const lc_config_t* cfg = lifecycle_get_config(http->lc);
-    lc_power_levels_json(cfg->role == LC_ROLE_AP, levels, sizeof(levels));
+    lc_power_levels_json(cfg->role == LC_ROLE_AP, cfg->max_power, levels, sizeof(levels));
     const char* standby = cfg->standby_dbm < 0 ? "null" : st->standby ? "true" : "false";
     snprintf(out, out_sz, "\"power\":%s,\"power_dbm\":%s,\"power_levels\":[%s],\"armed\":%s,\"standby\":%s",
              level, dbm, levels, st->armed ? "true" : "false", standby);
@@ -698,7 +698,8 @@ static void handle_power(lifecycle_http_ctx* http, int fd, const char* method, c
         if (query_param(query, "level", arg, sizeof(arg)) != 0 || lc_power_parse(arg, &level) != 0 ||
             lifecycle_request_power(http->lc, level) != 0) {
             char levels[96], json[200];
-            lc_power_levels_json(lifecycle_get_config(http->lc)->role == LC_ROLE_AP, levels, sizeof(levels));
+            const lc_config_t* cfg = lifecycle_get_config(http->lc);
+            lc_power_levels_json(cfg->role == LC_ROLE_AP, cfg->max_power, levels, sizeof(levels));
             snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"'level' must be one of\",\"power_levels\":[%s]}",
                      levels);
             send_json(fd, 400, "Bad Request", json);

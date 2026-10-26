@@ -523,17 +523,33 @@ int lc_power_parse(const char* s, int* out)
     return 0;
 }
 
-int lc_power_valid(int is_ap, int level)
+static int power_within(int max_mw, int mw)
 {
-    return power_level_dbm(is_ap, level) >= 0;
+    return max_mw <= 0 || mw <= max_mw;
 }
 
-int lc_power_default(int is_ap)
+int lc_power_valid(int is_ap, int max_mw, int level)
 {
-    return is_ap ? 400 : 500;
+    return power_level_dbm(is_ap, level) >= 0 && (level == LC_POWER_AUTO || power_within(max_mw, level));
 }
 
-void lc_power_levels_json(int is_ap, char* out, size_t out_sz)
+int lc_power_default(int is_ap, int max_mw)
+{
+    int def = is_ap ? 400 : 500;
+    if (power_within(max_mw, def)) {
+        return def;
+    }
+    size_t                  n;
+    const lc_power_level_t* t = power_levels(is_ap, &n);
+    for (size_t i = 0; i < n; i++) {
+        if (power_within(max_mw, t[i].mw)) {
+            return t[i].mw;
+        }
+    }
+    return -1;
+}
+
+void lc_power_levels_json(int is_ap, int max_mw, char* out, size_t out_sz)
 {
     size_t                  n;
     const lc_power_level_t* t   = power_levels(is_ap, &n);
@@ -543,7 +559,9 @@ void lc_power_levels_json(int is_ap, char* out, size_t out_sz)
         len += (size_t)snprintf(out, out_sz, "\"auto\"");
     }
     for (size_t i = 0; i < n && len < out_sz; i++) {
-        len += (size_t)snprintf(out + len, out_sz - len, "%s%d", len ? "," : "", t[i].mw);
+        if (power_within(max_mw, t[i].mw)) {
+            len += (size_t)snprintf(out + len, out_sz - len, "%s%d", len ? "," : "", t[i].mw);
+        }
     }
 }
 

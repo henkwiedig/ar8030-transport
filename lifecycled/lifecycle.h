@@ -69,6 +69,11 @@ typedef struct {
      * chip's config-file power alone) or LC_POWER_ROLE_DEFAULT -- see
      * lifecycle_tuning.h. */
     int default_power;
+    /* Highest level in mW this board may use, or 0 (no cap): higher ones
+     * are not offered, refused and not taken from the sidecar. The BetaFPV
+     * P1's PA is calibrated by BetaFPV up to 22 dBm (200 mW), not the
+     * air's 400 mW = 26 dBm. */
+    int max_power;
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */
 

@@ -65,7 +65,13 @@ static void print_help(const char* argv0)
     printf("                            output power while none is persisted yet: air 400/\n");
     printf("                            200/100/25 mW, ground auto/500/200/100/25 mW, or none\n");
     printf("                            (leave the chip's config-file power alone)\n");
-    printf("                            (default: air 400 mW = 26 dBm, ground 500 mW)\n");
+    printf("                            (default: air 400 mW = 26 dBm, ground 500 mW, or the\n");
+    printf("                            highest level within --max-power)\n");
+    printf("  --max-power <mW>          highest level this board may use: higher ones are\n");
+    printf("                            not offered (GET /api/v1/power), refused and not\n");
+    printf("                            taken from the persisted setting; ground auto stays\n");
+    printf("                            (BetaFPV P1: 200, its PA's calibrated 22 dBm)\n");
+    printf("                            (default: none)\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (press: pair; hold 5 s: hooks.d/longpress)\n");
     printf("                            (default: none -- no physical button on this board)\n");
@@ -136,6 +142,7 @@ enum {
     OPT_DEFAULT_BANDWIDTH,
     OPT_DEFAULT_CHANNEL,
     OPT_DEFAULT_POWER,
+    OPT_MAX_POWER,
     OPT_BIND_GPIO,
     OPT_HTTP_PORT,
     OPT_HTTP_BIND,
@@ -176,6 +183,7 @@ int main(int argc, char** argv)
         .frame_change      = 1,
         .default_channel   = 25, /* 5805 MHz in ar8030.json's channel table */
         .default_power     = LC_POWER_ROLE_DEFAULT,
+        .max_power         = 0,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
         .http_bind         = "0.0.0.0",
@@ -205,6 +213,7 @@ int main(int argc, char** argv)
         {"default-bandwidth", required_argument, 0, OPT_DEFAULT_BANDWIDTH},
         {"default-channel",   required_argument, 0, OPT_DEFAULT_CHANNEL  },
         {"default-power",     required_argument, 0, OPT_DEFAULT_POWER    },
+        {"max-power",         required_argument, 0, OPT_MAX_POWER        },
         {"bind-gpio",         required_argument, 0, OPT_BIND_GPIO        },
         {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
         {"http-bind",         required_argument, 0, OPT_HTTP_BIND        },
@@ -272,6 +281,15 @@ int main(int argc, char** argv)
                 return 1;
             }
             break;
+        case OPT_MAX_POWER: {
+            char* end;
+            cfg.max_power = (int)strtol(optarg, &end, 10);
+            if (end == optarg || (*end && strcmp(end, "mw") != 0 && strcmp(end, "mW") != 0) || cfg.max_power <= 0) {
+                fprintf(stderr, "invalid --max-power '%s' (mW)\n", optarg);
+                return 1;
+            }
+            break;
+        }
         case OPT_BIND_GPIO:
             cfg.bind_gpio = (int)strtol(optarg, NULL, 10);
             break;
@@ -368,6 +386,11 @@ int main(int argc, char** argv)
                     cfg.overheat_c);
             return 1;
         }
+    }
+
+    if (cfg.max_power > 0 && lc_power_default(cfg.role == LC_ROLE_AP, cfg.max_power) < 0) {
+        fprintf(stderr, "--max-power %d leaves no power level for this role (lowest: 25 mW)\n", cfg.max_power);
+        return 1;
     }
 
     openlog("ar8030-lifecycled", LOG_PID, LOG_USER);
