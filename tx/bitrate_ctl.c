@@ -296,6 +296,20 @@ int bitrate_ctl_congested(void)
     return now_ms() < __atomic_load_n(&g_congested_until_ms, __ATOMIC_ACQUIRE);
 }
 
+/* Two of waybeam's low-water windows: one has surely closed over frames
+ * written after the flush (see cfg->ring_flushed_ms). */
+#define RING_FLUSH_SETTLE_MS (2 * VENC_RING_LOW_WATER_WINDOW_US / 1000)
+
+/* waybeam's low_water_slots, or 0 while it may still describe frames
+ * tx/main.c flushed. */
+static uint16_t ring_low_water(const bitrate_ctl_cfg_t *cfg, const venc_frame_ring_t *ring, uint64_t now)
+{
+    uint64_t flushed = __atomic_load_n(&cfg->ring_flushed_ms, __ATOMIC_ACQUIRE);
+    if (flushed && now < flushed + RING_FLUSH_SETTLE_MS)
+        return 0;
+    return __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+}
+
 static void subscribe_events(const bitrate_ctl_cfg_t *cfg)
 {
     /* Loaded once here via the same atomic accessor the rest of this file
@@ -415,7 +429,7 @@ static int run_rules(const bitrate_ctl_cfg_t *cfg)
          * once that happens. */
         venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);
         if (ring && have_applied && (now - last_apply_ms) >= (uint64_t)RING_BACKLOG_MIN_INTERVAL_MS) {
-            uint16_t backlog_slots = __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+            uint16_t backlog_slots = ring_low_water(cfg, ring, now);
             if (backlog_slots >= cfg->ring_backlog_high_slots) {
                 last_backlog_ms = now;
                 mark_congested(now);
@@ -954,7 +968,7 @@ static int run_pi(const bitrate_ctl_cfg_t *cfg)
 
         /* Ring backlog: hard backstop, same signal as the rules mode. */
         venc_frame_ring_t *ring = __atomic_load_n(&cfg->ring, __ATOMIC_ACQUIRE);
-        if (ring && __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED) >= cfg->ring_backlog_high_slots &&
+        if (ring && ring_low_water(cfg, ring, now) >= cfg->ring_backlog_high_slots &&
             now - last_backlog_ms >= (uint64_t)RING_CUT_HOLDOFF_MS) {
             k_i = (k < k_i ? k : k_i) * cfg->ring_backoff;
             last_backlog_ms = now;

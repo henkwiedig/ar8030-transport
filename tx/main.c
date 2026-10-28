@@ -704,6 +704,32 @@ static int stat_named_shm(const char *ring_name, dev_t *out_dev, ino_t *out_ino)
     return 0;
 }
 
+/* Drops every frame waiting in the ring; called whenever the data socket
+ * (re)opens. What queued up without a socket is of no use to the ground,
+ * and it can be very old: a full ring drops the NEW frames, so with no
+ * reader at all it keeps waybeam's first slot_count frames -- 84 s old when
+ * the link came up on a P1 (2026-10-28). Sent, they read as a full ring of
+ * backlog: the controller cut to the floor and marked the link congested,
+ * idr_ctrl suppressed every stream-up keyframe request of the ground, and
+ * its decoder, which only starts on an IDR, stayed black for good. Not on a
+ * reattach to a restarted waybeam: that ring is fresh and starts with an
+ * IDR. */
+static void flush_ring(venc_frame_ring_t *ring, bitrate_ctl_cfg_t *bc_cfg)
+{
+    uint64_t rd = __atomic_load_n(&ring->hdr->read_idx, __ATOMIC_RELAXED);
+    uint64_t w = __atomic_load_n(&ring->hdr->write_idx, __ATOMIC_ACQUIRE);
+    if (w > rd) {
+        /* The producer never writes into slot rd while it is queued. */
+        VencFrameMeta oldest;
+        memcpy(&oldest, venc_frame_ring_slot_at(ring, (uint32_t)(rd & (ring->hdr->slot_count - 1)))->data,
+               VENC_FRAME_META_SIZE);
+        fprintf(stderr, "tx: flushed %llu frame(s) queued before the socket opened, oldest %d ms\n",
+                (unsigned long long)(w - rd), (int32_t)((uint32_t)now_monotonic_us() - oldest.pts) / 1000);
+        __atomic_store_n(&ring->hdr->read_idx, w, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&bc_cfg->ring_flushed_ms, now_monotonic_us() / 1000, __ATOMIC_RELEASE);
+}
+
 int main(int argc, char **argv)
 {
     struct tx_args args;
@@ -879,6 +905,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "tx: %s\n", args.pi_params[i]);
     }
     bc_cfg.stop_flag = &g_stop;
+    flush_ring(ring, &bc_cfg); /* socket open since just above */
 
     tx_outq_t outq;
     tx_outq_init(&outq);
@@ -1046,6 +1073,7 @@ int main(int argc, char **argv)
                     break;
                 }
                 fprintf(stderr, "tx: bb_socket open (slot=%d port=%d)\n", slot, args.port);
+                flush_ring(ring, &bc_cfg);
             }
         }
 

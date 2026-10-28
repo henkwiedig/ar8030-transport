@@ -199,6 +199,13 @@ typedef struct {
      * sends all three again. */
     uint32_t ring_generation;
 
+    /* When tx/main.c last flushed the ring (CLOCK_MONOTONIC ms, __atomic;
+     * 0 = never), see its flush_ring(). waybeam publishes low_water_slots
+     * once per ~200 ms window, so right after a flush it can still describe
+     * the flushed frames: both modes' ring backlog checks skip it for two
+     * windows. */
+    uint64_t ring_flushed_ms;
+
     double pi_delay_set_ms;  /* queueing-delay setpoint, e.g. 10 */
     double pi_kp_up, pi_kp_down; /* proportional gain per ms of error */
     double pi_ki_up, pi_ki_down; /* integral gain per ms of error per s */
