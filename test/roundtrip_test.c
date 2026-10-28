@@ -451,6 +451,124 @@ int main(void)
             "completed)\n",
             (unsigned long long)stream2.checksum_fails, extracted2, cap.count - 1);
 
+    /* 2d. Bytes missing from the middle of the stream, as after the
+     * socket's receive buffer overflowed while the receiver was stalled:
+     * cut a run out of one middle chunk's payload. That chunk now looks
+     * shorter on the wire than its header claims, so its payload_len
+     * reaches into the chunk behind it and the checksum fails. Exactly
+     * that one chunk may be lost -- the chunks after it have to come out
+     * intact (the old code skipped the claimed length and lost the next
+     * chunk too, then spent a long byte-wise resync finding the one
+     * after). */
+    static uint8_t hole_wire[65536];
+    int hole_chunk_idx = cap.count / 2;
+    uint32_t hole_off = sizeof(junk);
+    for (int i = 0; i < hole_chunk_idx; i++)
+        hole_off += cap.lens[i];
+    hole_off += AR8030_CHUNK_HDR_SIZE + 100; /* 100 bytes into the payload */
+    const uint32_t hole_len = 57;
+    memcpy(hole_wire, wire, hole_off);
+    memcpy(hole_wire + hole_off, wire + hole_off + hole_len, wire_len - hole_off - hole_len);
+
+    struct fake_wire fw3 = { .data = hole_wire, .len = wire_len - hole_len, .pos = 0, .max_per_call = 64 };
+    static uint8_t stream_buf3[8 * (AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD)];
+    ar8030_chunk_stream_t stream3;
+    ar8030_chunk_stream_init(&stream3, fake_wire_read, &fw3, stream_buf3, sizeof(stream_buf3), 0, NULL);
+
+    int extracted3 = 0;
+    int next_idx = 0;
+    for (int guard = 0; guard < 1000000; guard++) {
+        struct ar8030_chunk_hdr hdr3;
+        uint32_t plen3 = 0;
+        int ret3 = ar8030_chunk_stream_read(&stream3, &hdr3, payload_buf, sizeof(payload_buf), &plen3);
+        if (ret3 < 0)
+            FAIL("chunk_stream_read hard error in hole test");
+        if (ret3 == 0) {
+            if (fw3.pos >= fw3.len)
+                break;
+            continue;
+        }
+        if (next_idx == hole_chunk_idx)
+            next_idx++; /* the damaged chunk is the one allowed to be missing */
+        if (hdr3.chunk_idx != next_idx)
+            FAIL("hole test: got chunk %u where chunk %d was expected", hdr3.chunk_idx, next_idx);
+        if (memcmp(payload_buf, cap.bufs[hdr3.chunk_idx] + AR8030_CHUNK_HDR_SIZE, plen3) != 0)
+            FAIL("hole test: chunk %u payload mismatch", hdr3.chunk_idx);
+        next_idx++;
+        extracted3++;
+    }
+    if (extracted3 != cap.count - 1)
+        FAIL("hole test: %d chunks came out, expected %d (only the damaged one lost)", extracted3,
+             cap.count - 1);
+    if (stream3.checksum_fails != 1)
+        FAIL("hole test: expected exactly 1 checksum failure, got %llu",
+             (unsigned long long)stream3.checksum_fails);
+    fprintf(stderr,
+            "hole test: %u bytes cut out of chunk %d, only that chunk lost (%d/%d extracted, "
+            "checksum_fails=%llu, resync_dropped=%llu B)\n",
+            hole_len, hole_chunk_idx, extracted3, cap.count, (unsigned long long)stream3.checksum_fails,
+            (unsigned long long)stream3.resync_dropped_bytes);
+
+    /* 2e. A long junk run in front (bigger than one chunk, far bigger than
+     * the read size), with fragments of the magic scattered through it so
+     * every partial-match path is hit, fed one byte at a time so a magic
+     * is also split across reads at every possible offset. Nothing may
+     * be lost or duplicated, and the drop counter has to account for
+     * exactly the junk. */
+    static uint8_t junk_wire[200000 + 65536];
+    uint32_t junk_len = 200000;
+    {
+        const uint32_t m = AR8030_CHUNK_MAGIC;
+        uint8_t mb[4];
+        memcpy(mb, &m, 4);
+        for (uint32_t i = 0; i < junk_len; i++)
+            junk_wire[i] = (uint8_t)(i * 31u + 7u);
+        for (uint32_t i = 0; i + 3 < junk_len; i += 997) {
+            uint32_t partial = 1 + (i / 997) % 3; /* 1..3 of the 4 magic bytes, never all */
+            memcpy(junk_wire + i, mb, partial);
+            junk_wire[i + partial] = (uint8_t)(mb[partial] ^ 0x55); /* break the match */
+        }
+        junk_wire[junk_len - 2] = mb[0]; /* and the run ends in a partial magic itself */
+        junk_wire[junk_len - 1] = mb[1];
+    }
+    uint32_t junk_wire_len = junk_len;
+    for (int i = 0; i < cap.count; i++) {
+        memcpy(junk_wire + junk_wire_len, cap.bufs[i], cap.lens[i]);
+        junk_wire_len += cap.lens[i];
+    }
+    struct fake_wire fw4 = { .data = junk_wire, .len = junk_wire_len, .pos = 0, .max_per_call = 1 };
+    static uint8_t stream_buf4[8 * (AR8030_CHUNK_HDR_SIZE + AR8030_CHUNK_MAX_PAYLOAD)];
+    ar8030_chunk_stream_t stream4;
+    ar8030_chunk_stream_init(&stream4, fake_wire_read, &fw4, stream_buf4, sizeof(stream_buf4), 0, NULL);
+    int extracted4 = 0;
+    for (long guard = 0; guard < 100000000L; guard++) {
+        struct ar8030_chunk_hdr hdr4;
+        uint32_t plen4 = 0;
+        int ret4 = ar8030_chunk_stream_read(&stream4, &hdr4, payload_buf, sizeof(payload_buf), &plen4);
+        if (ret4 < 0)
+            FAIL("chunk_stream_read hard error in junk test");
+        if (ret4 == 0) {
+            if (fw4.pos >= fw4.len)
+                break;
+            continue;
+        }
+        if (hdr4.chunk_idx != extracted4)
+            FAIL("junk test: got chunk %u where chunk %d was expected", hdr4.chunk_idx, extracted4);
+        if (memcmp(payload_buf, cap.bufs[extracted4] + AR8030_CHUNK_HDR_SIZE, plen4) != 0)
+            FAIL("junk test: chunk %d payload mismatch", extracted4);
+        extracted4++;
+    }
+    if (extracted4 != cap.count)
+        FAIL("junk test: %d chunks came out, expected %d", extracted4, cap.count);
+    if (stream4.resync_dropped_bytes != junk_len)
+        FAIL("junk test: dropped %llu bytes, the junk run was %u",
+             (unsigned long long)stream4.resync_dropped_bytes, junk_len);
+    if (stream4.checksum_fails != 0)
+        FAIL("junk test: unexpected checksum failures: %llu", (unsigned long long)stream4.checksum_fails);
+    fprintf(stderr, "junk test: %u junk bytes with partial magics skipped 1 byte per read, all %d chunks "
+                    "intact, drop counter exact\n",
+            junk_len, extracted4);
+
     /* 3. RTP/H.265-packetize the reassembled frame over a connected
      * AF_UNIX SOCK_DGRAM pair (same send()-on-connected-socket path
      * rx/main.c uses for the real UDP socket) and depacketize it back. */

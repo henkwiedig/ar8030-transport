@@ -21,6 +21,36 @@ void ar8030_chunk_stream_init(ar8030_chunk_stream_t *s, ar8030_chunk_read_fn rea
     s->checksum_fails = 0;
 }
 
+/* Number of leading bytes of buf[0..len) that are junk for certain: the
+ * offset of the first complete chunk magic, or, with no complete match,
+ * everything but the last three bytes (which may be the start of a magic
+ * that the next read completes).
+ *
+ * One memchr() pass for the magic's first byte instead of testing every
+ * offset, and the caller then drops the whole junk run with a single
+ * memmove(): resyncing a buffer of n bytes costs O(n), not the O(n) per
+ * dropped byte of shifting it down one byte at a time (measured on the
+ * VR04: 223 us per dropped byte with a 262 KB buffer, so a 47 KB junk run
+ * kept the receiver busy for seconds and let the socket overflow again). */
+static uint32_t scan_for_magic(const uint8_t *buf, uint32_t len)
+{
+    const uint32_t magic = AR8030_CHUNK_MAGIC;
+    uint8_t mb[sizeof(magic)];
+    memcpy(mb, &magic, sizeof(mb));
+
+    uint32_t i = 0;
+    while (len - i >= sizeof(mb)) {
+        const uint8_t *p = memchr(buf + i, mb[0], len - i - (sizeof(mb) - 1));
+        if (!p)
+            break;
+        i = (uint32_t)(p - buf);
+        if (memcmp(p, mb, sizeof(mb)) == 0)
+            return i;
+        i++;
+    }
+    return len >= sizeof(mb) - 1 ? len - (uint32_t)(sizeof(mb) - 1) : 0;
+}
+
 /* Appends whatever read_fn() has available right now. Returns 1 if it
  * added bytes, 0 on timeout/no-data. */
 static int fill(ar8030_chunk_stream_t *s)
@@ -44,13 +74,11 @@ int ar8030_chunk_stream_read(ar8030_chunk_stream_t *s, struct ar8030_chunk_hdr *
         if (s->stop_flag && *s->stop_flag)
             return 0;
 
-        /* Resync: while we have enough buffered bytes to even ask the
-         * question, keep dropping one leading byte at a time until
-         * buf[0..HDR_SIZE) looks like a real header. In steady state this
-         * loop body never runs more than once (the previous call already
-         * left a valid header at the front, or none at all) -- it only
-         * does real work right after a corrupted read or a sender
-         * restart mid-stream.
+        /* Resync: drop everything in front of the next chunk magic. In
+         * steady state there is nothing to drop (the previous call left
+         * a valid header at the front, or none at all) -- it only does
+         * real work right after a corrupted read, a hole in the stream
+         * or a sender restart mid-stream.
          *
          * magic is the only field this can validate: payload_len can no
          * longer be range-checked against AR8030_CHUNK_MAX_PAYLOAD as a
@@ -59,15 +87,17 @@ int ar8030_chunk_stream_read(ar8030_chunk_stream_t *s, struct ar8030_chunk_hdr *
          * by construction, so that comparison would always be true. The
          * actual bound that matters for memory safety (payload_len vs.
          * payload_buf_cap) is still checked below, per chunk. */
-        while (s->len >= AR8030_CHUNK_HDR_SIZE) {
-            memcpy(hdr, s->buf, AR8030_CHUNK_HDR_SIZE);
-            if (hdr->magic == AR8030_CHUNK_MAGIC)
-                break;
-            memmove(s->buf, s->buf + 1, --s->len);
-            s->resync_dropped_bytes++;
+        if (s->len >= sizeof(uint32_t)) {
+            uint32_t junk = scan_for_magic(s->buf, s->len);
+            if (junk) {
+                s->len -= junk;
+                memmove(s->buf, s->buf + junk, s->len);
+                s->resync_dropped_bytes += junk;
+            }
         }
 
         if (s->len >= AR8030_CHUNK_HDR_SIZE) {
+            memcpy(hdr, s->buf, AR8030_CHUNK_HDR_SIZE);
             uint32_t need = (uint32_t)AR8030_CHUNK_HDR_SIZE + hdr->payload_len;
             if (s->len >= need) {
                 if (hdr->payload_len > payload_buf_cap)
@@ -75,21 +105,30 @@ int ar8030_chunk_stream_read(ar8030_chunk_stream_t *s, struct ar8030_chunk_hdr *
 
                 const uint8_t *payload = s->buf + AR8030_CHUNK_HDR_SIZE;
                 int checksum_ok = (ar8030_crc16(payload, hdr->payload_len) == hdr->checksum);
-                if (hdr->payload_len)
-                    memcpy(payload_buf, payload, hdr->payload_len);
-
-                /* Either way, this chunk's bytes are spent: a checksum
-                 * failure means the header was fine (nothing to resync
-                 * past) and the payload is simply corrupt, so skip past
-                 * it and keep looking for the next chunk in this same
-                 * call rather than handing corrupt video data upstream. */
-                memmove(s->buf, s->buf + need, s->len - need);
-                s->len -= need;
 
                 if (!checksum_ok) {
+                    /* Not even payload_len can be trusted now: bytes lost
+                     * from the middle of the stream (the socket's receive
+                     * buffer overflowing while this process was stalled)
+                     * make a chunk look shorter on the wire than its
+                     * header claims, so the claimed length reaches into
+                     * the chunks behind it. Skipping that length would
+                     * throw those away as well and force a long resync;
+                     * dropping just the magic lets the next scan pick the
+                     * following chunk up wherever it really starts. A
+                     * chunk that was only corrupted in place costs the
+                     * same either way: the scan passes over its payload. */
                     s->checksum_fails++;
+                    s->len -= sizeof(uint32_t);
+                    memmove(s->buf, s->buf + sizeof(uint32_t), s->len);
+                    s->resync_dropped_bytes += sizeof(uint32_t);
                     continue;
                 }
+
+                if (hdr->payload_len)
+                    memcpy(payload_buf, payload, hdr->payload_len);
+                memmove(s->buf, s->buf + need, s->len - need);
+                s->len -= need;
 
                 *out_payload_len = hdr->payload_len;
                 s->chunks_read++;

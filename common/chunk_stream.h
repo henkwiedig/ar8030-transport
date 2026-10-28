@@ -9,10 +9,10 @@
  * sender: it can return less than one chunk, more than one concatenated,
  * or a chunk split across several read() calls. This buffers and
  * reassembles the byte stream into discrete chunks using
- * ar8030_chunk_hdr.payload_len, and resyncs (byte-at-a-time) if the
- * expected magic doesn't validate at the current position -- which
- * should only happen right after a corrupted read or a sender restart
- * mid-stream, not in steady state.
+ * ar8030_chunk_hdr.payload_len, and resyncs (scanning forward for the
+ * next magic) if the expected magic doesn't validate at the current
+ * position -- which should only happen right after bytes were lost from
+ * the stream or a sender restart mid-stream, not in steady state.
  *
  * The actual read is injected as a callback (matching chunker.h's
  * ar8030_chunk_send_fn) rather than calling bb_socket_read() directly, so
@@ -45,16 +45,17 @@ typedef struct {
      * bytes_consumed count only chunks returned to the caller (well-formed
      * header AND a passing payload checksum). resync_dropped_bytes counts
      * bytes discarded while scanning past a bad magic to find the next
-     * real header -- it should stay at (or very near) zero in steady
-     * state; anything climbing steadily means the stream lost alignment,
-     * e.g. a corrupted read or the sender having restarted mid-stream.
-     * checksum_fails counts chunks with a well-formed header (valid magic,
-     * in-range payload_len) whose payload's CRC16 didn't match -- i.e. the
-     * bytes arrived with the framing intact but corrupted content, which
-     * resyncing can't catch or fix (the header itself was fine, so there
-     * is nothing to resync past); such a chunk is silently skipped, never
-     * handed to the caller, since forwarding known-corrupt video data is
-     * worse than treating it as lost. */
+     * real header (including the magic of a chunk whose checksum failed)
+     * -- it should stay at (or very near) zero in steady state; anything
+     * climbing steadily means the stream lost alignment, e.g. bytes lost
+     * from it or the sender having restarted mid-stream.
+     * checksum_fails counts chunks with a valid magic whose payload's
+     * CRC16 didn't match -- corrupted content, or bytes missing from the
+     * middle so the payload_len ran into the next chunk; such a chunk is
+     * never handed to the caller, since forwarding known-corrupt video
+     * data is worse than treating it as lost. Only its magic is dropped:
+     * the scan for the next header then starts right behind it, so
+     * intact chunks inside its claimed length survive. */
     uint64_t chunks_read;
     uint64_t bytes_consumed;
     uint64_t resync_dropped_bytes;
