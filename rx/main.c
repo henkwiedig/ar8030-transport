@@ -26,6 +26,7 @@
 #include "clock_sync.h"
 #include "reassembly.h"
 #include "rtp_h265.h"
+#include "rx_log.h"
 #include "sidecar_srv.h"
 #include "timing_sei.h"
 
@@ -102,6 +103,7 @@ struct rx_args {
     int sidecar_port; /* serve the tunnelled waybeam sidecar here, 0 = off */
     int timing_sei;   /* insert the per-frame timing SEI (common/timing_sei.h) */
     int verbose;
+    const char *log_path; /* -L, NULL = stderr as inherited */
 };
 
 static void usage(const char *argv0)
@@ -122,9 +124,11 @@ static void usage(const char *argv0)
 
             "  -v             print periodic in/out stats to stderr (chunks, resyncs, frames, "
             "bytes, RTP output)\n"
+            "  -L <file>      write stdout/stderr to <file>, rotated at %d KB, %d old files kept\n"
             "  -h             this help\n",
             argv0, DEFAULT_DAEMON_IP, DEFAULT_VIDEO_PORT, DEFAULT_TARGET_HOST, DEFAULT_TARGET_PORT,
-            DEFAULT_MAX_RTP_PAYLOAD, DEFAULT_REASSEMBLY_MAX, DEFAULT_SIDECAR_PORT);
+            DEFAULT_MAX_RTP_PAYLOAD, DEFAULT_REASSEMBLY_MAX, DEFAULT_SIDECAR_PORT, RX_LOG_MAX_BYTES / 1024,
+            RX_LOG_KEEP);
 }
 
 static int parse_args(int argc, char **argv, struct rx_args *a)
@@ -140,10 +144,14 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
     a->sidecar_port = DEFAULT_SIDECAR_PORT;
     a->timing_sei = 1;
     a->verbose = 0;
+    a->log_path = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:Tvh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:TvL:h")) != -1) {
         switch (opt) {
+        case 'L':
+            a->log_path = optarg;
+            break;
         case 'C':
             a->sidecar_port = atoi(optarg);
             break;
@@ -327,6 +335,8 @@ int main(int argc, char **argv)
     struct rx_args args;
     if (parse_args(argc, argv, &args) != 0)
         return 1;
+    if (args.log_path)
+        rx_log_open(args.log_path); /* on failure: carry on, logging to the inherited stderr */
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

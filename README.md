@@ -894,6 +894,17 @@ than only knowing that they did:
   stays near zero) points at loss/corruption severe enough that some
   chunk of nearly every frame is unusable.
 
+Where the lines land on a deployed unit: the air unit's
+`S65ar8030-transport-tx` redirects tx's output to
+`/tmp/ar8030/ar8030-transport-tx.log`, emptied on every tx start. The
+ground's `S98ar8030-transport-rx` runs `rx -v -L
+/tmp/ar8030/ar8030-transport-rx.log`. `-L` sends rx's stdout and stderr
+to that file and rotates it at 1 MB, keeping `.1` and `.2`, which is
+about 35 minutes per file at `-v`'s rate. The ground stays on for hours
+in RAM-backed `/tmp`, so a plain redirect would grow without bound. A
+restart keeps the previous run's log as `.1`. The ground support package
+(`collect_support_data.sh`) copies every file in `/tmp/ar8030/`.
+
 ## Bench findings (Caddx Ascent Hi3516CV610 air unit)
 
 - **What led to the datagram → stream mode switch above.** The first,
