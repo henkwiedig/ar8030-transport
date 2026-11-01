@@ -27,6 +27,9 @@
 #define CLOCK_SYNC_WINDOW 16
 #define CLOCK_SYNC_PERIOD_MS 500      /* steady state */
 #define CLOCK_SYNC_FAST_PERIOD_MS 100 /* until the first window is full */
+/* A live exchange takes ~25 ms; a reply far slower than this answers a
+ * probe that waited for the link (clock_sync_on_reply()). */
+#define CLOCK_SYNC_MAX_RTT_US 250000
 
 typedef struct {
     pthread_mutex_t mu;
@@ -39,6 +42,8 @@ typedef struct {
     uint32_t seq;
     uint64_t last_sent_us;
     uint64_t replies;
+    uint64_t stale;          /* replies dropped as answers to probes that waited for the link */
+    uint64_t stale_until_us; /* arrival of the last reply over CLOCK_SYNC_MAX_RTT_US */
 } clock_sync_t;
 
 uint64_t clock_sync_now_us(void); /* ground CLOCK_MONOTONIC, us */

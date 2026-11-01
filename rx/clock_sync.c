@@ -42,6 +42,24 @@ void clock_sync_on_reply(clock_sync_t *cs, uint64_t t1_us, uint64_t t2_us, uint6
     int64_t offset = (((int64_t)t2_us - (int64_t)t1_us) + ((int64_t)t3_us - (int64_t)t4_us)) / 2;
 
     pthread_mutex_lock(&cs->mu);
+    /* Probes sent while the link is down wait in the ground's queues and
+     * are all answered once it comes up, seconds or minutes later. Their
+     * whole wait is on the way up, so each one's offset is off by half its
+     * age, and as they drain, each a little younger than the one before,
+     * the min-rtt pick walks the estimate back to the truth one step per
+     * reply -- every step a jump in the capture times downstream, which a
+     * display pacing frames by them takes for clock steps and keeps. None
+     * of that is a measurement: drop it, and keep what the window holds.
+     * The youngest of the backlog come back under any rtt bound, still
+     * lopsided by the queue they sat in; every probe that went out before
+     * the last stale reply came in sat in it, so those go too. */
+    if (rtt > CLOCK_SYNC_MAX_RTT_US || t1_us < cs->stale_until_us) {
+        if (rtt > CLOCK_SYNC_MAX_RTT_US && t4_us > cs->stale_until_us)
+            cs->stale_until_us = t4_us;
+        cs->stale++;
+        pthread_mutex_unlock(&cs->mu);
+        return;
+    }
     /* An offset that no round trip in the window can explain means the air
      * clock itself jumped (the air unit rebooted): the old samples describe
      * a clock that no longer exists, so start over rather than let their

@@ -139,6 +139,45 @@ static void test_clock_sync(void)
     CHECK(off == new_offset, "after an air reboot offset is %lld, want %lld", (long long)off,
           (long long)new_offset);
 
+    /* The ground waits two minutes for its air (pairing, or booted first),
+     * probing every 100 ms all the while; at link-up the queue drains in
+     * 1.7 s and the air answers every probe as it comes in. The replies to
+     * probes sent during the last 250 ms of the drain have a plausible
+     * rtt, but they sat in the same queue: no estimate may come out of
+     * the backlog at all, and the first live exchange must be exact. */
+    {
+        clock_sync_t cs4;
+        clock_sync_init(&cs4);
+        const uint64_t up_at = 120000000, drain = 1700000;
+        unsigned accepted = 0;
+        for (uint64_t t1s = 100000; t1s < up_at + drain; t1s += 100000) {
+            uint64_t arrive = up_at + (t1s < up_at ? (t1s * drain) / up_at : drain) + 12000;
+            if (arrive < t1s + 12000)
+                arrive = t1s + 12000;
+            exchange(&cs4, t1s, offset, arrive - t1s, 300, 12000);
+            if (clock_sync_get(&cs4, &off, &unc) && accepted++ == 0)
+                CHECK(0, "probe sent at %llu ms: estimate %lld us off", (unsigned long long)(t1s / 1000),
+                      (long long)(off - offset));
+        }
+        CHECK(cs4.stale == up_at / 100000 + drain / 100000 - 1, "%llu stale replies dropped",
+              (unsigned long long)cs4.stale);
+        exchange(&cs4, up_at + drain + 100000, offset, 12000, 300, 12000);
+        clock_sync_get(&cs4, &off, &unc);
+        CHECK(off == offset, "after a live exchange the offset is %lld us off", (long long)(off - offset));
+
+        /* A window that already holds live samples keeps them through the
+         * same drain: the estimate never moves. */
+        clock_sync_t cs5;
+        clock_sync_init(&cs5);
+        for (int i = 0; i < 4; i++)
+            exchange(&cs5, 1000 + i * 100000, offset, 12000, 300, 12000);
+        for (uint64_t t1s = 600000; t1s < up_at - 300000; t1s += 500000)
+            exchange(&cs5, t1s, offset, up_at - t1s, 300, 12000);
+        clock_sync_get(&cs5, &off, &unc);
+        CHECK(off == offset && cs5.n == 4, "a drain moved a live estimate by %lld us (%u samples)",
+              (long long)(off - offset), cs5.n);
+    }
+
     uint32_t seq;
     uint64_t t1;
     clock_sync_t cs3;
@@ -158,6 +197,7 @@ int main(void)
         return 1;
     }
     printf("timing test: SEI emulation prevention, insert and parse round trip; clock sync picks the "
-           "min-rtt sample, stays within its bound, and resets on an air reboot\nPASS\n");
+           "min-rtt sample, stays within its bound, resets on an air reboot, and drops replies to probes that "
+           "waited for the link\nPASS\n");
     return 0;
 }

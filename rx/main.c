@@ -478,15 +478,16 @@ int main(int argc, char **argv)
                 uint32_t unc;
                 if (clock_sync_get(&sync, &off, &unc))
                     fprintf(stderr,
-                            "rx timing: air-ground offset %" PRId64 " us +-%u us (%llu sync replies) | "
+                            "rx timing: air-ground offset %" PRId64 " us +-%u us (%llu sync replies, %llu stale) | "
                             "capture->rx %.2f ms avg, %.2f max | encode %.2f ms | frames lost %u | "
                             "sidecar %llu\n",
-                            off, unc, (unsigned long long)sync.replies,
+                            off, unc, (unsigned long long)sync.replies, (unsigned long long)sync.stale,
                             air_latency_n ? air_latency_sum_ms / air_latency_n : 0.0, air_latency_max_ms,
                             sidecar.encode_avg_us / 1000.0, frames_lost,
                             (unsigned long long)sidecar.published);
                 else
-                    fprintf(stderr, "rx timing: no clock sync reply from the air unit yet\n");
+                    fprintf(stderr, "rx timing: no clock sync reply from the air unit yet (%llu stale)\n",
+                            (unsigned long long)sync.stale);
                 air_latency_sum_ms = 0;
                 air_latency_max_ms = 0;
                 air_latency_n = 0;
