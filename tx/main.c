@@ -201,7 +201,8 @@ static void usage(const char *argv0)
             "  -C <rules|pi>  bitrate controller: rule-based (default) or feedforward + PI on the\n"
             "                 air-side delay (see bitrate_ctl.c and tools/bc_replay)\n"
             "  -p <key=value> override a PI tunable, repeatable: pi_recover_per_s, pi_severe_k,\n"
-            "                 pi_retx_severe_events, pi_mild_trim, pi_k_max, pi_delay_set_ms\n"
+            "                 pi_retx_severe_events, pi_mild_trim, pi_k_max, pi_delay_set_ms,\n"
+            "                 pi_write_cost_ms\n"
             "  -S <port>      forward waybeam's RTP timing sidecar from this loopback UDP port\n"
             "                 (waybeam outgoing.sidecarPort) to the ground (default 0 = off)\n"
 
@@ -228,7 +229,7 @@ static int apply_pi_param(bitrate_ctl_cfg_t *c, const char *kv)
 #define PI_D(f) if (n == strlen(#f) && !strncmp(kv, #f, n)) { c->f = v; return 0; }
 #define PI_I(f) if (n == strlen(#f) && !strncmp(kv, #f, n)) { c->f = (int)v; return 0; }
     PI_D(pi_recover_per_s) PI_D(pi_severe_k) PI_I(pi_retx_severe_events)
-    PI_D(pi_mild_trim) PI_D(pi_k_max) PI_D(pi_delay_set_ms)
+    PI_D(pi_mild_trim) PI_D(pi_k_max) PI_D(pi_delay_set_ms) PI_D(pi_write_cost_ms)
 #undef PI_D
 #undef PI_I
     return -1;
@@ -875,6 +876,11 @@ int main(int argc, char **argv)
      * about half the dropped frames and delay spikes. */
     bc_cfg.mode = args.bc_mode;
     bc_cfg.pi_delay_set_ms = 15; /* link-side queueing delay, not capture -> write */
+    /* Every bb_socket_write() costs about this much on top of moving its
+     * bytes: a 500-byte slice took 1.3 ms at MCS -1 (walk 2026-11-03), and a
+     * 22 Mbit/s frame took 10.3 ms in one write but 13.3 ms in three (bench,
+     * same day). See the delay computation in the send loop. */
+    bc_cfg.pi_write_cost_ms = 1.5;
     bc_cfg.pi_kp_up = 0.006;
     bc_cfg.pi_kp_down = 0.02;
     bc_cfg.pi_ki_up = 0.01;
@@ -1005,12 +1011,13 @@ int main(int argc, char **argv)
                 print_tx_stats(&stats, &stats_prev, now - stats_last_print, ring);
                 uint64_t wf = stats.write_frames - stats_prev.write_frames;
                 fprintf(stderr, "tx stats: pts age %.2f ms | capture->write start %.2f ms avg | frame write %.2f ms avg, "
-                        "%.2f max | sidecar forwarded=%llu | outq dropped=%llu\n",
+                        "%.2f max | sidecar forwarded=%llu | outq dropped=%llu | delay %.1f ms\n",
                         pts_age_us / 1000.0,
                         wf ? (stats.age_at_send_us_sum - stats_prev.age_at_send_us_sum) / 1000.0 / wf : 0.0,
                         wf ? (stats.write_us_sum - stats_prev.write_us_sum) / 1000.0 / wf : 0.0,
                         stats.write_us_max / 1000.0, (unsigned long long)sc_cfg.forwarded,
-                        (unsigned long long)outq.dropped);
+                        (unsigned long long)outq.dropped,
+                        __atomic_load_n(&bc_cfg.delay_us, __ATOMIC_ACQUIRE) / 1000.0);
                 stats.write_us_max = 0;
                 stats_prev = stats;
                 stats_last_print = now;
@@ -1268,7 +1275,22 @@ int main(int argc, char **argv)
             prev_pts = meta.pts;
             venc_frame_ring_fill_t fill;
             uint32_t behind = venc_frame_ring_get_fill(ring, &fill) == 0 ? fill.used_slots / entries_per_frame : 0;
-            double d_us = (double)behind * frame_period_us + (double)write_us;
+            /* A sliced frame takes one write per slice, and each write has a
+             * fixed cost that is no queueing (pi_write_cost_ms). Count the
+             * frame as one write, so the setpoint holds the link where it
+             * held it before slices: 3 slices read ~3 ms more at the same
+             * bitrate (bench 2026-11-03, 22 Mbit/s: D ~10.5 ms per second
+             * with the correction). A write longer than the frame interval
+             * still leaves frames waiting and D past the setpoint for a
+             * moment: that is queueing. Never below the average write:
+             * that much the radio did take. */
+            double w_us = (double)write_us;
+            if (entries_per_frame > 1) {
+                double fixed_us = (double)(entries_per_frame - 1) * bc_cfg.pi_write_cost_ms * 1000.0;
+                double floor_us = w_us / entries_per_frame;
+                w_us = w_us - fixed_us > floor_us ? w_us - fixed_us : floor_us;
+            }
+            double d_us = (double)behind * frame_period_us + w_us;
             delay_ewma_us = delay_ewma_us ? delay_ewma_us + (d_us - delay_ewma_us) / 8.0 : d_us;
             __atomic_store_n(&bc_cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);
             __atomic_store_n(&bc_cfg.last_tx_done_ms, write_end_us / 1000, __ATOMIC_RELEASE);

@@ -195,6 +195,16 @@ top of a picture while the encoder works on the bottom:
   is the time spent inside the writes (between slices tx waits on the
   encoder, which is no link delay), and ring backlog is divided by the
   entries the last frame took (`entries_per_frame` in `tx/bitrate_ctl.h`).
+- Each write costs ~1.3-1.5 ms on top of moving its bytes (a 500-byte slice
+  takes 1.3 ms at MCS -1; at 22 Mbit/s a frame takes 10.3 ms in one write,
+  13.3 ms in three). The PI's delay takes that off once per extra write
+  (`-p pi_write_cost_ms=1.5`), so the 15 ms setpoint means what it meant
+  before slices: at 22 Mbit/s on a clean bench link D reads ~10.5 ms per
+  second instead of ~13.5. Short dips remain: a frame write sometimes takes
+  20-27 ms, longer than the 16.7 ms frame interval, one or two frames wait
+  in the ring, D passes the setpoint for a second and the PI cuts 5-25 %
+  and climbs back (bench 2026-11-03: about every 20 s). The -v stats line
+  ends with the PI's current delay.
 
 Bench, Ascent Lite (OS02K10 1080p60) to the VRX Pro, 3 slices: capture ->
 reassembled on the ground 34.3 -> 27.9 ms average at a fixed 16 Mbit/s, and

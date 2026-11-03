@@ -212,6 +212,10 @@ typedef struct {
     uint64_t ring_flushed_ms;
 
     double pi_delay_set_ms;  /* queueing-delay setpoint, e.g. 10 */
+    double pi_write_cost_ms; /* fixed cost of one bb_socket_write() on top of
+                              * moving its bytes; tx/main.c takes it off the
+                              * delay once per extra write a sliced frame
+                              * needed, e.g. 1.5 */
     double pi_kp_up, pi_kp_down; /* proportional gain per ms of error */
     double pi_ki_up, pi_ki_down; /* integral gain per ms of error per s */
     double pi_k_min, pi_k_max;   /* bounds of k (rate = C * margin * k) */
