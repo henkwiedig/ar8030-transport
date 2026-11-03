@@ -300,14 +300,16 @@ int bitrate_ctl_congested(void)
  * written after the flush (see cfg->ring_flushed_ms). */
 #define RING_FLUSH_SETTLE_MS (2 * VENC_RING_LOW_WATER_WINDOW_US / 1000)
 
-/* waybeam's low_water_slots, or 0 while it may still describe frames
- * tx/main.c flushed. */
+/* waybeam's low_water_slots in frames, or 0 while it may still describe
+ * frames tx/main.c flushed. */
 static uint16_t ring_low_water(const bitrate_ctl_cfg_t *cfg, const venc_frame_ring_t *ring, uint64_t now)
 {
     uint64_t flushed = __atomic_load_n(&cfg->ring_flushed_ms, __ATOMIC_ACQUIRE);
     if (flushed && now < flushed + RING_FLUSH_SETTLE_MS)
         return 0;
-    return __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+    uint32_t per = __atomic_load_n(&cfg->entries_per_frame, __ATOMIC_RELAXED);
+    uint16_t slots = __atomic_load_n(&ring->hdr->low_water_slots, __ATOMIC_RELAXED);
+    return per > 1 ? (uint16_t)(slots / per) : slots;
 }
 
 static void subscribe_events(const bitrate_ctl_cfg_t *cfg)

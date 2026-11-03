@@ -65,9 +65,24 @@
  * would be read downstream as damage on every frame that set it.  Absence is
  * not a guarantee of integrity -- only its presence is a positive statement. */
 #define VENC_FRAME_FLAG_SALVAGED 0x08
+/* This entry is one slice of an access unit, and more of the same access
+ * unit follows in the next entry: the producer publishes each slice the
+ * moment the encoder hands it out (CV610 video0.sliceOutput), so the link can
+ * start sending a picture while the rest of it is still being encoded.  The
+ * access unit's last slice is published WITHOUT this flag, so an entry
+ * without it ends an access unit -- or is one, as without slice output.
+ *
+ * Every slice of one access unit carries the same pts and the same
+ * IDR/GDR/ENHANCE flags and GDR position.  An entry whose pts differs from
+ * the open access unit's starts a new one: the open one has lost its end
+ * (the producer stops publishing an access unit's slices after one did not
+ * fit the ring) and is incomplete.  A consumer that does not handle this
+ * flag would take every slice for a picture, so a producer sets it only when
+ * slice output was asked for. */
+#define VENC_FRAME_FLAG_PARTIAL  0x10
 
 typedef struct {
-	uint32_t pts;        /* capture timestamp (µs, truncated to 32 bits) */
+	uint32_t pts;        /* capture timestamp (µs, CLOCK_MONOTONIC, truncated to 32 bits) */
 	uint8_t  codec;      /* VENC_FRAME_CODEC_H265 */
 	uint8_t  flags;      /* VENC_FRAME_FLAG_*; venc sets IDR/GDR/ENHANCE */
 	uint8_t  gdr_pos;    /* 0-based position in GDR cycle (0 when inactive) */

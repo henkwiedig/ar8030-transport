@@ -28,6 +28,7 @@ typedef struct {
     uint32_t frame_pts;
     uint8_t flags;
     int active;
+    int done; /* the last feed() completed this frame (cleared by the next one) */
 
     /* Lifetime counters for -v stats reporting (rx/main.c) -- persist
      * across ar8030_reassembly_reset() calls, unlike everything above.

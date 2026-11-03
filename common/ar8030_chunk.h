@@ -73,6 +73,16 @@
 #define AR8030_CHUNK_FLAG_GDR 0x02u
 #define AR8030_CHUNK_FLAG_ENHANCE 0x04u
 
+/* A frame sent while it is still being encoded (waybeam video0.sliceOutput:
+ * each slice leaves the encoder, and tx sends it, before the next one is
+ * done). Its total chunk count is not known when its first chunks go out,
+ * so every chunk of such a frame carries chunk_count 0, except the last:
+ * that one carries AR8030_CHUNK_FLAG_FRAME_END and the real count
+ * (chunk_idx + 1). The receiver completes the frame on that flag. A frame
+ * sent whole keeps a real chunk_count on every chunk and never sets this
+ * flag. Chunk-level, not frame-level: never copied from VencFrameMeta. */
+#define AR8030_CHUNK_FLAG_FRAME_END 0x80u
+
 #define AR8030_CHUNK_CODEC_H265 0x01u
 /* A chunk of this codec carries one whole, already RTP-packetized audio
  * datagram (waybeam's cv610_audio.c own RTP/Opus packetizer output, PT=98)
@@ -119,7 +129,8 @@ struct ar8030_chunk_hdr {
     uint32_t magic;       /* AR8030_CHUNK_MAGIC */
     uint16_t frame_seq;   /* wraps; one value per source frame */
     uint16_t chunk_idx;   /* 0-based index within this frame */
-    uint16_t chunk_count; /* total chunks this frame was split into */
+    uint16_t chunk_count; /* total chunks this frame was split into; 0 while
+                           * unknown (see AR8030_CHUNK_FLAG_FRAME_END) */
     uint16_t payload_len; /* bytes following this header for this chunk;
                             * see the file header comment on why stream
                             * mode makes this load-bearing, not advisory */

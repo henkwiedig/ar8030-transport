@@ -170,6 +170,38 @@ params) rather than an internal fixed-size array, specifically so a
 a RAM-constrained target — `tx/main.c` mallocs it once at startup, sized
 to the actual `-c` in use, not the ceiling.
 
+## Streamed frames: slices sent while the picture is still encoding
+
+With waybeam's CV610 `video0.sliceOutput` the encoder hands out each slice
+as soon as its rows are encoded, and waybeam puts it on the frame-shm ring as
+an entry of its own, flagged `VENC_FRAME_FLAG_PARTIAL` until the picture's
+last slice (`third_party/waybeam_frame_ring/venc_frame_ring.h`). tx sends
+each such entry the moment it reads it, so the radio is already carrying the
+top of a picture while the encoder works on the bottom:
+
+- One `frame_seq` for the whole picture; `chunk_idx` runs on across its
+  slices (`ar8030_chunk_part()` in `common/chunker.c`).
+- `chunk_count` is 0 on every chunk but the last: the total is not known
+  when the first slice goes out. The last chunk carries
+  `AR8030_CHUNK_FLAG_FRAME_END` (0x80) and the real count.
+- rx completes the frame on that flag and hands on the whole picture as
+  before, so nothing downstream changes. A picture whose end never comes
+  (a slice that did not fit waybeam's ring, a failed write) is dropped when
+  the next `frame_seq` starts, like any incomplete frame.
+- A picture published whole (one slice, no slice output, or the P1) goes out
+  exactly as before. There is no negotiation: the air side decides by its
+  waybeam config, and every rx since this change reads both kinds.
+- The link controller keeps counting frames, not ring entries: "frame write"
+  is the time spent inside the writes (between slices tx waits on the
+  encoder, which is no link delay), and ring backlog is divided by the
+  entries the last frame took (`entries_per_frame` in `tx/bitrate_ctl.h`).
+
+Bench, Ascent Lite (OS02K10 1080p60) to the VRX Pro, 3 slices: capture ->
+reassembled on the ground 34.3 -> 27.9 ms average at a fixed 16 Mbit/s, and
+38.3 -> 30.2 ms average (53.0 -> 43.8 ms max) under the PI controller at
+~22 Mbit/s. Each slice is one more `bb_socket_write()` (about 1 ms): 2-4
+slices gain about the same, 6 lose part of it again and stall now and then.
+
 ## Embedded audio (Majestic-style, on a separate `bb_socket` port)
 
 `audio_tx`/`audio_rx` bridge waybeam's optional audio output across the

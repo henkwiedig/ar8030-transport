@@ -193,6 +193,11 @@ typedef struct {
     uint32_t delay_us;
     uint64_t last_tx_done_ms;
 
+    /* Ring entries per frame, written by tx/main.c's send loop (__atomic):
+     * with waybeam's slice output every slice is an entry of its own, and
+     * the ring backlog checks count frames, not slices. 0 reads as 1. */
+    uint32_t entries_per_frame;
+
     /* Bumped by tx/main.c (__atomic) each time it reattaches to the ring
      * of a restarted waybeam. waybeam comes back with its configured
      * bitrate and fpv.roiEnabled and at the full frame rate, so PI mode

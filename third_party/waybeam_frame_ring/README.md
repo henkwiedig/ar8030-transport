@@ -7,7 +7,8 @@ need waybeam checked out on the ground side, and so `ar8030-transport-tx`
 builds against a pinned, known-good copy instead of a moving sibling
 checkout.
 
-- Source commit: `cd3c5a27a9a515bcdd76900de1558bd342c3d10d`
+- Source commit: `cd3c5a27a9a515bcdd76900de1558bd342c3d10d`; `venc_frame_ring.h`
+  re-copied from waybeam `slice-output` (0.87.0) for `VENC_FRAME_FLAG_PARTIAL`
   (`include/venc_frame_ring.h`, `src/venc_frame_ring.c`)
 - License: MIT (see `LICENSE` in this directory, copied from upstream)
 - Ring format version pinned by these files: `VENC_FRAME_RING_VERSION` = 2

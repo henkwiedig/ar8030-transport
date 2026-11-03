@@ -979,6 +979,19 @@ int main(int argc, char **argv)
     double last_health_check_s = now_monotonic_s();
 
     uint16_t frame_seq = 0;
+    /* The frame being sent slice by slice, see the read loop below. */
+    struct {
+        int open;
+        int failed;
+        uint32_t pts;
+        uint8_t flags;
+        uint32_t next_idx; /* chunk_idx of its next chunk */
+        uint32_t sent;     /* chunks written */
+        uint32_t entries;  /* ring entries (slices) so far */
+        uint64_t write_us; /* time spent in its writes */
+    } sf = {0};
+    /* Ring entries the last frame took, for counting backlog in frames. */
+    uint32_t entries_per_frame = 1;
     /* air CLOCK_MONOTONIC (low 32 bits, us) minus the frame's pts when it
      * was read off the ring. The ground's latency figures assume pts is
      * CLOCK_MONOTONIC too, so this must be a small positive number (encode
@@ -1162,17 +1175,68 @@ int main(int argc, char **argv)
                     pts_age_us);
         }
 
-        stats.frames_in++;
+        /* A frame whose slices come as entries of their own (waybeam
+         * video0.sliceOutput) goes out slice by slice, as each is read: the
+         * radio starts on the picture while the encoder is still on the rest
+         * of it. See AR8030_CHUNK_FLAG_FRAME_END for how the ground tells
+         * where it ends. An entry with another pts while one is open means
+         * the open one lost its end on the air side: the ground drops it
+         * when this frame_seq moves on. */
+        int partial = (meta.flags & VENC_FRAME_FLAG_PARTIAL) != 0;
+        if (sf.open && meta.pts != sf.pts) {
+            stats.frames_incomplete++;
+            frame_seq++;
+            sf.open = 0;
+        }
         uint32_t expected_chunks = 0;
         uint64_t write_start_us = now_monotonic_us();
-        stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
-        send_ctx.last_write_ret = 0;
-        int sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
-                                       meta.pts, frame_data, frame_len, args.chunk_payload,
-                                       chunk_send_to_socket, &send_ctx, &expected_chunks, chunk_scratch,
-                                       chunk_scratch_size);
+        int sent;
+        uint64_t write_us;
+        if (partial || sf.open) {
+            if (!sf.open) {
+                memset(&sf, 0, sizeof(sf));
+                sf.open = 1;
+                sf.pts = meta.pts;
+                sf.flags = frame_flags_from_meta(&meta);
+                stats.frames_in++;
+                stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
+                send_ctx.last_write_ret = 0;
+            }
+            uint32_t n = 0;
+            int s = 0;
+            /* After a failed chunk the rest of the frame is of no use. */
+            if (!sf.failed)
+                s = ar8030_chunk_part(frame_seq, sf.flags, AR8030_CHUNK_CODEC_H265, meta.pts, frame_data,
+                                      frame_len, args.chunk_payload, sf.next_idx, !partial,
+                                      chunk_send_to_socket, &send_ctx, &n, chunk_scratch, chunk_scratch_size);
+            if (s < 0 || (uint32_t)s != n)
+                sf.failed = 1;
+            if (s > 0)
+                sf.sent += (uint32_t)s;
+            sf.next_idx += n;
+            sf.entries++;
+            /* Time spent in the writes, not since the first one: between
+             * slices tx waits on the encoder, which is no link delay. */
+            sf.write_us += now_monotonic_us() - write_start_us;
+            if (partial)
+                continue;
+            sf.open = 0;
+            sent = (int)sf.sent;
+            expected_chunks = sf.next_idx;
+            write_us = sf.write_us;
+            entries_per_frame = sf.entries;
+        } else {
+            stats.frames_in++;
+            stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
+            send_ctx.last_write_ret = 0;
+            sent = ar8030_chunk_frame(frame_seq, frame_flags_from_meta(&meta), AR8030_CHUNK_CODEC_H265,
+                                      meta.pts, frame_data, frame_len, args.chunk_payload, chunk_send_to_socket,
+                                      &send_ctx, &expected_chunks, chunk_scratch, chunk_scratch_size);
+            write_us = now_monotonic_us() - write_start_us;
+            entries_per_frame = 1;
+        }
+        __atomic_store_n(&bc_cfg.entries_per_frame, entries_per_frame, __ATOMIC_RELAXED);
         uint64_t write_end_us = now_monotonic_us();
-        uint64_t write_us = write_end_us - write_start_us;
         stats.write_us_sum += write_us;
         /* Link-side queueing delay for the PI controller, EWMA 1/8: the
          * frames still waiting in the ring behind this one x the frame
@@ -1203,7 +1267,7 @@ int main(int argc, char **argv)
             }
             prev_pts = meta.pts;
             venc_frame_ring_fill_t fill;
-            uint32_t behind = venc_frame_ring_get_fill(ring, &fill) == 0 ? fill.used_slots : 0;
+            uint32_t behind = venc_frame_ring_get_fill(ring, &fill) == 0 ? fill.used_slots / entries_per_frame : 0;
             double d_us = (double)behind * frame_period_us + (double)write_us;
             delay_ewma_us = delay_ewma_us ? delay_ewma_us + (d_us - delay_ewma_us) / 8.0 : d_us;
             __atomic_store_n(&bc_cfg.delay_us, (uint32_t)delay_ewma_us, __ATOMIC_RELEASE);

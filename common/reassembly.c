@@ -13,6 +13,7 @@ void ar8030_reassembly_init(ar8030_reassembly_t *r, uint8_t *buf, uint32_t cap)
 void ar8030_reassembly_reset(ar8030_reassembly_t *r)
 {
     r->active = 0;
+    r->done = 0;
     r->write_off = 0;
     r->next_chunk_idx = 0;
 }
@@ -37,6 +38,10 @@ int ar8030_reassembly_feed(ar8030_reassembly_t *r, const struct ar8030_chunk_hdr
     int is_new_frame = !r->active || hdr->frame_seq != r->frame_seq;
 
     if (is_new_frame) {
+        /* A streamed frame whose end never came (a slice lost on the air
+         * side) is given up for the next one. */
+        if (r->active && !r->done && r->chunk_count == 0)
+            note_dropped(r, r->frame_seq);
         if (hdr->chunk_idx != 0) {
             /* Mid-frame chunk for a frame we never started (e.g. we just
              * started up, or dropped chunk 0) -- nothing to do but wait
@@ -46,15 +51,25 @@ int ar8030_reassembly_feed(ar8030_reassembly_t *r, const struct ar8030_chunk_hdr
             return 0;
         }
         r->active = 1;
+        r->done = 0;
         r->frame_seq = hdr->frame_seq;
-        r->chunk_count = hdr->chunk_count;
+        /* 0 while the sender did not know it yet (streamed frame), see
+         * AR8030_CHUNK_FLAG_FRAME_END -- a one-chunk streamed frame comes
+         * with its real count and the flag at once. */
+        r->chunk_count = (hdr->flags & AR8030_CHUNK_FLAG_FRAME_END) ? 0 : hdr->chunk_count;
         r->frame_pts = hdr->frame_pts;
-        r->flags = hdr->flags;
+        r->flags = hdr->flags & (uint8_t)~AR8030_CHUNK_FLAG_FRAME_END;
         r->write_off = 0;
         r->next_chunk_idx = 0;
     }
 
-    if (hdr->chunk_idx != r->next_chunk_idx || hdr->chunk_count != r->chunk_count) {
+    /* A streamed frame's chunks say 0 until the one that ends it, which
+     * carries the real count. */
+    int frame_end = r->chunk_count == 0 && (hdr->flags & AR8030_CHUNK_FLAG_FRAME_END) &&
+                    hdr->chunk_count == (uint32_t)hdr->chunk_idx + 1u;
+    uint16_t want_count = frame_end ? hdr->chunk_count : r->chunk_count;
+
+    if (hdr->chunk_idx != r->next_chunk_idx || hdr->chunk_count != want_count) {
         /* Out-of-order/duplicate/inconsistent chunk -- the transport is
          * expected to preserve order, so this means we missed one. Drop
          * what we had; this chunk itself is unusable without its
@@ -76,7 +91,8 @@ int ar8030_reassembly_feed(ar8030_reassembly_t *r, const struct ar8030_chunk_hdr
     r->write_off += payload_len;
     r->next_chunk_idx++;
 
-    if (r->next_chunk_idx == r->chunk_count) {
+    if (frame_end || r->next_chunk_idx == r->chunk_count) {
+        r->done = 1;
         r->completed_frames++;
         return 1; /* complete */
     }

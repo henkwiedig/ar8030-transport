@@ -569,6 +569,75 @@ int main(void)
                     "intact, drop counter exact\n",
             junk_len, extracted4);
 
+    /* 2f. A streamed frame (AR8030_CHUNK_FLAG_FRAME_END): the same bytes
+     * sent as three parts, as tx does with slices that leave the encoder
+     * one by one -- chunk_count 0 until the last chunk. Then a streamed
+     * frame whose end never comes must count as dropped once the next
+     * frame starts, and a one-chunk streamed frame must complete at once. */
+    {
+        static struct chunk_capture scap;
+        memset(&scap, 0, sizeof(scap));
+        uint32_t cuts[4] = { 0, annexb_len / 3, annexb_len / 3 * 2, annexb_len };
+        uint32_t idx = 0;
+        for (int p = 0; p < 3; p++) {
+            uint32_t n = 0;
+            int s = ar8030_chunk_part(7, AR8030_CHUNK_FLAG_GDR, AR8030_CHUNK_CODEC_H265, frame_pts,
+                                      annexb + cuts[p], cuts[p + 1] - cuts[p], chunk_payload, idx, p == 2,
+                                      capture_chunk, &scap, &n, chunk_scratch, sizeof(chunk_scratch));
+            if (s < 0 || (uint32_t)s != n)
+                FAIL("streamed part %d: sent %d of %u chunks", p, s, n);
+            idx += n;
+        }
+        ar8030_reassembly_t sr;
+        static uint8_t sr_buf[65536];
+        ar8030_reassembly_init(&sr, sr_buf, sizeof(sr_buf));
+        int done_at = -1;
+        for (int i = 0; i < scap.count; i++) {
+            struct ar8030_chunk_hdr h;
+            memcpy(&h, scap.bufs[i], AR8030_CHUNK_HDR_SIZE);
+            int last = i + 1 == scap.count;
+            if ((h.chunk_count != 0) != last || ((h.flags & AR8030_CHUNK_FLAG_FRAME_END) != 0) != last)
+                FAIL("streamed chunk %d: count %u flags 0x%x", i, h.chunk_count, h.flags);
+            if (ar8030_reassembly_feed(&sr, &h, scap.bufs[i] + AR8030_CHUNK_HDR_SIZE,
+                                       scap.lens[i] - AR8030_CHUNK_HDR_SIZE))
+                done_at = i;
+        }
+        if (done_at != scap.count - 1)
+            FAIL("streamed frame completed at chunk %d of %d", done_at, scap.count);
+        if (sr.flags != AR8030_CHUNK_FLAG_GDR || sr.write_off != annexb_len ||
+            memcmp(sr.buf, annexb, annexb_len) != 0)
+            FAIL("streamed frame: flags 0x%x, %u bytes, or content differ", sr.flags, sr.write_off);
+        ar8030_reassembly_reset(&sr);
+
+        /* Its end lost: everything but the last chunk, then a new frame. */
+        for (int i = 0; i + 1 < scap.count; i++) {
+            struct ar8030_chunk_hdr h;
+            memcpy(&h, scap.bufs[i], AR8030_CHUNK_HDR_SIZE);
+            h.frame_seq = 8;
+            if (ar8030_reassembly_feed(&sr, &h, scap.bufs[i] + AR8030_CHUNK_HDR_SIZE,
+                                       scap.lens[i] - AR8030_CHUNK_HDR_SIZE))
+                FAIL("a streamed frame without its end completed");
+        }
+        static struct chunk_capture one;
+        memset(&one, 0, sizeof(one));
+        uint32_t n1 = 0;
+        if (ar8030_chunk_part(9, 0, AR8030_CHUNK_CODEC_H265, frame_pts, annexb, 100, chunk_payload, 0, 1,
+                              capture_chunk, &one, &n1, chunk_scratch, sizeof(chunk_scratch)) != 1)
+            FAIL("one-chunk streamed frame not sent as one chunk");
+        struct ar8030_chunk_hdr h1;
+        memcpy(&h1, one.bufs[0], AR8030_CHUNK_HDR_SIZE);
+        if (h1.chunk_count != 1 || !(h1.flags & AR8030_CHUNK_FLAG_FRAME_END))
+            FAIL("one-chunk streamed frame: count %u flags 0x%x", h1.chunk_count, h1.flags);
+        if (!ar8030_reassembly_feed(&sr, &h1, one.bufs[0] + AR8030_CHUNK_HDR_SIZE, 100))
+            FAIL("one-chunk streamed frame did not complete");
+        if (sr.dropped_frames != 1 || sr.flags != 0 || sr.write_off != 100)
+            FAIL("after a lost frame end: dropped %llu (want 1), flags 0x%x, %u bytes",
+                 (unsigned long long)sr.dropped_frames, sr.flags, sr.write_off);
+        fprintf(stderr, "streamed frames: %d chunks in 3 parts byte-identical, a lost end counted as one "
+                        "drop, a one-chunk frame complete at once\n",
+                scap.count);
+    }
+
     /* 3. RTP/H.265-packetize the reassembled frame over a connected
      * AF_UNIX SOCK_DGRAM pair (same send()-on-connected-socket path
      * rx/main.c uses for the real UDP socket) and depacketize it back. */
