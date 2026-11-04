@@ -9,7 +9,10 @@
  * into whole Annex-B H.265 access units, RTP/H.265-packetizes each
  * (rx/rtp_h265.c) and sends the packets over UDP to PixelPilot's
  * existing RTP listener -- no PixelPilot_rk source changes; point a
- * stock `pixelpilot -p 5600` at this tool's -H/-p target.
+ * stock `pixelpilot -p 5600` at this tool's -H/-p target. A frame the air
+ * sends slice by slice (AR8030_CHUNK_FLAG_SLICE_END) goes on the same way,
+ * one slice at a time, the RTP marker on its last packet: a decoder that
+ * takes a picture as its slices arrive starts on it before it is whole.
  *
  * Reassembly assumes chunk order is preserved by the transport (bb_socket
  * is a queued point-to-point channel, not a packet-switched network, so
@@ -461,6 +464,11 @@ int main(int argc, char **argv)
     double air_latency_max_ms = 0;
     uint32_t air_latency_n = 0;
 
+    /* How much of the streamed frame being reassembled has gone out
+     * already (slice by slice), and whether a slice was among it. */
+    uint32_t fwd_off = 0;
+    int fwd_vcl = 0;
+
     uint64_t rtp_packets_sent = 0;
     uint64_t rtp_bytes_sent = 0;
     struct rx_stats_snapshot stats_prev = rx_stats_snapshot_take(&stream, &reasm, 0, 0);
@@ -574,8 +582,35 @@ int main(int argc, char **argv)
         }
         if (hdr.codec != AR8030_CHUNK_CODEC_H265)
             continue; /* never hand anything but video to the reassembler */
-        if (!ar8030_reassembly_feed(&reasm, &hdr, payload_buf, payload_len))
+        int complete = ar8030_reassembly_feed(&reasm, &hdr, payload_buf, payload_len);
+        /* Was the chunk taken? A refused one resets the reassembler. */
+        int taken = reasm.active && reasm.frame_seq == hdr.frame_seq &&
+                    reasm.next_chunk_idx == (uint16_t)(hdr.chunk_idx + 1u);
+        if (taken && hdr.chunk_idx == 0) {
+            fwd_off = 0;
+            fwd_vcl = 0;
+        }
+        uint32_t rtp_ts = (uint32_t)(((uint64_t)reasm.frame_pts * 90ull) / 1000ull);
+        if (!complete) {
+            /* A slice of a streamed frame is complete: pass on what has not
+             * gone yet. The frame's chunk_count stays 0 until its end, and a
+             * frame sent whole never sets SLICE_END. If the rest of the
+             * frame is lost, what went out stays a picture without its
+             * bottom, which the decoder ends at the next one. */
+            if (taken && reasm.chunk_count == 0 && (hdr.flags & AR8030_CHUNK_FLAG_SLICE_END) &&
+                reasm.write_off > fwd_off) {
+                const uint8_t *part = reasm.buf + fwd_off;
+                uint32_t part_len = reasm.write_off - fwd_off;
+                int n = rtp_h265_send_nals(&rtp_ctx, part, part_len, rtp_ts, 0);
+                if (n > 0) {
+                    rtp_packets_sent += (uint64_t)n;
+                    rtp_bytes_sent += part_len;
+                }
+                fwd_vcl = fwd_vcl || rtp_h265_has_vcl(part, part_len);
+                fwd_off = reasm.write_off;
+            }
             continue;
+        }
         uint64_t rx_done_us = clock_sync_now_us();
 
         if (have_last_frame_seq) {
@@ -588,6 +623,8 @@ int main(int argc, char **argv)
 
         int64_t offset;
         uint32_t uncertainty;
+        uint8_t sei[TIMING_SEI_NAL_MAX];
+        uint32_t sei_len = 0;
         if (clock_sync_get(&sync, &offset, &uncertainty)) {
             uint64_t capture_air = unwrap_air_pts(reasm.frame_pts, (uint64_t)((int64_t)rx_done_us + offset));
             uint64_t capture_ground = (uint64_t)((int64_t)capture_air - offset);
@@ -609,18 +646,43 @@ int main(int argc, char **argv)
                     .encode_us = encode_us,
                     .frames_lost = frames_lost,
                 };
-                uint8_t sei[TIMING_SEI_NAL_MAX];
-                uint32_t sei_len = timing_sei_build(&t, sei);
-                timing_sei_insert(reasm.buf, &reasm.write_off, reasm.cap, sei, sei_len);
+                /* A prefix SEI goes ahead of the first slice; once a slice
+                 * has gone out on its own, a suffix SEI ahead of the rest. */
+                sei_len = fwd_vcl ? timing_sei_build_suffix(&t, sei) : timing_sei_build(&t, sei);
             }
         }
 
-        uint32_t rtp_ts = (uint32_t)(((uint64_t)reasm.frame_pts * 90ull) / 1000ull);
-        int rtp_pkts = rtp_h265_send_frame(&rtp_ctx, reasm.buf, reasm.write_off, rtp_ts);
-        if (rtp_pkts > 0) {
-            rtp_packets_sent += (uint64_t)rtp_pkts;
-            rtp_bytes_sent += reasm.write_off;
+        if (fwd_off == 0) {
+            if (sei_len)
+                timing_sei_insert(reasm.buf, &reasm.write_off, reasm.cap, sei, sei_len);
+            int rtp_pkts = rtp_h265_send_frame(&rtp_ctx, reasm.buf, reasm.write_off, rtp_ts);
+            if (rtp_pkts > 0) {
+                rtp_packets_sent += (uint64_t)rtp_pkts;
+                rtp_bytes_sent += reasm.write_off;
+            }
+        } else {
+            /* The rest of a frame that went out slice by slice: the timing
+             * SEI first, so a receiver has it before the last slice ends
+             * the picture (the SEI itself carries the marker if nothing is
+             * left). */
+            uint32_t rest = reasm.write_off - fwd_off;
+            if (sei_len) {
+                int n = rtp_h265_send_nals(&rtp_ctx, sei, sei_len, rtp_ts, rest == 0);
+                if (n > 0) {
+                    rtp_packets_sent += (uint64_t)n;
+                    rtp_bytes_sent += sei_len;
+                }
+            }
+            if (rest) {
+                int n = rtp_h265_send_nals(&rtp_ctx, reasm.buf + fwd_off, rest, rtp_ts, 1);
+                if (n > 0) {
+                    rtp_packets_sent += (uint64_t)n;
+                    rtp_bytes_sent += rest;
+                }
+            }
         }
+        fwd_off = 0;
+        fwd_vcl = 0;
         ar8030_reassembly_reset(&reasm);
     }
 

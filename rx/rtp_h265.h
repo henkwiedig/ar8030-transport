@@ -36,4 +36,14 @@ void rtp_h265_init(rtp_h265_ctx_t *ctx, int sockfd, uint16_t max_payload);
 int rtp_h265_send_frame(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len,
                          uint32_t rtp_ts_90k);
 
+/* The same for part of an access unit: the NALs in annexb, the RTP marker
+ * on the last packet only if au_end (the access unit ends with them). rx
+ * passes a frame on slice by slice this way while it is still arriving.
+ * rtp_h265_send_frame() is this with au_end 1. */
+int rtp_h265_send_nals(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len, uint32_t rtp_ts_90k,
+                       int au_end);
+
+/* 1 if the Annex-B data holds a VCL NAL (a slice), 0 otherwise. */
+int rtp_h265_has_vcl(const uint8_t *annexb, uint32_t len);
+
 #endif /* AR8030_TRANSPORT_RX_RTP_H265_H */

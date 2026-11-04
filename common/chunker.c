@@ -7,11 +7,13 @@
 
 /* Shared by both entry points. total_count is the chunk_count every chunk
  * carries, except that with frame_end the last one carries
- * first_idx + count instead, plus AR8030_CHUNK_FLAG_FRAME_END. */
+ * first_idx + count instead, plus AR8030_CHUNK_FLAG_FRAME_END; without it,
+ * part (a slice of a streamed frame) puts AR8030_CHUNK_FLAG_SLICE_END on
+ * the last one. */
 static int chunk_run(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t frame_pts, const uint8_t *data,
                      uint32_t data_len, uint32_t chunk_payload, uint32_t first_idx, uint32_t total_count,
-                     int frame_end, ar8030_chunk_send_fn send, void *send_ctx, uint32_t *out_chunk_count,
-                     uint8_t *scratch, uint32_t scratch_cap)
+                     int frame_end, int part, ar8030_chunk_send_fn send, void *send_ctx,
+                     uint32_t *out_chunk_count, uint8_t *scratch, uint32_t scratch_cap)
 {
     if (chunk_payload == 0 || chunk_payload > AR8030_CHUNK_MAX_PAYLOAD)
         return -1;
@@ -35,6 +37,7 @@ static int chunk_run(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t 
         if (len > chunk_payload)
             len = chunk_payload;
         int final = frame_end && i + 1 == chunk_count;
+        int slice_end = part && !frame_end && i + 1 == chunk_count;
 
         struct ar8030_chunk_hdr hdr;
         hdr.magic = AR8030_CHUNK_MAGIC;
@@ -42,7 +45,9 @@ static int chunk_run(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t 
         hdr.chunk_idx = (uint16_t)(first_idx + i);
         hdr.chunk_count = (uint16_t)(final ? first_idx + chunk_count : total_count);
         hdr.payload_len = (uint16_t)len;
-        hdr.flags = (uint8_t)(final ? flags | AR8030_CHUNK_FLAG_FRAME_END : flags);
+        hdr.flags = (uint8_t)(final       ? flags | AR8030_CHUNK_FLAG_FRAME_END
+                              : slice_end ? flags | AR8030_CHUNK_FLAG_SLICE_END
+                                          : flags);
         hdr.codec = codec;
         hdr.frame_pts = frame_pts;
         hdr.checksum = ar8030_crc16(data + off, len);
@@ -72,8 +77,8 @@ int ar8030_chunk_frame(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_
         chunk_count = 1;
     if (chunk_count > 0xFFFFu)
         return -1;
-    return chunk_run(frame_seq, flags, codec, frame_pts, data, data_len, chunk_payload, 0, chunk_count, 0, send,
-                     send_ctx, out_chunk_count, scratch, scratch_cap);
+    return chunk_run(frame_seq, flags, codec, frame_pts, data, data_len, chunk_payload, 0, chunk_count, 0, 0,
+                     send, send_ctx, out_chunk_count, scratch, scratch_cap);
 }
 
 int ar8030_chunk_part(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t frame_pts,
@@ -81,6 +86,6 @@ int ar8030_chunk_part(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t
                        uint32_t first_idx, int last, ar8030_chunk_send_fn send, void *send_ctx,
                        uint32_t *out_chunk_count, uint8_t *scratch, uint32_t scratch_cap)
 {
-    return chunk_run(frame_seq, flags, codec, frame_pts, data, data_len, chunk_payload, first_idx, 0, last, send,
-                     send_ctx, out_chunk_count, scratch, scratch_cap);
+    return chunk_run(frame_seq, flags, codec, frame_pts, data, data_len, chunk_payload, first_idx, 0, last, 1,
+                     send, send_ctx, out_chunk_count, scratch, scratch_cap);
 }

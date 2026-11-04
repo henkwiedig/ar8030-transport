@@ -58,7 +58,9 @@ int ar8030_chunk_frame(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_
  * contract as ar8030_chunk_frame(), but the chunks are numbered from
  * first_idx on, and carry chunk_count 0 unless last is set, in which case
  * the final chunk carries AR8030_CHUNK_FLAG_FRAME_END and the frame's real
- * total. *out_chunk_count, if non-NULL, is set to how many chunks this part
+ * total; otherwise the final chunk carries AR8030_CHUNK_FLAG_SLICE_END, so
+ * data cut at NAL boundaries can go on from the receiver part by part.
+ * *out_chunk_count, if non-NULL, is set to how many chunks this part
  * needs. Returns the number sent, or -1 (nothing sent) if the frame would
  * need more than 65535 chunks in all or scratch_cap is too small. */
 int ar8030_chunk_part(uint16_t frame_seq, uint8_t flags, uint8_t codec, uint32_t frame_pts,

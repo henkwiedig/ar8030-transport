@@ -89,6 +89,27 @@ static void test_sei(void)
     CHECK(timing_sei_insert(buf, &nlen, sizeof(buf), sei, sei_len) == -1 && nlen == sizeof(no_slice),
           "insert into an AU without a slice must leave it alone");
     CHECK(timing_sei_parse(slice1, sizeof(slice1), &out) == 0, "found an SEI that isn't there");
+
+    /* A frame rx passed on slice by slice: the suffix SEI between the
+     * slices is found; a prefix SEI after a slice, or a suffix SEI ahead
+     * of the first, is not ours. */
+    uint8_t suf[TIMING_SEI_NAL_MAX];
+    uint32_t suf_len = timing_sei_build_suffix(&in, suf);
+    CHECK(suf_len == sei_len && suf[4] == 0x50 && suf[5] == 0x01 && memcmp(suf + 6, sei + 6, sei_len - 6) == 0,
+          "suffix SEI: NAL header %02x %02x (want 50 01) or body differs from the prefix one", suf[4], suf[5]);
+    len = 0;
+    memcpy(au + len, vps, sizeof(vps)), len += sizeof(vps);
+    memcpy(au + len, slice1, sizeof(slice1)), len += sizeof(slice1);
+    memcpy(au + len, suf, suf_len), len += suf_len;
+    memcpy(au + len, slice2, sizeof(slice2)), len += sizeof(slice2);
+    memset(&out, 0xff, sizeof(out));
+    CHECK(timing_sei_parse(au, len, &out) == 1 && memcmp(&in, &out, sizeof(in)) == 0,
+          "suffix SEI between the slices not found or changed");
+    len = 0;
+    memcpy(au + len, suf, suf_len), len += suf_len;
+    memcpy(au + len, slice1, sizeof(slice1)), len += sizeof(slice1);
+    memcpy(au + len, sei, sei_len), len += sei_len;
+    CHECK(timing_sei_parse(au, len, &out) == 0, "took a suffix SEI before the slice or a prefix SEI after it");
 }
 
 /* One simulated exchange: air clock = ground + offset, the SYNC takes
@@ -196,7 +217,7 @@ int main(void)
         fprintf(stderr, "timing_test: %d failure(s)\n", failures);
         return 1;
     }
-    printf("timing test: SEI emulation prevention, insert and parse round trip; clock sync picks the "
+    printf("timing test: SEI emulation prevention, insert and parse round trip, suffix SEI between slices; clock sync picks the "
            "min-rtt sample, stays within its bound, resets on an air reboot, and drops replies to probes that "
            "waited for the link\nPASS\n");
     return 0;

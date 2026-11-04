@@ -55,14 +55,22 @@ struct timing_sei_v1 { /* all fields little endian */
  * TIMING_SEI_NAL_MAX bytes). Returns its length. */
 uint32_t timing_sei_build(const struct timing_sei_v1 *t, uint8_t *out);
 
+/* The same message as a suffix SEI NAL (type 40): one that may follow a
+ * slice. rx sends it in front of the last slice of a frame it passes on
+ * slice by slice -- the earlier slices are gone by the time the frame is
+ * complete, and so is the place for a prefix SEI. */
+uint32_t timing_sei_build_suffix(const struct timing_sei_v1 *t, uint8_t *out);
+
 /* Inserts the SEI NAL in front of the first VCL NAL of the Annex-B access
  * unit buf[0..*len) in place (parameter sets stay ahead of it). Returns 0,
  * or -1 if there is no slice in the AU or cap is too small -- the AU is
  * then left unchanged. */
 int timing_sei_insert(uint8_t *buf, uint32_t *len, uint32_t cap, const uint8_t *sei, uint32_t sei_len);
 
-/* Finds our SEI in an Annex-B access unit and decodes it. Returns 1 if
- * found, 0 otherwise. Reference implementation for PixelPilot's parser. */
+/* Finds our SEI in an Annex-B access unit and decodes it: a prefix SEI
+ * ahead of the first slice, or a suffix SEI anywhere after it. Returns 1
+ * if found, 0 otherwise. Reference implementation for PixelPilot's
+ * parser. */
 int timing_sei_parse(const uint8_t *au, uint32_t len, struct timing_sei_v1 *out);
 
 #endif

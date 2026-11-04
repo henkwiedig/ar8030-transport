@@ -118,7 +118,24 @@ static int next_nal(const uint8_t *data, uint32_t size, uint32_t *from, const ui
     return 1;
 }
 
+int rtp_h265_has_vcl(const uint8_t *annexb, uint32_t len)
+{
+    uint32_t cursor = 0;
+    const uint8_t *nal;
+    uint32_t nal_len;
+    while (next_nal(annexb, len, &cursor, &nal, &nal_len))
+        if (((nal[0] >> 1) & 0x3F) <= 31)
+            return 1;
+    return 0;
+}
+
 int rtp_h265_send_frame(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len, uint32_t rtp_ts_90k)
+{
+    return rtp_h265_send_nals(ctx, annexb, len, rtp_ts_90k, 1);
+}
+
+int rtp_h265_send_nals(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len, uint32_t rtp_ts_90k,
+                       int au_end)
 {
     uint32_t cursor = 0;
     const uint8_t *nal;
@@ -126,9 +143,10 @@ int rtp_h265_send_frame(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len
     int packets = 0;
 
     /* Collect NAL offsets first so we know which one is last (for the RTP
-     * marker bit) without a second scan pass. Frames are whole access
-     * units from the AR8030 chunk reassembly, so NAL counts are small
-     * (tens, not thousands) -- a fixed-size offset table is fine. */
+     * marker bit) without a second scan pass. These are whole access
+     * units, or slices of one, from the AR8030 chunk reassembly, so NAL
+     * counts are small (tens, not thousands) -- a fixed-size offset table
+     * is fine. */
     struct {
         const uint8_t *p;
         uint32_t len;
@@ -147,7 +165,7 @@ int rtp_h265_send_frame(rtp_h265_ctx_t *ctx, const uint8_t *annexb, uint32_t len
     for (int n = 0; n < nal_count; n++) {
         const uint8_t *p = nals[n].p;
         uint32_t plen = nals[n].len;
-        int is_last_nal = (n == nal_count - 1);
+        int is_last_nal = au_end && (n == nal_count - 1);
 
         if (plen < 2)
             continue; /* not a valid NAL (needs a 2-byte H.265 header) */

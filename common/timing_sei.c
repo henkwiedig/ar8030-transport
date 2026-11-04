@@ -5,9 +5,10 @@
 static const uint8_t k_uuid[16] = TIMING_SEI_UUID;
 
 #define SEI_PREFIX_NAL_TYPE 39
+#define SEI_SUFFIX_NAL_TYPE 40
 #define SEI_USER_DATA_UNREGISTERED 5
 
-uint32_t timing_sei_build(const struct timing_sei_v1 *t, uint8_t *out)
+static uint32_t build_nal(const struct timing_sei_v1 *t, uint8_t *out, uint8_t nal_type)
 {
     /* RBSP: payload type, size, UUID, data, then rbsp_trailing_bits. Both
      * type and size fit one byte (< 255). */
@@ -26,8 +27,8 @@ uint32_t timing_sei_build(const struct timing_sei_v1 *t, uint8_t *out)
     out[o++] = 0;
     out[o++] = 0;
     out[o++] = 1;
-    out[o++] = (uint8_t)(SEI_PREFIX_NAL_TYPE << 1); /* forbidden 0, type 39, layer id 0 */
-    out[o++] = 1;                                   /* nuh_temporal_id_plus1 */
+    out[o++] = (uint8_t)(nal_type << 1); /* forbidden 0, the SEI type, layer id 0 */
+    out[o++] = 1;                        /* nuh_temporal_id_plus1 */
     /* Emulation prevention: two zeros followed by 0..3 inside a NAL would
      * read as a start code; the timestamps contain zero bytes. */
     int zeros = 0;
@@ -40,6 +41,16 @@ uint32_t timing_sei_build(const struct timing_sei_v1 *t, uint8_t *out)
         zeros = rbsp[i] == 0 ? zeros + 1 : 0;
     }
     return o;
+}
+
+uint32_t timing_sei_build(const struct timing_sei_v1 *t, uint8_t *out)
+{
+    return build_nal(t, out, SEI_PREFIX_NAL_TYPE);
+}
+
+uint32_t timing_sei_build_suffix(const struct timing_sei_v1 *t, uint8_t *out)
+{
+    return build_nal(t, out, SEI_SUFFIX_NAL_TYPE);
 }
 
 /* Offset of the start code of the next NAL at or after from, or len. */
@@ -82,13 +93,19 @@ int timing_sei_insert(uint8_t *buf, uint32_t *len, uint32_t cap, const uint8_t *
 
 int timing_sei_parse(const uint8_t *au, uint32_t len, struct timing_sei_v1 *out)
 {
+    int seen_slice = 0;
     uint32_t sc_len;
     uint32_t pos = find_start_code(au, len, 0, &sc_len);
     while (pos < len) {
         uint32_t nal = pos + sc_len;
         uint32_t next_sc;
         uint32_t next = find_start_code(au, len, nal, &next_sc);
-        if (nal + 2 < next && ((au[nal] >> 1) & 0x3f) == SEI_PREFIX_NAL_TYPE) {
+        if (nal >= len)
+            break;
+        uint8_t type = (uint8_t)((au[nal] >> 1) & 0x3f);
+        if (type <= 31)
+            seen_slice = 1;
+        if (nal + 2 < next && (seen_slice ? type == SEI_SUFFIX_NAL_TYPE : type == SEI_PREFIX_NAL_TYPE)) {
             /* Strip emulation prevention into an RBSP copy, only as much
              * as one of our messages can be. */
             uint8_t rbsp[2 + TIMING_SEI_PAYLOAD_SIZE];

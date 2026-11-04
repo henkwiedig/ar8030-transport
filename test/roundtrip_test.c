@@ -579,6 +579,7 @@ int main(void)
         memset(&scap, 0, sizeof(scap));
         uint32_t cuts[4] = { 0, annexb_len / 3, annexb_len / 3 * 2, annexb_len };
         uint32_t idx = 0;
+        uint32_t part_ends[3] = { 0, 0, 0 };
         for (int p = 0; p < 3; p++) {
             uint32_t n = 0;
             int s = ar8030_chunk_part(7, AR8030_CHUNK_FLAG_GDR, AR8030_CHUNK_CODEC_H265, frame_pts,
@@ -587,6 +588,7 @@ int main(void)
             if (s < 0 || (uint32_t)s != n)
                 FAIL("streamed part %d: sent %d of %u chunks", p, s, n);
             idx += n;
+            part_ends[p] = idx;
         }
         ar8030_reassembly_t sr;
         static uint8_t sr_buf[65536];
@@ -598,6 +600,11 @@ int main(void)
             int last = i + 1 == scap.count;
             if ((h.chunk_count != 0) != last || ((h.flags & AR8030_CHUNK_FLAG_FRAME_END) != 0) != last)
                 FAIL("streamed chunk %d: count %u flags 0x%x", i, h.chunk_count, h.flags);
+            /* SLICE_END on the last chunk of each part but the last */
+            int part_end = !last && (h.chunk_idx + 1u == part_ends[0] || h.chunk_idx + 1u == part_ends[1]);
+            if (((h.flags & AR8030_CHUNK_FLAG_SLICE_END) != 0) != part_end)
+                FAIL("streamed chunk %d: SLICE_END %d, want %d", i, !!(h.flags & AR8030_CHUNK_FLAG_SLICE_END),
+                     part_end);
             if (ar8030_reassembly_feed(&sr, &h, scap.bufs[i] + AR8030_CHUNK_HDR_SIZE,
                                        scap.lens[i] - AR8030_CHUNK_HDR_SIZE))
                 done_at = i;
@@ -633,8 +640,8 @@ int main(void)
         if (sr.dropped_frames != 1 || sr.flags != 0 || sr.write_off != 100)
             FAIL("after a lost frame end: dropped %llu (want 1), flags 0x%x, %u bytes",
                  (unsigned long long)sr.dropped_frames, sr.flags, sr.write_off);
-        fprintf(stderr, "streamed frames: %d chunks in 3 parts byte-identical, a lost end counted as one "
-                        "drop, a one-chunk frame complete at once\n",
+        fprintf(stderr, "streamed frames: %d chunks in 3 parts byte-identical, SLICE_END on the part ends, a "
+                        "lost end counted as one drop, a one-chunk frame complete at once\n",
                 scap.count);
     }
 
@@ -682,6 +689,50 @@ int main(void)
     fprintf(stderr, "RTP round trip: %d/%d NALs byte-identical, marker bit correct, "
                      "sequence monotonic, timestamp constant\n",
             rc.nal_count, expected_nal_count);
+
+    /* 3b. The same frame passed on in two parts, as rx does with a frame
+     * that arrives slice by slice: the marker only on the very last
+     * packet, the NALs as before. */
+    {
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0)
+            FAIL("socketpair failed");
+        rtp_h265_init(&rtp_ctx, sv[0], 200);
+        /* cut where the last NAL (the slice) starts, at its start code */
+        uint32_t cut = (uint32_t)(expected_nals[expected_nal_count - 1].p - annexb);
+        while (cut > 0 && annexb[cut - 1] != 0)
+            cut--;
+        while (cut > 0 && annexb[cut - 1] == 0)
+            cut--;
+        if (rtp_h265_has_vcl(annexb, cut) != 0 || rtp_h265_has_vcl(annexb + cut, annexb_len - cut) != 1)
+            FAIL("rtp_h265_has_vcl wrong");
+        int p1 = rtp_h265_send_nals(&rtp_ctx, annexb, cut, rtp_ts, 0);
+        int p2 = rtp_h265_send_nals(&rtp_ctx, annexb + cut, annexb_len - cut, rtp_ts, 1);
+        if (p1 <= 0 || p2 <= 0)
+            FAIL("rtp_h265_send_nals sent %d + %d packets", p1, p2);
+        struct rtp_capture rc2;
+        memset(&rc2, 0, sizeof(rc2));
+        int last_marker = 0;
+        for (int i = 0; i < p1 + p2; i++) {
+            uint8_t pkt[2048];
+            ssize_t n = recv(sv[1], pkt, sizeof(pkt), 0);
+            if (n <= 0)
+                FAIL("recv() got no packet %d/%d", i, p1 + p2);
+            depacketize_one(&rc2, pkt, (uint32_t)n);
+            last_marker = (pkt[1] & 0x80) != 0;
+        }
+        close(sv[0]);
+        close(sv[1]);
+        if (rc2.marker_count != 1 || !last_marker)
+            FAIL("two parts: %d marker packets, last one marked %d", rc2.marker_count, last_marker);
+        if (rc2.nal_count != expected_nal_count)
+            FAIL("two parts: %d NALs, expected %d", rc2.nal_count, expected_nal_count);
+        for (int i = 0; i < expected_nal_count; i++)
+            if (rc2.nal_lens[i] != expected_nals[i].len ||
+                memcmp(rc2.nals[i], expected_nals[i].p, expected_nals[i].len) != 0)
+                FAIL("two parts: NAL %d differs", i);
+        fprintf(stderr, "RTP in two parts: %d + %d packets, one marker on the last, NALs byte-identical\n", p1,
+                p2);
+    }
 
     fprintf(stderr, "PASS\n");
     return 0;

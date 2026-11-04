@@ -82,6 +82,12 @@
  * sent whole keeps a real chunk_count on every chunk and never sets this
  * flag. Chunk-level, not frame-level: never copied from VencFrameMeta. */
 #define AR8030_CHUNK_FLAG_FRAME_END 0x80u
+/* The last chunk of one part (slice) of a streamed frame, other than the
+ * part that ends the frame (FRAME_END says that one): the bytes so far end
+ * on a NAL boundary, so the receiver can pass them on as they are instead
+ * of waiting for the frame -- a decoder that takes a picture slice by
+ * slice starts on it then. Chunk-level, like FRAME_END. */
+#define AR8030_CHUNK_FLAG_SLICE_END 0x40u
 
 #define AR8030_CHUNK_CODEC_H265 0x01u
 /* A chunk of this codec carries one whole, already RTP-packetized audio

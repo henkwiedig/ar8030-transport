@@ -184,10 +184,21 @@ top of a picture while the encoder works on the bottom:
 - `chunk_count` is 0 on every chunk but the last: the total is not known
   when the first slice goes out. The last chunk carries
   `AR8030_CHUNK_FLAG_FRAME_END` (0x80) and the real count.
-- rx completes the frame on that flag and hands on the whole picture as
-  before, so nothing downstream changes. A picture whose end never comes
-  (a slice that did not fit waybeam's ring, a failed write) is dropped when
-  the next `frame_seq` starts, like any incomplete frame.
+- The last chunk of every other slice carries `AR8030_CHUNK_FLAG_SLICE_END`
+  (0x40): the bytes so far end on a NAL boundary. rx RTP-packetizes each
+  slice as that chunk comes in (`rtp_h265_send_nals()`), the RTP marker
+  only on the picture's last packet, so a decoder that takes a picture
+  slice by slice (the VRX Pro's, with the rkvdec2 stream-mode kernel and
+  MPP patches; PixelPilot in slice mode) starts on it before it is all in.
+  The timing SEI goes out as a suffix SEI in front of the last slice: the
+  earlier slices, and the place of a prefix SEI, are gone by the time the
+  frame is complete. A receiver that wants whole access units (rtph265depay
+  gathering by the marker, h265parse) gets the same picture as before.
+- rx still reassembles the frame for its own bookkeeping. A picture whose
+  end never comes (a slice that did not fit waybeam's ring, a failed write)
+  is counted dropped when the next `frame_seq` starts; the slices that went
+  out already stay a picture without its bottom, which the decoder ends at
+  the next picture's start.
 - A picture published whole (one slice, no slice output, or the P1) goes out
   exactly as before. There is no negotiation: the air side decides by its
   waybeam config, and every rx since this change reads both kinds.

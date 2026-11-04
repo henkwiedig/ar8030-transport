@@ -58,7 +58,7 @@ int ar8030_reassembly_feed(ar8030_reassembly_t *r, const struct ar8030_chunk_hdr
          * with its real count and the flag at once. */
         r->chunk_count = (hdr->flags & AR8030_CHUNK_FLAG_FRAME_END) ? 0 : hdr->chunk_count;
         r->frame_pts = hdr->frame_pts;
-        r->flags = hdr->flags & (uint8_t)~AR8030_CHUNK_FLAG_FRAME_END;
+        r->flags = hdr->flags & (uint8_t)~(AR8030_CHUNK_FLAG_FRAME_END | AR8030_CHUNK_FLAG_SLICE_END);
         r->write_off = 0;
         r->next_chunk_idx = 0;
     }
