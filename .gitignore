@@ -27,3 +27,5 @@ audio_rx/ar8030-transport-audio-rx
 /kmod/modules.order
 /kmod/Module.symvers
 /kmod/.tmp_versions/
+/xdata/build/
+/xdata/ar8030-xdata
