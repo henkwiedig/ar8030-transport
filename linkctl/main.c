@@ -137,9 +137,10 @@ static void usage(const char *argv0)
             "      for some socket types -- all-zero means this port isn't counted, not\n"
             "      that it is idle. Compare BB_GET_MCS's throughput (theoretical).\n"
             "\n"
-            "  frame-change <0|1>\n"
+            "  frame-change <0|1|2>\n"
             "      BB_SET_FRAME_CHANGE (1V1 only): 1 = exchange frame structure,\n"
-            "      0 = restore the original. Compare BB_GET_MCS throughput after.\n"
+            "      2 = short uplink slot (shorter super-frame), 0 = restore the\n"
+            "      original. Compare BB_GET_MCS throughput and chip-cli frame after.\n"
             "\n"
             "  cfg-dump [-m mode] [file]\n"
             "      Read the baseband configuration file via BB_GET_CFG (mode\n"
@@ -1600,13 +1601,14 @@ static int cmd_daemon_log(int argc, char **argv)
 
 static int cmd_frame_change(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "linkctl: frame-change needs 0 or 1\n");
+    int mode = argc < 2 ? -1 : atoi(argv[1]);
+    if (mode < 0 || mode > 2) {
+        fprintf(stderr, "linkctl: frame-change needs 0, 1 or 2\n");
         return 1;
     }
     bb_set_frame_change_t fc;
     memset(&fc, 0, sizeof(fc));
-    fc.mode = (uint8_t)(atoi(argv[1]) ? 1 : 0);
+    fc.mode = (uint8_t)mode;
     int ret = bb_ioctl(g_hbb, BB_SET_FRAME_CHANGE, &fc, NULL);
     printf("BB_SET_FRAME_CHANGE(mode=%u) ret=%d\n", fc.mode, ret);
     return ret ? 1 : 0;
