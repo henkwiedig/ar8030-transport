@@ -55,8 +55,10 @@ typedef struct {
     char cfg_path[256];
 
     int default_bandwidth;
-    /* BB_SET_FRAME_CHANGE(mode=1) on the AP after every connect, 0 = leave
-     * the chip's own frame structure alone. See lc_frame_change_apply(). */
+    /* AP: BB_SET_FRAME_CHANGE mode applied after every connect while none
+     * is persisted yet (no ar8030.frame_change sidecar): 1 = exchanged
+     * frame structure, 2 = short uplink slot, 0 = leave the chip's own
+     * frame structure alone. See lc_frame_change_apply(). */
     int frame_change;
     /* AP only: channel used while nothing is persisted yet (no
      * ar8030.channel sidecar): an index, LC_CHANNEL_AUTO or LC_CHANNEL_NONE
@@ -194,7 +196,9 @@ typedef struct {
     int        work_chan;      /* chip-reported working channel, -1 if not read yet */
     int        power;          /* wanted: mW level, LC_POWER_AUTO or LC_POWER_NONE */
     int        power_dbm;      /* chip-reported dBm target, -1 if not read yet */
-    int        armed;          /* last reported arm state; 1 until told otherwise */
+    int        frame_change;   /* wanted frame change mode (AP); -1 on the DEV */
+    int        frame_change_pending; /* AP: not yet accepted on this link (or no link) */
+    int        armed;         /* last reported arm state; 1 until told otherwise */
     int        standby;        /* low-power mode applied (cfg standby_dbm >= 0 only) */
     int        soc_temp_valid; /* non-zero once soc_temp_cmd gave a reading */
     int        soc_temp_c10;   /* SoC temperature, 0.1 degC */
@@ -327,6 +331,13 @@ int lifecycle_request_channel(lifecycle_ctx* ctx, int chan);
  * chip-wide and needs no link. Returns 0 if queued, -1 if level is not
  * one of this role's levels. */
 int lifecycle_request_power(lifecycle_ctx* ctx, int level);
+
+/* Same mailbox pattern, for the frame change mode (0..LC_FRAME_CHANGE_MAX,
+ * see lc_frame_change_apply()). AP only: the AP is the controlling side of
+ * the 1V1 link and re-applies the mode after every connect and relink.
+ * Persisted, and applied right away while connected. Returns 0 if queued,
+ * -1 for a mode out of range, -2 on the DEV side. */
+int lifecycle_request_frame_change(lifecycle_ctx* ctx, int mode);
 
 /* Same mailbox pattern, for the flight controller's arm state (0 or 1),
  * which drives the low-power mode (lc_config_t.standby_dbm). Not

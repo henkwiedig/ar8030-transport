@@ -2262,7 +2262,8 @@ design rationale):
   `notes/open_issues.md` §7). That is too short for the drop debounce,
   so lifecycled counts the chip's CONNECT events instead, and on such a
   relink re-applies the link tuning without running the hooks: retx,
-  power, `BB_SET_FRAME_CHANGE(1)` on the AP, the MCS table on the DEV.
+  power, the frame change mode on the AP (see `/api/v1/frame-change`),
+  the MCS table on the DEV.
   Without the frame change the 40 MHz link reports 34.5 Mbit/s at MCS 12,
   less than 20 MHz with it (36.7); with it, 54.1. The host write path
   caps a bulk writer at about 40 Mbit/s anyway (blast), so 40 MHz buys
@@ -2349,6 +2350,28 @@ design rationale):
   3): built against an SDK without it (`BB_HAVE_PWR_AUTO_BOUNDS` unset)
   lifecycled refuses to touch power instead of sending the truncated
   payload.
+- **`GET|POST /api/v1/frame-change[?mode=<0|1|2>]`** (air) -- the
+  *persisted* `BB_SET_FRAME_CHANGE` mode, owned by the AP (the
+  controlling side of the 1V1 link; the DEV answers `409` to a POST and
+  `null` to a GET). `1` (the default, `--frame-change`) exchanges the
+  frame structure for the most throughput; `2` shortens the uplink slot,
+  so the radio cycle drops from 7965 to 4651 us at 20 MHz and frames
+  reach the ground earlier, for about 15% less throughput; `0` leaves the
+  chip's own frame structure. Measured on the Ascent Lite + VRX Pro bench
+  at MCS 12, 60 fps (mode 1 -> 2): `BB_GET_MCS` 36688 -> 31415 kbps,
+  video 22.5 -> 19.2 Mbit/s, capture -> ground rx 33.7 -> 28.3 ms,
+  PixelPilot's vsync lock target 58.5 -> 49.9 ms at the same drop rate.
+  ```
+  curl -X POST 'http://<host>:8899/api/v1/frame-change?mode=2'
+  curl http://<host>:8899/api/v1/frame-change
+  {"ok":true,"frame_change":2,"frame_change_applied":true,"modes":[0,1,2]}
+  ```
+  Saved to an `ar8030.frame_change` sidecar next to `cfg_path`, applied
+  right away while connected and after every connect and relink (the chip
+  drops back to mode 0 on a relink). `frame_change_applied` is `false`
+  without a link or while the chip still refuses the mode (it can right
+  after a connect; lifecycled retries every poll). Both fields are also
+  in `/api/v1/status`.
 - **`GET|POST /api/v1/armed[?state=<0|1>]`** (air) -- the flight
   controller's arm state, which drives stock's low-power mode when
   lifecycled runs with `--standby-dbm <dBm>` (Ascent Lite stock: 10).

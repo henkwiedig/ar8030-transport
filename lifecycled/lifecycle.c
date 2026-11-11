@@ -126,10 +126,18 @@ struct lifecycle_ctx {
      * CONNECT while in LC_STATE_CONNECTED -- see LC_DROP_CONFIRM_TICKS.
      * Reset to 0 on any CONNECT reading. */
     int drop_miss_count;
-    /* AP: BB_SET_FRAME_CHANGE(1) not yet accepted on this link -- it can
-     * fail right after CONNECT (ret -2, seen 2026-10-03 with --fem-ctrl:
-     * MCS 10 then gives 19.5 instead of 27.7 Mbit/s), retried per poll. */
+    /* AP: the wanted frame change mode not yet accepted on this link -- it
+     * can fail right after CONNECT (ret -2, seen 2026-10-03 with
+     * --fem-ctrl: MCS 10 then gives 19.5 instead of 27.7 Mbit/s), retried
+     * per poll. status_lock for writes (lifecycle_get_status() reads it). */
     int frame_change_pending;
+    /* AP: wanted frame change mode -- the persisted one, else
+     * cfg.frame_change; -1 on the DEV. Written only by the lifecycle
+     * thread, under status_lock. */
+    int frame_change;
+    /* lifecycle_request_frame_change()'s mailbox, cmd_lock; -1 = nothing
+     * queued. */
+    int pending_frame_change;
     /* g_link_connect_gen when the link tuning was last applied -- a
      * different value while in LC_STATE_CONNECTED means the chip relinked
      * inside the drop debounce (see g_link_connect_gen). */
@@ -271,6 +279,8 @@ struct lifecycle_ctx {
 static void lc_apply_power(lifecycle_ctx* ctx);
 static void lc_poll_power(lifecycle_ctx* ctx);
 static void lc_apply_link_tuning(lifecycle_ctx* ctx);
+static void lc_frame_change_set_pending(lifecycle_ctx* ctx, int pending);
+static void lc_frame_change_try(lifecycle_ctx* ctx);
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -381,6 +391,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
     ctx->pending_armed        = -1;
+    ctx->pending_frame_change = -1;
     ctx->armed                = 1;
     ctx->distance_m           = -1;
     ctx->batt_arm_ret         = 1; /* not an ioctl result: logs the first arm */
@@ -390,6 +401,11 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
         ctx->channel = cfg->default_channel;
     }
     int is_ap = cfg->role == LC_ROLE_AP;
+    if (!is_ap) {
+        ctx->frame_change = -1;
+    } else if (!cfg->cfg_path[0] || lc_frame_change_load(cfg->cfg_path, &ctx->frame_change) != 0) {
+        ctx->frame_change = cfg->frame_change;
+    }
     if (!cfg->cfg_path[0] || lc_power_load(cfg->cfg_path, &ctx->power) != 0 ||
         !lc_power_valid(is_ap, cfg->max_power, ctx->power)) {
         ctx->power = cfg->default_power == LC_POWER_ROLE_DEFAULT ? lc_power_default(is_ap, cfg->max_power)
@@ -512,9 +528,10 @@ static void lc_apply_link_tuning(lifecycle_ctx* ctx)
 
     /* AP side only -- it is the controlling side of the 1V1 link (stock
      * gets ~40 Mbit/s at MCS 12 vs 25.9 without this). Chip-wide, needs an
-     * established link, and is lost on reboot/re-link, hence here. */
-    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
-        ctx->frame_change_pending = lc_frame_change_apply(ctx->client.handle, 1) != 0;
+     * established link, and is lost on reboot/re-link (back to mode 0),
+     * hence here. */
+    if (ctx->cfg.role == LC_ROLE_AP && ctx->frame_change > 0) {
+        lc_frame_change_try(ctx);
     }
 
     /* DEV side of --link-policy: the downlink's table, on every connect
@@ -1125,6 +1142,47 @@ static void lc_drain_power_request(lifecycle_ctx* ctx)
     lc_poll_power(ctx);
 }
 
+static void lc_frame_change_set_pending(lifecycle_ctx* ctx, int pending)
+{
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->frame_change_pending = pending;
+    pthread_mutex_unlock(&ctx->status_lock);
+}
+
+/* Sends the wanted frame change mode; still pending (retried per poll)
+ * if the chip refuses it. */
+static void lc_frame_change_try(lifecycle_ctx* ctx)
+{
+    lc_frame_change_set_pending(ctx, lc_frame_change_apply(ctx->client.handle, ctx->frame_change) != 0);
+}
+
+/* Drains lifecycle_request_frame_change()'s mailbox: persists, then
+ * applies while connected -- mode 0 too, since the link may be running
+ * another mode right now. Without a link the next connect applies it. */
+static void lc_drain_frame_change_request(lifecycle_ctx* ctx)
+{
+    pthread_mutex_lock(&ctx->cmd_lock);
+    int mode                  = ctx->pending_frame_change;
+    ctx->pending_frame_change = -1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+
+    if (mode < 0) {
+        return;
+    }
+    lc_log("lifecycle: http: frame change requested: mode %d", mode);
+    if (ctx->cfg.cfg_path[0]) {
+        lc_frame_change_save(ctx->cfg.cfg_path, mode);
+    }
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->frame_change = mode;
+    pthread_mutex_unlock(&ctx->status_lock);
+    if (ctx->state == LC_STATE_CONNECTED) {
+        lc_frame_change_try(ctx);
+    } else {
+        lc_frame_change_set_pending(ctx, 0);
+    }
+}
+
 /* Writes whole degC to cfg.rf_temp_file via rename(), so a reader never
  * sees a half-written line. */
 static void lc_write_rf_temp_file(const lifecycle_ctx* ctx, int c10)
@@ -1417,6 +1475,7 @@ void* lifecycle_thread_main(void* arg)
         lc_drain_retx_request(ctx);
         lc_drain_channel_request(ctx);
         lc_drain_power_request(ctx);
+        lc_drain_frame_change_request(ctx);
         lc_drain_forget_request(ctx);
         lc_poll_distance(ctx);
         lc_poll_sock_info(ctx);
@@ -1545,13 +1604,13 @@ void* lifecycle_thread_main(void* arg)
                            ctx->last_bandwidth);
                     lc_tuning_apply(ctx->client.handle, ctx->connected_slot, ctx->last_bandwidth);
                     /* Bandwidth renegotiation may reset the frame structure. */
-                    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.frame_change) {
-                        ctx->frame_change_pending = 1;
+                    if (ctx->cfg.role == LC_ROLE_AP && ctx->frame_change > 0) {
+                        lc_frame_change_set_pending(ctx, 1);
                     }
                 }
             }
             if (did_fallback_poll && ctx->frame_change_pending) {
-                ctx->frame_change_pending = lc_frame_change_apply(ctx->client.handle, 1) != 0;
+                lc_frame_change_try(ctx);
             }
             if (did_fallback_poll) {
                 lc_channel_track(ctx);
@@ -1595,6 +1654,8 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->work_chan      = ctx->work_chan;
     out->power          = ctx->power;
     out->power_dbm      = ctx->power_dbm;
+    out->frame_change   = ctx->frame_change;
+    out->frame_change_pending = ctx->frame_change_pending;
     out->armed          = ctx->armed;
     out->standby        = ctx->standby;
     out->soc_temp_valid = ctx->soc_temp_valid;
@@ -1680,6 +1741,20 @@ int lifecycle_request_power(lifecycle_ctx* ctx, int level)
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_power       = level;
     ctx->pending_power_valid = 1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_frame_change(lifecycle_ctx* ctx, int mode)
+{
+    if (ctx->cfg.role != LC_ROLE_AP) {
+        return -2;
+    }
+    if (mode < 0 || mode > LC_FRAME_CHANGE_MAX) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_frame_change = mode;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }

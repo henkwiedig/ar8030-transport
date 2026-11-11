@@ -81,8 +81,11 @@ static void print_help(const char* argv0)
     printf("                            control API\" section)\n");
     printf("  --http-bind <addr>        address to bind the HTTP control API to\n");
     printf("                            (default: 0.0.0.0, every interface)\n");
-    printf("  --frame-change 0|1        AP only: apply BB_SET_FRAME_CHANGE(1) after every connect\n");
-    printf("                            (default 1; 0 leaves the chip's frame structure alone)\n");
+    printf("  --frame-change 0|1|2      AP only: BB_SET_FRAME_CHANGE mode after every connect while\n");
+    printf("                            none is persisted (ar8030.frame_change, POST\n");
+    printf("                            /api/v1/frame-change): 1 exchanged frame structure,\n");
+    printf("                            2 short uplink slot (lower latency, less throughput),\n");
+    printf("                            0 leaves the chip's frame structure alone (default 1)\n");
     printf("  --rf-temp-adc <ch>        poll RF-board temperature on this AR8030 ADC channel\n");
     printf("                            (default: none -- board-specific; Caddx Ascent: 4)\n");
     printf("  --rf-temp-file <path>     also write it there in whole degC, \"\" = don't\n");
@@ -298,7 +301,11 @@ int main(int argc, char** argv)
             cfg.http_port = (uint16_t)strtoul(optarg, NULL, 10);
             break;
         case OPT_FRAME_CHANGE:
-            cfg.frame_change = atoi(optarg) ? 1 : 0;
+            cfg.frame_change = atoi(optarg);
+            if (cfg.frame_change < 0 || cfg.frame_change > LC_FRAME_CHANGE_MAX) {
+                fprintf(stderr, "ar8030-lifecycled: --frame-change takes 0..%d\n", LC_FRAME_CHANGE_MAX);
+                return 1;
+            }
             break;
         case OPT_HTTP_BIND:
             strncpy(cfg.http_bind, optarg, sizeof(cfg.http_bind) - 1);

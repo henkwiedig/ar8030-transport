@@ -395,6 +395,7 @@ static void format_power_fields(const lifecycle_http_ctx* http, const lc_status_
 }
 
 static void format_heat_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz);
+static void format_frame_change_fields(const lc_status_t* st, char* out, size_t out_sz);
 
 static void handle_status(lifecycle_http_ctx* http, int fd)
 {
@@ -422,6 +423,8 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
     format_power_fields(http, &st, power, sizeof(power));
     char heat[64];
     format_heat_fields(http, &st, heat, sizeof(heat));
+    char frame[96];
+    format_frame_change_fields(&st, frame, sizeof(frame));
     char dist[16];
     if (st.distance_m >= 0) {
         snprintf(dist, sizeof(dist), "%d", st.distance_m);
@@ -429,12 +432,12 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
         snprintf(dist, sizeof(dist), "null");
     }
 
-    char json[9050];
+    char json[9150];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,%s,"
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,%s,%s,"
               "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"batt_v\":%s,\"linkctl_exit_code\":%d,"
               "\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, heat, dist,
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, heat, frame, dist,
              st.paired ? "true" : "false", rf_temp, batt_v, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
@@ -723,6 +726,51 @@ static void handle_power(lifecycle_http_ctx* http, int fd, const char* method, c
     send_json(fd, 200, "OK", json);
 }
 
+/* "frame_change" (wanted mode, null on the DEV) and "frame_change_applied"
+ * (the chip accepted it on the current link; null on the DEV). */
+static void format_frame_change_fields(const lc_status_t* st, char* out, size_t out_sz)
+{
+    if (st->frame_change < 0) {
+        snprintf(out, out_sz, "\"frame_change\":null,\"frame_change_applied\":null");
+        return;
+    }
+    int applied = st->state == LC_STATE_CONNECTED && !st->frame_change_pending;
+    snprintf(out, out_sz, "\"frame_change\":%d,\"frame_change_applied\":%s", st->frame_change,
+             applied ? "true" : "false");
+}
+
+/* GET /api/v1/frame-change -- the wanted BB_SET_FRAME_CHANGE mode (AP;
+ * null on the DEV) and whether the current link runs it, cheap (no
+ * linkctl fork). POST /api/v1/frame-change?mode=<0|1|2> -- persisted and
+ * applied on the lifecycle thread's next tick, AP only (409 on the DEV). */
+static void handle_frame_change(lifecycle_http_ctx* http, int fd, const char* method, const char* query)
+{
+    if (strcmp(method, "POST") == 0) {
+        int mode;
+        int rc = query_param_int(query, "mode", &mode) != 0 ? -1 : lifecycle_request_frame_change(http->lc, mode);
+        if (rc == -2) {
+            send_json(fd, 409, "Conflict",
+                      "{\"ok\":false,\"error\":\"the air unit (ap) owns the frame structure: set it there\"}");
+            return;
+        }
+        if (rc != 0) {
+            send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"'mode' must be 0, 1 or 2\"}");
+            return;
+        }
+        char json[48];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":%d}", mode);
+        send_json(fd, 202, "Accepted", json);
+        return;
+    }
+
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    char fields[96], json[160];
+    format_frame_change_fields(&st, fields, sizeof(fields));
+    snprintf(json, sizeof(json), "{\"ok\":true,%s,\"modes\":[0,1,2]}", fields);
+    send_json(fd, 200, "OK", json);
+}
+
 /* "soc_temp_c" (null without --soc-temp-cmd or a reading) and
  * "overheat" (video paused for heat, null without --overheat-c). */
 static void format_heat_fields(const lifecycle_http_ctx* http, const lc_status_t* st, char* out, size_t out_sz)
@@ -872,6 +920,17 @@ static const char INDEX_HTML[] =
     "<span id='pwr_cur'></span>\n"
     "</div>\n"
     "\n"
+    "<h2>Frame structure (air unit, persisted, survives reboots)</h2>\n"
+    "<div class='row'>\n"
+    "<select id='fc'>\n"
+    "<option value='1'>1: exchanged (most throughput)</option>\n"
+    "<option value='2'>2: short uplink slot (lower latency, ~15% less throughput)</option>\n"
+    "<option value='0'>0: chip default</option>\n"
+    "</select>\n"
+    "<button id='fc_btn' onclick='setFrameChange()'>Apply</button>\n"
+    "<span id='fc_cur'></span>\n"
+    "</div>\n"
+    "\n"
     "<h2>Advanced (ar8030-linkctl, one-shot -- not persisted)</h2>\n"
     "\n"
     "<div class='ctl'><span>Channel mode</span>\n"
@@ -1002,6 +1061,24 @@ static const char INDEX_HTML[] =
     "    setTimeout(loadPower, 1500);\n"
     "  }).catch(e=>msg('error: '+e, false));\n"
     "}\n"
+    "function loadFrameChange(){\n"
+    "  fetch('/api/v1/frame-change').then(r=>r.json()).then(d=>{\n"
+    "    var cur = document.getElementById('fc_cur');\n"
+    "    if (d.frame_change === null) {\n"
+    "      document.getElementById('fc').disabled = true;\n"
+    "      document.getElementById('fc_btn').disabled = true;\n"
+    "      cur.textContent = 'set on the air unit'; return;\n"
+    "    }\n"
+    "    document.getElementById('fc').value = d.frame_change;\n"
+    "    cur.textContent = d.frame_change_applied ? 'running' : 'applied on the next link';\n"
+    "  });\n"
+    "}\n"
+    "function setFrameChange(){\n"
+    "  fetch('/api/v1/frame-change?mode='+encodeURIComponent(v('fc')), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
+    "    msg(d.ok ? 'frame change queued: mode '+d.queued : 'failed: '+d.error, d.ok);\n"
+    "    setTimeout(loadFrameChange, 1500);\n"
+    "  }).catch(e=>msg('error: '+e, false));\n"
+    "}\n"
     "function setChannel(){\n"
     "  var ch = v('chan');\n"
     "  fetch('/api/v1/channel?chan='+encodeURIComponent(ch), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
@@ -1046,6 +1123,7 @@ static const char INDEX_HTML[] =
     "}\n"
     "refresh();\n"
     "loadPower();\n"
+    "loadFrameChange();\n"
     "setInterval(refresh, 2000);\n"
     "</script>\n"
     "</body></html>\n";
@@ -1128,6 +1206,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_retx_tuning(http, fd, query);
     } else if (strcmp(path, "/api/v1/power") == 0) {
         handle_power(http, fd, method, query);
+    } else if (strcmp(path, "/api/v1/frame-change") == 0) {
+        handle_frame_change(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/armed") == 0) {
         handle_armed(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/channel") == 0) {

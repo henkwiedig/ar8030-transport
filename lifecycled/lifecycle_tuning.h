@@ -237,14 +237,26 @@ int lc_retx_save(const char* cfg_path, int win, int busy, int idle, int conti_bu
 
 /* Applies the 5 values via BB_SET_RETX_EVENT_STATUS (chip-wide, no slot
  * parameter). Returns the ioctl's own return code (0 on success). */
-/* BB_SET_FRAME_CHANGE (1V1 only). mode=1 exchanges the frame structure
- * (confirmed live on air: BB_GET_MCS throughput at MCS 12 / 20M goes from
- * 25933 to 36688 kbps, matching what stock reaches); mode=0 restores the
- * original. Does not survive a reboot or re-link -- must be re-applied
- * after every connect. Idempotent: confirmed live that repeating mode=1
- * on an already-exchanged link leaves throughput unchanged, so it is safe
- * to re-assert periodically. Returns the ioctl's own return code. */
+/* BB_SET_FRAME_CHANGE (1V1 only), mode 0..LC_FRAME_CHANGE_MAX. mode=1
+ * exchanges the frame structure (confirmed live on air: BB_GET_MCS
+ * throughput at MCS 12 / 20M goes from 25933 to 36688 kbps, matching what
+ * stock reaches); mode=2 shortens the uplink slot, so the whole cycle
+ * (7965 -> 4651 us at 20 MHz) and with it the delivery delay (frames
+ * reach the ground ~8 ms earlier at 60 fps) for ~15% less throughput
+ * (36688 -> 31415 kbps at MCS 12); mode=0 restores the original. Does not
+ * survive a reboot or re-link -- must be re-applied after every connect.
+ * Idempotent: confirmed live that repeating mode=1 on an already-exchanged
+ * link leaves throughput unchanged, so it is safe to re-assert
+ * periodically. Returns the ioctl's own return code (-1 for a mode out of
+ * range, nothing sent). */
+#define LC_FRAME_CHANGE_MAX 2
 int lc_frame_change_apply(bb_dev_handle_t* handle, int mode);
+
+/* Sidecar "ar8030.frame_change" next to cfg_path (the mode, 0..
+ * LC_FRAME_CHANGE_MAX). Load returns 0 and fills *out, -1 if missing or
+ * invalid; save returns 0 on success. */
+int lc_frame_change_load(const char* cfg_path, int* out);
+int lc_frame_change_save(const char* cfg_path, int mode);
 
 int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int conti_busy, int conti_idle);
 

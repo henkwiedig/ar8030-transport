@@ -238,12 +238,63 @@ int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int cont
 
 int lc_frame_change_apply(bb_dev_handle_t* handle, int mode)
 {
+    if (mode < 0 || mode > LC_FRAME_CHANGE_MAX) {
+        lc_log("lifecycle: tuning: frame change mode %d out of range, not sent", mode);
+        return -1;
+    }
     bb_set_frame_change_t fc;
     memset(&fc, 0, sizeof(fc));
-    fc.mode = mode ? 1 : 0;
+    fc.mode = (uint8_t)mode;
     int ret = bb_ioctl(handle, BB_SET_FRAME_CHANGE, &fc, NULL);
     lc_log("lifecycle: tuning: BB_SET_FRAME_CHANGE(mode=%u) ret=%d", fc.mode, ret);
     return ret;
+}
+
+int lc_frame_change_load(const char* cfg_path, int* out)
+{
+    char path[512];
+    lc_sidecar_path(cfg_path, "ar8030.frame_change", path, sizeof(path));
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    int mode = -1;
+    int ok   = fscanf(f, "%d", &mode) == 1;
+    fclose(f);
+    if (!ok || mode < 0 || mode > LC_FRAME_CHANGE_MAX) {
+        lc_log("lifecycle: tuning: %s has no valid frame change mode, ignoring", path);
+        return -1;
+    }
+    *out = mode;
+    return 0;
+}
+
+int lc_frame_change_save(const char* cfg_path, int mode)
+{
+    if (mode < 0 || mode > LC_FRAME_CHANGE_MAX) {
+        lc_log("lifecycle: tuning: refusing to persist invalid frame change mode %d", mode);
+        return -1;
+    }
+
+    char path[512];
+    lc_sidecar_path(cfg_path, "ar8030.frame_change", path, sizeof(path));
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "%d\n", mode);
+    fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: tuning: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 int lc_channel_parse(const char* s, int* out)
