@@ -3,8 +3,10 @@
 Status, 2026-11-12: phases 1-4 done and bench-tested on the VR04 with a P1
 air unit (see "Results"); the ring is the default on every Artosyn ground
 (sbc-groundstations 7b15901), the VRX Pro (Rockchip/MPP) untested. Phase 5
-(audio) waits for an Ascent air unit: the P1 has no microphone. Decisions
-taken with the user are in "Decisions" at the end.
+(audio): built, the transport bench-tested with a synthetic Opus stream on
+the P1 (which has no microphone); playback waits for an Ascent air unit and
+a ground with an audio output (the VR04 has none). Decisions taken with the
+user are in "Decisions" at the end.
 
 ## Why
 
@@ -168,6 +170,25 @@ Both rings carry ground-clock times, so audio could later be held back to
 line up with the vsync-locked video; today audio plays as soon as it
 arrives (`sync=false`), and that stays.
 
+### What was built (phase 5)
+
+- tx `-a <port>` (tx/audio_sub.c): binds 127.0.0.1:<port> (waybeam's
+  `outgoing.audioPort`, 5601), queues each RTP/Opus packet on tx/outq.h
+  like the sidecar (queue 16 -> 32 entries), written with the next video
+  chunk as an `AR8030_CHUNK_CODEC_OPUS` single-chunk frame. The air units'
+  `hooks.d/*/40-socat.sh` relayed that port over ar_net0 to the ground's
+  UDP 5600 (09-23, "socat for audio forward"); with PixelPilot reading the
+  ring that went nowhere, so the hooks go and tx takes the port.
+- rx `-A <name>`: each OPUS chunk into the audio ring (64 x 1 KB,
+  `VENC_FRAME_CODEC_OPUS`, pts = rx's receive time), and as RTP to the UDP
+  target while rx sends RTP; `-v` prints an "rx audio:" line.
+- PixelPilot `--frame-shm-audio <name>` (with `--audio`): a reader pushes
+  each packet into `appsrc ! tee name=rtp_tee`, so the RTP path's playback
+  branch and the recorders' audio tap work unchanged.
+- Bench (P1 + VR04): a 50 packets/s Opus test stream (host GStreamer ->
+  socat on the P1 -> tx -a) arrived in the ground's audio ring at 49.8/s,
+  0 dropped, read by PixelPilot; video unaffected.
+
 ## Expected effect (VR04)
 
 Gone from the live path: rx's RTP packetizing and sends, `udpsrc0:src`, the
@@ -190,7 +211,8 @@ visibly.
    and SinYine VRX.
 5. Audio: tx muxes waybeam's Opus onto the video socket, rx writes
    `/gnd_audio`, PixelPilot plays it through an appsrc; `audio_tx`/`audio_rx`
-   retire (their port 3 belongs to `ar_net0`).
+   retire (their port 3 belongs to `ar_net0`), and so does the air units'
+   socat relay of the audio port over ar_net0 (the user's choice, 11-12).
 
 ## Results (VR04 + P1 air, 2026-11-12)
 
