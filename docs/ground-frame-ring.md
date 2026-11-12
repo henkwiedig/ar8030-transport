@@ -232,6 +232,18 @@ interleaved 2 x 90 s each, both with the table CRC16 and RTP at `-M 8192`:
   thread of their own (starting one took 0.8-1 s, which overflowed the
   8-entry ring when it ran on the ring thread)
 - an rx restart: PixelPilot sees the ring gone or replaced and reattaches
+- the re-encoding DVR (the VR04's default) stalls the decoder feed now and
+  then (the wave5 encoder next to the decoder): with one thread reading the
+  ring and feeding the decoder that lost ~1100 entries in 84 s. PixelPilot
+  88c4787 reads the ring in one thread (SCHED_FIFO) into a 2 MB queue and
+  feeds the decoder from it in another, as udpsrc's socket buffer and the
+  pull thread did: 0 lost. 50 s each, display drops per 10 s: no DVR 3.0,
+  raw 4.5, re-encode 7.3
+- memory: the VR04 runs close to its limit. With 9 MB of test files in /tmp
+  (MemAvailable 16 MB, CMA nearly empty) recording froze the whole process
+  for 1-6 s at a time; with ~25 MB available it was clean. The ring itself
+  is resident (4 MB in /dev/shm); 8 x 256 KB would halve that if the
+  Ascent's IDRs fit
 - defaults (sbc-groundstations): S98ar8030-transport-rx passes
   `-R gnd_frames`, pixelpilot.sh adds `--frame-shm gnd_frames` in receiver
   mode artosyn (not /etc/default/pixelpilot, whose gsmenu-edited overlay
