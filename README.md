@@ -651,6 +651,21 @@ still, then start waybeam -- tx only looks for a replaced ring after a
 200 ms gap in frames, so it would keep reading a still that is still
 writing.
 
+## Ground frame ring: rx -> PixelPilot without RTP (`rx -R`)
+
+`rx -R <name>` publishes the reassembled video into a frame-shm ring of its
+own (`/dev/shm/<name>`, the same `venc_frame_ring` format as waybeam's
+`/venc_frames`) instead of sending RTP to PixelPilot over the loopback: on
+the 2-core AR9311 goggles the RTP hop and PixelPilot's GStreamer receive
+path cost more CPU than anything else in the receive chain. An entry is
+what rx would have sent as RTP (a whole access unit, or one forwarded part
+of a streamed frame with `VENC_FRAME_FLAG_PARTIAL`, timing SEI in-band);
+`VENC_FRAME_FLAG_DISCONT` marks the first entry after anything went missing.
+With `-R` the RTP output is off; `-P` keeps it as well, for testing.
+`ringdump/` (`ar8030-ringdump`) reads the ring and, given rx's RTP on a
+port, checks the two carry the same NAL units. Design, decisions, phases
+and bench results: [docs/ground-frame-ring.md](docs/ground-frame-ring.md).
+
 ## ar8030d connection: surviving a daemon restart
 
 Both `tx/main.c` and `rx/main.c` only ever called `ar8030_link_connect_retry()`
