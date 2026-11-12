@@ -50,6 +50,11 @@
 /* Metadata prepended to each frame in the slot's data[] */
 #define VENC_FRAME_META_SIZE    8
 #define VENC_FRAME_CODEC_H265   0x01
+/* RTP/Opus packets, one per entry, as the air unit's audio path sent them.
+ * Never in a video ring: ar8030-transport-rx publishes the AR8030 link's
+ * audio in a ring of its own (ar8030-transport docs/ground-frame-ring.md),
+ * so a consumer that only knows H.265 never meets one. */
+#define VENC_FRAME_CODEC_OPUS   0x02
 #define VENC_FRAME_FLAG_IDR     0x01
 #define VENC_FRAME_FLAG_GDR     0x02  /* GDR rolling intra stripe active */
 #define VENC_FRAME_FLAG_ENHANCE 0x04  /* SVC-T enhance layer (droppable) */
@@ -80,6 +85,16 @@
  * flag would take every slice for a picture, so a producer sets it only when
  * slice output was asked for. */
 #define VENC_FRAME_FLAG_PARTIAL  0x10
+/* Bit 5 is set by a RECEIVER, never by venc, like SALVAGED.  The ground's
+ * ar8030-transport-rx republishes what came over the AR8030 link and stamps
+ * it on the first entry after something went missing in front of it: whole
+ * frames that never arrived (a frame counter gap), the rest of a picture whose
+ * first slices were already published, or entries it dropped itself because
+ * the ring was full.  A decoder that sees it must expect broken references
+ * until the next IDR or completed GDR cycle, and may ask the air for an IDR.
+ * Absence is not a guarantee: a producer that does not track loss never sets
+ * it. */
+#define VENC_FRAME_FLAG_DISCONT  0x20
 
 typedef struct {
 	uint32_t pts;        /* capture timestamp (µs, CLOCK_MONOTONIC, truncated to 32 bits) */
