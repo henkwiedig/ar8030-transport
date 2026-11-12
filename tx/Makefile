@@ -43,6 +43,7 @@ SRCS := \
 	idr_ctrl.c \
 	outq.c \
 	sidecar_sub.c \
+	audio_sub.c \
 	$(COMMON)/chunk_stream.c \
 	$(COMMON)/ar8030_link.c \
 	$(COMMON)/http_get.c \

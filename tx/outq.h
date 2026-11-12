@@ -3,8 +3,8 @@
 
 /*
  * Small air -> ground chunks that are not video: SYNCR clock-sync replies
- * (tx/idr_ctrl.c) and tunnelled waybeam sidecar datagrams
- * (tx/sidecar_sub.c).
+ * (tx/idr_ctrl.c), tunnelled waybeam sidecar datagrams (tx/sidecar_sub.c)
+ * and waybeam's RTP/Opus audio (tx/audio_sub.c).
  *
  * Those come from other threads, but the video socket is stream mode: a
  * chunk written from a second thread could land in the middle of a video
@@ -21,10 +21,12 @@
 
 #include "ar8030_chunk.h"
 
-#define TX_OUTQ_DEPTH 16
+/* 32: room for the audio (~50 packets/s) next to the sidecar (one per frame)
+ * and the SYNCR replies between two video chunks. */
+#define TX_OUTQ_DEPTH 32
 
 typedef struct {
-    uint8_t codec; /* AR8030_CHUNK_CODEC_CTRL or _SIDECAR */
+    uint8_t codec; /* AR8030_CHUNK_CODEC_CTRL, _SIDECAR or _OPUS */
     /* SYNCR replies are formatted at send time so t3 is the real write
      * time; everything else is sent from data/len as is. */
     int is_syncr;

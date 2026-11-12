@@ -92,10 +92,12 @@
 #define AR8030_CHUNK_CODEC_H265 0x01u
 /* A chunk of this codec carries one whole, already RTP-packetized audio
  * datagram (waybeam's cv610_audio.c own RTP/Opus packetizer output, PT=98)
- * verbatim -- see audio_tx/main.c and audio_rx/main.c. Unlike H.265, there
- * is no Annex-B re-parsing or RTP re-packetization on either end: the
- * bytes that go in on the air side are the exact bytes handed to a UDP
- * `send()` on the ground side. */
+ * verbatim. tx -a sends it as a single-chunk frame on the video socket,
+ * between or among the video chunks like CTRL and SIDECAR (tx/audio_sub.c);
+ * rx publishes it to its audio ring (-A) or sends it as RTP next to the
+ * video. audio_tx/audio_rx did the same on a socket of their own, which
+ * cannot coexist with ar_net0 (port 3). Unlike H.265, there is no Annex-B
+ * re-parsing or RTP re-packetization on either end. */
 #define AR8030_CHUNK_CODEC_OPUS 0x02u
 
 /* A control message on the video socket (both ends open it TX|RX). One

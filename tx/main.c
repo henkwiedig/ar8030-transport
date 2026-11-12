@@ -23,6 +23,7 @@
 #include "chunker.h"
 #include "outq.h"
 #include "sidecar_sub.h"
+#include "audio_sub.h"
 #include "venc_frame_ring.h"
 
 #include <errno.h>
@@ -161,6 +162,7 @@ struct tx_args {
     uint32_t ring_backlog_slots; /* URGENT trips at low_water_slots >= this (ring has 8 slots) */
     double ring_backoff;         /* bitrate multiplier per URGENT cut */
     int sidecar_port;            /* waybeam outgoing.sidecarPort to forward, 0 = off */
+    int audio_port;              /* waybeam outgoing.audioPort to receive, 0 = off */
     const char *pi_params[16];   /* -p key=value, applied after the PI defaults */
     int n_pi_params;
     int verbose;
@@ -205,6 +207,9 @@ static void usage(const char *argv0)
             "                 pi_write_cost_ms\n"
             "  -S <port>      forward waybeam's RTP timing sidecar from this loopback UDP port\n"
             "                 (waybeam outgoing.sidecarPort) to the ground (default 0 = off)\n"
+            "  -a <port>      receive waybeam's RTP/Opus audio on this loopback UDP port\n"
+            "                 (waybeam outgoing.audioPort) and send it on the video socket\n"
+            "                 (default 0 = off)\n"
 
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
@@ -260,13 +265,17 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->ring_backlog_slots = 6; /* of 8; measured: <=4 fires on ordinary keyframe bursts */
     a->ring_backoff = 0.92;
     a->sidecar_port = 0;
+    a->audio_port = 0;
     a->n_pi_params = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:D:B:R:Q:K:i:S:C:p:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:D:B:R:Q:K:i:S:a:C:p:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
+            break;
+        case 'a':
+            a->audio_port = atoi(optarg);
             break;
         case 'i':
             a->idr_coalesce_ms = atoi(optarg);
@@ -930,6 +939,12 @@ int main(int argc, char **argv)
     pthread_t sc_thread;
     int sc_thread_ok = args.sidecar_port > 0 && pthread_create(&sc_thread, NULL, sidecar_sub_thread_main, &sc_cfg) == 0;
 
+    audio_sub_cfg_t au_cfg = {
+        .port = args.audio_port, .outq = &outq, .verbose = args.verbose, .stop_flag = &g_stop
+    };
+    pthread_t au_thread;
+    int au_thread_ok = args.audio_port > 0 && pthread_create(&au_thread, NULL, audio_sub_thread_main, &au_cfg) == 0;
+
     pthread_t bc_thread;
     int bc_thread_ok = (pthread_create(&bc_thread, NULL, bitrate_thread_main, &bc_cfg) == 0);
     if (!bc_thread_ok)
@@ -1011,12 +1026,13 @@ int main(int argc, char **argv)
                 print_tx_stats(&stats, &stats_prev, now - stats_last_print, ring);
                 uint64_t wf = stats.write_frames - stats_prev.write_frames;
                 fprintf(stderr, "tx stats: pts age %.2f ms | capture->write start %.2f ms avg | frame write %.2f ms avg, "
-                        "%.2f max | sidecar forwarded=%llu | outq dropped=%llu | delay %.1f ms\n",
+                        "%.2f max | sidecar forwarded=%llu | audio forwarded=%llu | outq dropped=%llu | "
+                        "delay %.1f ms\n",
                         pts_age_us / 1000.0,
                         wf ? (stats.age_at_send_us_sum - stats_prev.age_at_send_us_sum) / 1000.0 / wf : 0.0,
                         wf ? (stats.write_us_sum - stats_prev.write_us_sum) / 1000.0 / wf : 0.0,
                         stats.write_us_max / 1000.0, (unsigned long long)sc_cfg.forwarded,
-                        (unsigned long long)outq.dropped,
+                        (unsigned long long)au_cfg.forwarded, (unsigned long long)outq.dropped,
                         __atomic_load_n(&bc_cfg.delay_us, __ATOMIC_ACQUIRE) / 1000.0);
                 stats.write_us_max = 0;
                 stats_prev = stats;
@@ -1334,6 +1350,8 @@ int main(int argc, char **argv)
         pthread_join(idr_thread, NULL);
     if (sc_thread_ok)
         pthread_join(sc_thread, NULL);
+    if (au_thread_ok)
+        pthread_join(au_thread, NULL);
 
     free(send_ctx.combo);
     free(chunk_scratch);

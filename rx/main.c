@@ -55,6 +55,10 @@
 #define DEFAULT_VIDEO_PORT 2     /* must match tx/main.c's -o, see its comment */
 /* -R: slots in the frame-shm ring, as in waybeam's own (venc_frame_ring.h). */
 #define RING_SLOTS 8
+/* -A: the audio ring, one RTP/Opus packet per entry (at most
+ * AR8030_SIDECAR_MAX_PAYLOAD bytes), ~1.3 s at 50 packets/s. */
+#define AUDIO_RING_SLOTS 64
+#define AUDIO_RING_SLOT_SIZE 1024
 #define DEFAULT_MAX_RTP_PAYLOAD 1400
 #define DEFAULT_REASSEMBLY_MAX (512 * 1024) /* venc_frame_ring.h: up to 512 KB slots (CV610) */
 #define RETRY_MS 2000
@@ -112,6 +116,7 @@ struct rx_args {
     const char *log_path; /* -L, NULL = stderr as inherited */
     const char *ring_name; /* -R: publish to this frame-shm ring instead of RTP */
     int also_rtp;          /* -P: RTP as well as the ring (for comparing the two) */
+    const char *audio_ring_name; /* -A: publish the air's audio to this frame-shm ring */
 };
 
 static void usage(const char *argv0)
@@ -132,6 +137,8 @@ static void usage(const char *argv0)
             "  -R <name>      publish the frames to frame-shm ring <name> (e.g. gnd_frames) for\n"
             "                 a same-host consumer instead of sending RTP (docs/ground-frame-ring.md)\n"
             "  -P             with -R: send the RTP as well (testing)\n"
+            "  -A <name>      publish the air unit's RTP/Opus audio (tx -a) to frame-shm ring\n"
+            "                 <name> (e.g. gnd_audio); without -R it also goes out as RTP\n"
 
             "  -v             print periodic in/out stats to stderr (chunks, resyncs, frames, "
             "bytes, RTP output)\n"
@@ -158,9 +165,10 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
     a->log_path = NULL;
     a->ring_name = NULL;
     a->also_rtp = 0;
+    a->audio_ring_name = NULL;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:TvL:R:Ph")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:TvL:R:PA:h")) != -1) {
         switch (opt) {
         case 'L':
             a->log_path = optarg;
@@ -170,6 +178,9 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
             break;
         case 'P':
             a->also_rtp = 1;
+            break;
+        case 'A':
+            a->audio_ring_name = optarg;
             break;
         case 'C':
             a->sidecar_port = atoi(optarg);
@@ -456,6 +467,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "rx: publishing frames to frame-shm ring '%s' (%d x %u bytes)%s\n", args.ring_name,
                 RING_SLOTS, slot_size, rtp_on ? ", and RTP" : "");
     }
+    /* The air's audio: its own ring, so a reader that only wants video, or
+     * stalls on it, never meets or blocks the other (docs/ground-frame-ring.md). */
+    venc_frame_ring_t *audio_ring = NULL;
+    if (args.audio_ring_name) {
+        audio_ring = venc_frame_ring_create(args.audio_ring_name, AUDIO_RING_SLOTS, AUDIO_RING_SLOT_SIZE);
+        if (!audio_ring)
+            fprintf(stderr, "rx: cannot create audio ring '%s', audio %s\n", args.audio_ring_name,
+                    rtp_on ? "as RTP only" : "dropped");
+        else
+            fprintf(stderr, "rx: publishing audio to frame-shm ring '%s' (%d x %d bytes)\n", args.audio_ring_name,
+                    AUDIO_RING_SLOTS, AUDIO_RING_SLOT_SIZE);
+    }
+    uint64_t audio_packets = 0, audio_dropped = 0, audio_prev = 0;
 
     rtp_h265_ctx_t rtp_ctx;
     rtp_h265_init(&rtp_ctx, udp_fd, args.rtp_max_payload);
@@ -555,6 +579,12 @@ int main(int argc, char **argv)
                     ring_prev_partial = ring_out.partial_entries;
                     ring_prev_read = rd;
                 }
+                if (audio_packets || audio_ring) {
+                    fprintf(stderr, "rx audio: %.1f packets/s | totals: packets=%llu ring_dropped=%llu\n",
+                            (audio_packets - audio_prev) / (now - stats_last_print),
+                            (unsigned long long)audio_packets, (unsigned long long)audio_dropped);
+                    audio_prev = audio_packets;
+                }
                 int64_t off;
                 uint32_t unc;
                 if (clock_sync_get(&sync, &off, &unc))
@@ -651,6 +681,20 @@ int main(int argc, char **argv)
         }
         if (hdr.codec == AR8030_CHUNK_CODEC_SIDECAR) {
             sidecar_srv_publish(&sidecar, payload_buf, payload_len);
+            continue;
+        }
+        if (hdr.codec == AR8030_CHUNK_CODEC_OPUS) {
+            /* One RTP/Opus packet (tx -a): to the audio ring, and next to the
+             * video as RTP while there is RTP (PixelPilot splits by payload
+             * type, as with audio_rx). */
+            audio_packets++;
+            if (audio_ring) {
+                VencFrameMeta am = {.pts = (uint32_t)clock_sync_now_us(), .codec = VENC_FRAME_CODEC_OPUS};
+                if (venc_frame_ring_write(audio_ring, &am, payload_buf, payload_len) != 0)
+                    audio_dropped++;
+            }
+            if (rtp_on && udp_fd >= 0)
+                send(udp_fd, payload_buf, payload_len, 0);
             continue;
         }
         if (hdr.codec != AR8030_CHUNK_CODEC_H265)
@@ -779,6 +823,8 @@ int main(int argc, char **argv)
     free(payload_buf);
     free(reasm_buf);
     rx_ring_out_close(&ring_out);
+    if (audio_ring)
+        venc_frame_ring_destroy(audio_ring);
     if (udp_fd >= 0)
         close(udp_fd);
     g_stop = 1;
