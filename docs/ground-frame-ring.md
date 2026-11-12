@@ -1,7 +1,9 @@
 # Ground frame ring: rx -> PixelPilot without RTP
 
-Status: phase 1 (rx producer + test reader) done and bench-tested
-2026-11-12, see "Phase 1 results"; PixelPilot's side not started. Decisions
+Status, 2026-11-12: phases 1-4 done and bench-tested on the VR04 with a P1
+air unit (see "Results"); the ring is the default on every Artosyn ground
+(sbc-groundstations 7b15901), the VRX Pro (Rockchip/MPP) untested. Phase 5
+(audio) waits for an Ascent air unit: the P1 has no microphone. Decisions
 taken with the user are in "Decisions" at the end.
 
 ## Why
@@ -190,7 +192,9 @@ visibly.
    `/gnd_audio`, PixelPilot plays it through an appsrc; `audio_tx`/`audio_rx`
    retire (their port 3 belongs to `ar_net0`).
 
-## Phase 1 results (VR04 + P1 air, 2026-11-12)
+## Results (VR04 + P1 air, 2026-11-12)
+
+### Phase 1: rx producer
 
 `rx -R gnd_frames` (`rx/ring_out.c`, host test `test/ring_out_test.c`) and
 `ringdump/` (`ar8030-ringdump`), on the bench VR04 with the P1 sending
@@ -211,6 +215,28 @@ SC231AI 1080p60 in two strips, ~21.8 Mbit/s:
   dropped (~354 in the 3 s before the reader attached); the first entry the
   reader then gets carries DISCONT.
 
+### Phases 2-4: PixelPilot, DVR, defaults
+
+PixelPilot `--frame-shm` (PixelPilot_rk 24f265f, dbd37c9), ring vs RTP
+interleaved 2 x 90 s each, both with the table CRC16 and RTP at `-M 8192`:
+
+| | PixelPilot | rx | box busy | p50 | p99 | vsync target | display drops |
+|---|---|---|---|---|---|---|---|
+| RTP | 45 % of a core | 16 % | 51 % | 33.2 ms | 45.6 ms | 47.1 ms | 4.8 / 10 s |
+| ring | 21 % | 11 % | 35 % | 30.0 ms | 36.3 ms | 43.2 ms | 2.6 / 10 s |
+
+- the wave5 decoder must not get GDR pictures before the parameter sets
+  (h265parse holds them back on the RTP path): PixelPilot feeds from the
+  first access unit with an SPS
+- raw DVR from the ring through an appsrc; recorders start and stop in a
+  thread of their own (starting one took 0.8-1 s, which overflowed the
+  8-entry ring when it ran on the ring thread)
+- an rx restart: PixelPilot sees the ring gone or replaced and reattaches
+- defaults (sbc-groundstations): S98ar8030-transport-rx passes
+  `-R gnd_frames`, pixelpilot.sh adds `--frame-shm gnd_frames` in receiver
+  mode artosyn (not /etc/default/pixelpilot, whose gsmenu-edited overlay
+  copies would keep older arguments)
+
 ## Decisions (2026-11-12, with the user)
 
 - Loss: `VENC_FRAME_FLAG_DISCONT` 0x20 in the shared frame-shm format
@@ -220,4 +246,6 @@ SC231AI 1080p60 in two strips, ~21.8 Mbit/s:
   not be published at all). Phase 1's reader measures the largest frames;
   shrink only if they leave room.
 - RTP: off whenever the ring is in use.
-- Audio: its own ring, phase 5 (above).
+- Audio: its own ring, phase 5 (above); needs an Ascent air unit.
+- No fallback to RTP for PixelPilot builds without `--frame-shm`: every
+  Artosyn ground image moves to the ring at once.
