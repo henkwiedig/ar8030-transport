@@ -225,6 +225,14 @@ slices gain about the same, 6 lose part of it again and stall now and then.
 
 ## Embedded audio (Majestic-style, on a separate `bb_socket` port)
 
+> **Superseded (2026-11-12):** the audio now rides the video socket (`tx -a`,
+> tx/audio_sub.c) and rx publishes it to an audio ring (`rx -A`) for
+> PixelPilot (`--frame-shm-audio`); see
+> [docs/ground-frame-ring.md](docs/ground-frame-ring.md), "Audio". The
+> separate socket below cannot coexist with `ar_net0`: only bb ports 2 and 3
+> are usable, and `ar_net0` has 3. `audio_tx`/`audio_rx` stay in the tree
+> for reference.
+
 `audio_tx`/`audio_rx` bridge waybeam's optional audio output across the
 same AR8030 link as video, landing on the **same UDP destination** as
 `ar8030-transport-rx`'s video output — the way the stock Majestic
