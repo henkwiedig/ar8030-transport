@@ -47,6 +47,10 @@ int lc_tuning_save(const char* cfg_path, int bandwidth_mhz);
  * failure or an out-of-range reading. */
 int lc_tuning_read_current(bb_dev_handle_t* handle, int is_ap);
 
+/* AP: the uplink's receive bandwidth in MHz (slot user 0, BB_GET_STATUS rx), -1 on failure. The ground (DEV)
+ * chooses it with its own BB_SET_BANDWIDTH, a few seconds after a fresh connect. */
+int lc_tuning_read_uplink(bb_dev_handle_t* handle);
+
 /* Applies bandwidth_mhz (TX direction) to the given slot via
  * BB_SET_BANDWIDTH. slot must be the slot actually reporting CONNECT
  * (see lc_tuning_resolve_connected_slot()) -- which slot a peer lands
@@ -248,7 +252,14 @@ int lc_retx_save(const char* cfg_path, int win, int busy, int idle, int conti_bu
  * Idempotent: confirmed live that repeating mode=1 on an already-exchanged
  * link leaves throughput unchanged, so it is safe to re-assert
  * periodically. Returns the ioctl's own return code (-1 for a mode out of
- * range, nothing sent). */
+ * range, nothing sent).
+ * Mode 2's shorter slot is a correction on top of the computed slot element
+ * time (-400 us); the chip recomputes that time when the uplink bandwidth
+ * changes and the correction is gone (5051 instead of 4651 us at 20 MHz,
+ * seen on both chips after a fresh connect). A repeated mode 2 request is a
+ * no-op on the chip, so lifecycle.c applies mode 2 only once the uplink
+ * bandwidth has switched, and re-enters it through mode 0 after a later
+ * uplink change. */
 #define LC_FRAME_CHANGE_MAX 2
 int lc_frame_change_apply(bb_dev_handle_t* handle, int mode);
 

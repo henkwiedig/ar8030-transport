@@ -2372,6 +2372,16 @@ design rationale):
   without a link or while the chip still refuses the mode (it can right
   after a connect; lifecycled retries every poll). Both fields are also
   in `/api/v1/status`.
+  Mode 2's shorter slot is a -400 µs correction on top of the slot time
+  the chip computes, and the chip computes that time again whenever the
+  uplink bandwidth changes, which drops the correction (both chips at
+  5051 instead of 4651 µs, 28.9 instead of 31.4 Mbit/s). After a fresh
+  connect the ground switches the uplink from 2.5 MHz to its bandwidth a
+  few seconds in, so lifecycled holds mode 2 back until the uplink is at
+  the downlink's bandwidth or has moved from its connect value (at most
+  10 s; `frame_change_applied` is `false` meanwhile). A later uplink
+  change under mode 2 is answered with mode 0 and mode 2 again a second
+  later: the chip ignores a mode 2 request while it is in mode 2.
 - **`GET|POST /api/v1/armed[?state=<0|1>]`** (air) -- the flight
   controller's arm state, which drives stock's low-power mode when
   lifecycled runs with `--standby-dbm <dBm>` (Ascent Lite stock: 10).

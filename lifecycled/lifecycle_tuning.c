@@ -120,6 +120,22 @@ int lc_tuning_read_current(bb_dev_handle_t* handle, int is_ap)
     return BW_MHZ_BY_ENUM[bw];
 }
 
+int lc_tuning_read_uplink(bb_dev_handle_t* handle)
+{
+    bb_get_status_in_t  in = {0xffff};
+    bb_get_status_out_t out;
+    memset(&out, 0, sizeof(out));
+
+    if (bb_ioctl(handle, BB_GET_STATUS, &in, &out) != 0) {
+        return -1;
+    }
+    int bw = out.user_status[BB_USER_0].rx_status.bandwidth;
+    if (bw < 0 || bw >= BB_BW_MAX) {
+        return -1;
+    }
+    return BW_MHZ_BY_ENUM[bw];
+}
+
 int lc_tuning_apply(bb_dev_handle_t* handle, int slot, int bandwidth_mhz)
 {
     int bw_enum = mhz_to_bw_enum(bandwidth_mhz);

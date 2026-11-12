@@ -109,6 +109,8 @@
  * and how many pushes per connection (a re-tune through another channel
  * takes two). */
 #define LC_CHAN_CHECK_DELAY_S 3
+/* AP, frame change mode 2: longest wait for the uplink bandwidth switch after a connect (lc_frame_change_tick) */
+#define LC_FC_SETTLE_MAX_S 10
 #define LC_CHAN_PUSHES        4
 
 
@@ -138,6 +140,15 @@ struct lifecycle_ctx {
     /* lifecycle_request_frame_change()'s mailbox, cmd_lock; -1 = nothing
      * queued. */
     int pending_frame_change;
+    /* AP, mode 2 only (lc_frame_change_tick): fc_wait = the mode is held back
+     * until the uplink bandwidth has switched (fc_uplink_at_connect = its value
+     * at the connect, -1 = apply on the next tick) or fc_wait_until passes;
+     * fc_uplink_applied = the uplink bandwidth (MHz) the chip had when it
+     * accepted mode 2, -1 = none. Lifecycle thread only. */
+    int    fc_wait;
+    time_t fc_wait_until;
+    int    fc_uplink_at_connect;
+    int    fc_uplink_applied;
     /* g_link_connect_gen when the link tuning was last applied -- a
      * different value while in LC_STATE_CONNECTED means the chip relinked
      * inside the drop debounce (see g_link_connect_gen). */
@@ -281,6 +292,7 @@ static void lc_poll_power(lifecycle_ctx* ctx);
 static void lc_apply_link_tuning(lifecycle_ctx* ctx);
 static void lc_frame_change_set_pending(lifecycle_ctx* ctx, int pending);
 static void lc_frame_change_try(lifecycle_ctx* ctx);
+static void lc_frame_change_defer(lifecycle_ctx* ctx);
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
 
@@ -392,6 +404,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->power_dbm            = -1;
     ctx->pending_armed        = -1;
     ctx->pending_frame_change = -1;
+    ctx->fc_uplink_applied    = -1;
     ctx->armed                = 1;
     ctx->distance_m           = -1;
     ctx->batt_arm_ret         = 1; /* not an ioctl result: logs the first arm */
@@ -530,7 +543,9 @@ static void lc_apply_link_tuning(lifecycle_ctx* ctx)
      * gets ~40 Mbit/s at MCS 12 vs 25.9 without this). Chip-wide, needs an
      * established link, and is lost on reboot/re-link (back to mode 0),
      * hence here. */
-    if (ctx->cfg.role == LC_ROLE_AP && ctx->frame_change > 0) {
+    if (ctx->cfg.role == LC_ROLE_AP && ctx->frame_change == 2) {
+        lc_frame_change_defer(ctx);
+    } else if (ctx->cfg.role == LC_ROLE_AP && ctx->frame_change > 0) {
         lc_frame_change_try(ctx);
     }
 
@@ -1150,10 +1165,69 @@ static void lc_frame_change_set_pending(lifecycle_ctx* ctx, int pending)
 }
 
 /* Sends the wanted frame change mode; still pending (retried per poll)
- * if the chip refuses it. */
+ * if the chip refuses it. For mode 2 also notes the uplink bandwidth the
+ * chip runs it with (lc_frame_change_tick). */
 static void lc_frame_change_try(lifecycle_ctx* ctx)
 {
-    lc_frame_change_set_pending(ctx, lc_frame_change_apply(ctx->client.handle, ctx->frame_change) != 0);
+    int failed = lc_frame_change_apply(ctx->client.handle, ctx->frame_change) != 0;
+    lc_frame_change_set_pending(ctx, failed);
+    ctx->fc_wait           = 0;
+    ctx->fc_uplink_applied = !failed && ctx->frame_change == 2 ? lc_tuning_read_uplink(ctx->client.handle) : -1;
+}
+
+/* AP, mode 2 on a (re)connect: hold it back until the uplink bandwidth has
+ * switched -- see lc_frame_change_apply()'s comment in lifecycle_tuning.h.
+ * Reported as not applied meanwhile. */
+static void lc_frame_change_defer(lifecycle_ctx* ctx)
+{
+    ctx->fc_wait              = 1;
+    ctx->fc_wait_until        = time(NULL) + LC_FC_SETTLE_MAX_S;
+    ctx->fc_uplink_at_connect = lc_tuning_read_uplink(ctx->client.handle);
+    ctx->fc_uplink_applied    = -1;
+    lc_frame_change_set_pending(ctx, 1);
+    lc_log("lifecycle: tuning: frame change mode 2 waits for the uplink bandwidth (now %d MHz)",
+           ctx->fc_uplink_at_connect);
+}
+
+/* AP, mode 2, every tick while connected. While held back: apply once the
+ * uplink is at the downlink's bandwidth or has moved from its connect value,
+ * at the latest after LC_FC_SETTLE_MAX_S. Once running: an uplink bandwidth
+ * change dropped mode 2's shorter slot on the chip, so go to mode 0 and
+ * enter mode 2 again on the next tick (the chip ignores mode 2 while it is
+ * already in mode 2). */
+static void lc_frame_change_tick(lifecycle_ctx* ctx, time_t now)
+{
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->frame_change != 2) {
+        return;
+    }
+    int up = lc_tuning_read_uplink(ctx->client.handle);
+    if (ctx->fc_wait) {
+        int settled = up > 0 && (up == ctx->last_bandwidth || up != ctx->fc_uplink_at_connect);
+        if (!settled && now < ctx->fc_wait_until) {
+            return;
+        }
+        if (settled) {
+            lc_log("lifecycle: tuning: uplink at %d MHz, applying frame change mode 2", up);
+        } else {
+            lc_log("lifecycle: tuning: uplink still at %d MHz after %d s, applying frame change mode 2", up,
+                   LC_FC_SETTLE_MAX_S);
+        }
+        lc_frame_change_try(ctx);
+        return;
+    }
+    if (ctx->frame_change_pending || ctx->fc_uplink_applied <= 0 || up <= 0 || up == ctx->fc_uplink_applied) {
+        return;
+    }
+    lc_log("lifecycle: tuning: uplink %d -> %d MHz under frame change mode 2, re-entering it", ctx->fc_uplink_applied,
+           up);
+    if (lc_frame_change_apply(ctx->client.handle, 0) != 0) {
+        return;                                        /* sync channel busy: again next tick */
+    }
+    ctx->fc_wait              = 1;
+    ctx->fc_wait_until        = now;
+    ctx->fc_uplink_at_connect = -1;
+    ctx->fc_uplink_applied    = -1;
+    lc_frame_change_set_pending(ctx, 1);
 }
 
 /* Drains lifecycle_request_frame_change()'s mailbox: persists, then
@@ -1179,6 +1253,8 @@ static void lc_drain_frame_change_request(lifecycle_ctx* ctx)
     if (ctx->state == LC_STATE_CONNECTED) {
         lc_frame_change_try(ctx);
     } else {
+        ctx->fc_wait           = 0;
+        ctx->fc_uplink_applied = -1;
         lc_frame_change_set_pending(ctx, 0);
     }
 }
@@ -1567,7 +1643,9 @@ void* lifecycle_thread_main(void* arg)
                 ctx->chan_auto      = -1;
                 ctx->work_chan      = -1;
                 pthread_mutex_unlock(&ctx->status_lock);
-                ctx->drop_miss_count = 0;
+                ctx->drop_miss_count   = 0;
+                ctx->fc_wait           = 0;
+                ctx->fc_uplink_applied = -1;
                 break;
             }
             ctx->drop_miss_count = 0;
@@ -1609,9 +1687,10 @@ void* lifecycle_thread_main(void* arg)
                     }
                 }
             }
-            if (did_fallback_poll && ctx->frame_change_pending) {
+            if (did_fallback_poll && ctx->frame_change_pending && !ctx->fc_wait) {
                 lc_frame_change_try(ctx);
             }
+            lc_frame_change_tick(ctx, now);
             if (did_fallback_poll) {
                 lc_channel_track(ctx);
             }
