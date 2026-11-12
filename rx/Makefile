@@ -19,8 +19,9 @@ AR8030_SDK_LIB ?= /usr/lib
 
 ROOT := ..
 COMMON := $(ROOT)/common
+FRAME_RING := $(ROOT)/third_party/waybeam_frame_ring
 
-INCLUDES := -I. -I$(COMMON) -I$(AR8030_SDK_INC)
+INCLUDES := -I. -I$(COMMON) -I$(FRAME_RING) -I$(AR8030_SDK_INC)
 ALL_CFLAGS := $(CFLAGS) $(INCLUDES) -D_GNU_SOURCE
 
 LDFLAGS += -L$(AR8030_SDK_LIB)
@@ -42,6 +43,8 @@ SRCS := \
 	clock_sync.c \
 	sidecar_srv.c \
 	rx_log.c \
+	ring_out.c \
+	$(FRAME_RING)/venc_frame_ring.c \
 	$(COMMON)/timing_sei.c \
 	$(COMMON)/chunker.c \
 	$(COMMON)/ar8030_link.c \
@@ -65,6 +68,9 @@ $(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/%.o: $(COMMON)/%.c | $(BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) -c -o $@ $<
+
+$(BUILD_DIR)/%.o: $(FRAME_RING)/%.c | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 clean:

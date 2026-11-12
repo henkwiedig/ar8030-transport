@@ -7,8 +7,9 @@ CFLAGS ?= -O0 -g -Wall -Wextra
 ROOT := ..
 COMMON := $(ROOT)/common
 RX := $(ROOT)/rx
+FRAME_RING := $(ROOT)/third_party/waybeam_frame_ring
 
-INCLUDES := -I. -I$(COMMON) -I$(RX)
+INCLUDES := -I. -I$(COMMON) -I$(RX) -I$(FRAME_RING)
 ALL_CFLAGS := $(CFLAGS) $(INCLUDES) -D_GNU_SOURCE
 
 # Object files build into build/, NOT next to the shared .c sources in
@@ -36,21 +37,32 @@ TIMING_SRCS := \
 	$(RX)/clock_sync.c
 TIMING_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(TIMING_SRCS:.c=.o)))
 
+RING_SRCS := \
+	ring_out_test.c \
+	$(RX)/ring_out.c \
+	$(FRAME_RING)/venc_frame_ring.c
+RING_OBJS := $(addprefix $(BUILD_DIR)/,$(notdir $(RING_SRCS:.c=.o)))
+
 TARGET := roundtrip_test
 TIMING_TARGET := timing_test
+RING_TARGET := ring_out_test
 
 .PHONY: all check clean
-all: $(TARGET) $(TIMING_TARGET)
+all: $(TARGET) $(TIMING_TARGET) $(RING_TARGET)
 
-check: $(TARGET) $(TIMING_TARGET)
+check: $(TARGET) $(TIMING_TARGET) $(RING_TARGET)
 	./$(TARGET)
 	./$(TIMING_TARGET)
+	./$(RING_TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(ALL_CFLAGS) -o $@ $(OBJS)
 
 $(TIMING_TARGET): $(TIMING_OBJS)
 	$(CC) $(ALL_CFLAGS) -o $@ $(TIMING_OBJS) -lpthread
+
+$(RING_TARGET): $(RING_OBJS)
+	$(CC) $(ALL_CFLAGS) -o $@ $(RING_OBJS) -lrt
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -64,5 +76,8 @@ $(BUILD_DIR)/%.o: $(COMMON)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: $(RX)/%.c | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
+$(BUILD_DIR)/%.o: $(FRAME_RING)/%.c | $(BUILD_DIR)
+	$(CC) $(ALL_CFLAGS) -c -o $@ $<
+
 clean:
-	rm -rf $(TARGET) $(TIMING_TARGET) $(BUILD_DIR)
+	rm -rf $(TARGET) $(TIMING_TARGET) $(RING_TARGET) $(BUILD_DIR)

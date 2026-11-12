@@ -28,6 +28,7 @@
 #include "chunk_stream.h"
 #include "clock_sync.h"
 #include "reassembly.h"
+#include "ring_out.h"
 #include "rtp_h265.h"
 #include "rx_log.h"
 #include "sidecar_srv.h"
@@ -52,6 +53,8 @@
 #define DEFAULT_TARGET_HOST "127.0.0.1"
 #define DEFAULT_TARGET_PORT 5600 /* PixelPilot_rk's own -p default */
 #define DEFAULT_VIDEO_PORT 2     /* must match tx/main.c's -o, see its comment */
+/* -R: slots in the frame-shm ring, as in waybeam's own (venc_frame_ring.h). */
+#define RING_SLOTS 8
 #define DEFAULT_MAX_RTP_PAYLOAD 1400
 #define DEFAULT_REASSEMBLY_MAX (512 * 1024) /* venc_frame_ring.h: up to 512 KB slots (CV610) */
 #define RETRY_MS 2000
@@ -107,6 +110,8 @@ struct rx_args {
     int timing_sei;   /* insert the per-frame timing SEI (common/timing_sei.h) */
     int verbose;
     const char *log_path; /* -L, NULL = stderr as inherited */
+    const char *ring_name; /* -R: publish to this frame-shm ring instead of RTP */
+    int also_rtp;          /* -P: RTP as well as the ring (for comparing the two) */
 };
 
 static void usage(const char *argv0)
@@ -124,6 +129,9 @@ static void usage(const char *argv0)
             "  -C <port>      loopback UDP port serving the air unit's waybeam sidecar\n"
             "                 (default %d, 0 = off)\n"
             "  -T             don't insert the per-frame timing SEI\n"
+            "  -R <name>      publish the frames to frame-shm ring <name> (e.g. gnd_frames) for\n"
+            "                 a same-host consumer instead of sending RTP (docs/ground-frame-ring.md)\n"
+            "  -P             with -R: send the RTP as well (testing)\n"
 
             "  -v             print periodic in/out stats to stderr (chunks, resyncs, frames, "
             "bytes, RTP output)\n"
@@ -148,12 +156,20 @@ static int parse_args(int argc, char **argv, struct rx_args *a)
     a->timing_sei = 1;
     a->verbose = 0;
     a->log_path = NULL;
+    a->ring_name = NULL;
+    a->also_rtp = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:TvL:h")) != -1) {
+    while ((opt = getopt(argc, argv, "d:o:H:p:M:b:I:C:TvL:R:Ph")) != -1) {
         switch (opt) {
         case 'L':
             a->log_path = optarg;
+            break;
+        case 'R':
+            a->ring_name = optarg;
+            break;
+        case 'P':
+            a->also_rtp = 1;
             break;
         case 'C':
             a->sidecar_port = atoi(optarg);
@@ -317,6 +333,20 @@ static uint64_t unwrap_air_pts(uint32_t pts, uint64_t air_now_us)
     return cand;
 }
 
+/* An entry's pts in rx's frame-shm ring: the frame's capture time on the
+ * ground clock while the clock sync holds (the timing SEI's
+ * capture_ground_us), otherwise when rx got it; low 32 bits, us. */
+static uint32_t ring_entry_pts(clock_sync_t *sync, uint32_t frame_pts)
+{
+    uint64_t now = clock_sync_now_us();
+    int64_t offset;
+    uint32_t uncertainty;
+    if (!clock_sync_get(sync, &offset, &uncertainty))
+        return (uint32_t)now;
+    uint64_t capture_air = unwrap_air_pts(frame_pts, (uint64_t)((int64_t)now + offset));
+    return (uint32_t)((int64_t)capture_air - offset);
+}
+
 /* Handles an air -> ground control message; only SYNCR is defined. t4 is
  * when its chunk came off the stream. */
 static void handle_air_ctrl(clock_sync_t *sync, const uint8_t *payload, uint32_t len, uint64_t t4)
@@ -399,12 +429,33 @@ int main(int argc, char **argv)
     }
     fprintf(stderr, "rx: bb_socket open (port=%d)\n", args.port);
 
-    int udp_fd = open_udp_target(args.target_host, args.target_port);
-    if (udp_fd < 0) {
-        ar8030_link_close(&link);
-        return 1;
+    /* The ring replaces the RTP output; -P keeps both for a comparison. */
+    const int rtp_on = !args.ring_name || args.also_rtp;
+    int udp_fd = -1;
+    if (rtp_on) {
+        udp_fd = open_udp_target(args.target_host, args.target_port);
+        if (udp_fd < 0) {
+            ar8030_link_close(&link);
+            return 1;
+        }
+        fprintf(stderr, "rx: forwarding RTP/H.265 to %s:%d\n", args.target_host, args.target_port);
     }
-    fprintf(stderr, "rx: forwarding RTP/H.265 to %s:%d\n", args.target_host, args.target_port);
+
+    /* Room for the biggest entry: a whole frame (its timing SEI goes into the
+     * reassembly buffer), or a timing SEI plus the rest of a streamed one. */
+    rx_ring_out_t ring_out = {0};
+    const int ring_on = args.ring_name != NULL;
+    if (ring_on) {
+        uint32_t slot_size = VENC_FRAME_META_SIZE + args.reassembly_max + TIMING_SEI_NAL_MAX;
+        if (rx_ring_out_open(&ring_out, args.ring_name, RING_SLOTS, slot_size) != 0) {
+            if (udp_fd >= 0)
+                close(udp_fd);
+            ar8030_link_close(&link);
+            return 1;
+        }
+        fprintf(stderr, "rx: publishing frames to frame-shm ring '%s' (%d x %u bytes)%s\n", args.ring_name,
+                RING_SLOTS, slot_size, rtp_on ? ", and RTP" : "");
+    }
 
     rtp_h265_ctx_t rtp_ctx;
     rtp_h265_init(&rtp_ctx, udp_fd, args.rtp_max_payload);
@@ -413,7 +464,9 @@ int main(int argc, char **argv)
     uint8_t *reasm_buf = malloc(args.reassembly_max);
     if (!reasm_buf) {
         fprintf(stderr, "rx: OOM allocating %u-byte reassembly buffer\n", args.reassembly_max);
-        close(udp_fd);
+        rx_ring_out_close(&ring_out);
+        if (udp_fd >= 0)
+            close(udp_fd);
         ar8030_link_close(&link);
         return 1;
     }
@@ -427,7 +480,9 @@ int main(int argc, char **argv)
         free(stream_buf);
         free(payload_buf);
         free(reasm_buf);
-        close(udp_fd);
+        rx_ring_out_close(&ring_out);
+        if (udp_fd >= 0)
+            close(udp_fd);
         ar8030_link_close(&link);
         return 1;
     }
@@ -472,6 +527,7 @@ int main(int argc, char **argv)
     uint64_t rtp_packets_sent = 0;
     uint64_t rtp_bytes_sent = 0;
     struct rx_stats_snapshot stats_prev = rx_stats_snapshot_take(&stream, &reasm, 0, 0);
+    uint64_t ring_prev_entries = 0, ring_prev_partial = 0, ring_prev_read = 0;
     double stats_last_print = now_monotonic_s();
     double last_health_check_s = now_monotonic_s();
 
@@ -482,6 +538,23 @@ int main(int argc, char **argv)
                 struct rx_stats_snapshot cur =
                     rx_stats_snapshot_take(&stream, &reasm, rtp_packets_sent, rtp_bytes_sent);
                 print_rx_stats(&cur, &stats_prev, now - stats_last_print);
+                if (ring_on) {
+                    double dt = now - stats_last_print;
+                    uint64_t rd = __atomic_load_n(&ring_out.ring->hdr->read_idx, __ATOMIC_RELAXED);
+                    venc_frame_ring_fill_t fill;
+                    venc_frame_ring_get_fill(ring_out.ring, &fill);
+                    fprintf(stderr,
+                            "rx ring: %.1f entries/s out (%.1f/s partial), %.1f/s read%s, fill %u/%u | totals: "
+                            "entries=%llu discont=%llu dropped=%llu max_entry=%u\n",
+                            (ring_out.entries - ring_prev_entries) / dt,
+                            (ring_out.partial_entries - ring_prev_partial) / dt, (rd - ring_prev_read) / dt,
+                            rd == ring_prev_read ? " (no reader)" : "", fill.used_slots, fill.slot_count,
+                            (unsigned long long)ring_out.entries, (unsigned long long)ring_out.discont_entries,
+                            (unsigned long long)ring_out.dropped, ring_out.max_entry);
+                    ring_prev_entries = ring_out.entries;
+                    ring_prev_partial = ring_out.partial_entries;
+                    ring_prev_read = rd;
+                }
                 int64_t off;
                 uint32_t unc;
                 if (clock_sync_get(&sync, &off, &unc))
@@ -601,10 +674,15 @@ int main(int argc, char **argv)
                 reasm.write_off > fwd_off) {
                 const uint8_t *part = reasm.buf + fwd_off;
                 uint32_t part_len = reasm.write_off - fwd_off;
-                int n = rtp_h265_send_nals(&rtp_ctx, part, part_len, rtp_ts, 0);
-                if (n > 0) {
-                    rtp_packets_sent += (uint64_t)n;
-                    rtp_bytes_sent += part_len;
+                if (ring_on)
+                    rx_ring_out_publish(&ring_out, reasm.frame_seq, ring_entry_pts(&sync, reasm.frame_pts),
+                                        reasm.flags, 1, part, part_len, NULL, 0);
+                if (rtp_on) {
+                    int n = rtp_h265_send_nals(&rtp_ctx, part, part_len, rtp_ts, 0);
+                    if (n > 0) {
+                        rtp_packets_sent += (uint64_t)n;
+                        rtp_bytes_sent += part_len;
+                    }
                 }
                 fwd_vcl = fwd_vcl || rtp_h265_has_vcl(part, part_len);
                 fwd_off = reasm.write_off;
@@ -652,13 +730,19 @@ int main(int argc, char **argv)
             }
         }
 
+        uint32_t pts = ring_on ? ring_entry_pts(&sync, reasm.frame_pts) : 0;
         if (fwd_off == 0) {
             if (sei_len)
                 timing_sei_insert(reasm.buf, &reasm.write_off, reasm.cap, sei, sei_len);
-            int rtp_pkts = rtp_h265_send_frame(&rtp_ctx, reasm.buf, reasm.write_off, rtp_ts);
-            if (rtp_pkts > 0) {
-                rtp_packets_sent += (uint64_t)rtp_pkts;
-                rtp_bytes_sent += reasm.write_off;
+            if (ring_on)
+                rx_ring_out_publish(&ring_out, reasm.frame_seq, pts, reasm.flags, 0, reasm.buf, reasm.write_off,
+                                    NULL, 0);
+            if (rtp_on) {
+                int rtp_pkts = rtp_h265_send_frame(&rtp_ctx, reasm.buf, reasm.write_off, rtp_ts);
+                if (rtp_pkts > 0) {
+                    rtp_packets_sent += (uint64_t)rtp_pkts;
+                    rtp_bytes_sent += reasm.write_off;
+                }
             }
         } else {
             /* The rest of a frame that went out slice by slice: the timing
@@ -666,14 +750,19 @@ int main(int argc, char **argv)
              * the picture (the SEI itself carries the marker if nothing is
              * left). */
             uint32_t rest = reasm.write_off - fwd_off;
-            if (sei_len) {
+            /* One entry: the SEI and the rest; empty if neither, it then
+             * only ends the access unit. */
+            if (ring_on)
+                rx_ring_out_publish(&ring_out, reasm.frame_seq, pts, reasm.flags, 0, sei, sei_len,
+                                    reasm.buf + fwd_off, rest);
+            if (rtp_on && sei_len) {
                 int n = rtp_h265_send_nals(&rtp_ctx, sei, sei_len, rtp_ts, rest == 0);
                 if (n > 0) {
                     rtp_packets_sent += (uint64_t)n;
                     rtp_bytes_sent += sei_len;
                 }
             }
-            if (rest) {
+            if (rtp_on && rest) {
                 int n = rtp_h265_send_nals(&rtp_ctx, reasm.buf + fwd_off, rest, rtp_ts, 1);
                 if (n > 0) {
                     rtp_packets_sent += (uint64_t)n;
@@ -689,7 +778,9 @@ int main(int argc, char **argv)
     free(stream_buf);
     free(payload_buf);
     free(reasm_buf);
-    close(udp_fd);
+    rx_ring_out_close(&ring_out);
+    if (udp_fd >= 0)
+        close(udp_fd);
     g_stop = 1;
     if (idr_thread_ok)
         pthread_join(idr_thread, NULL); /* before the link it writes to goes away */

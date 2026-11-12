@@ -29,3 +29,6 @@ audio_rx/ar8030-transport-audio-rx
 /kmod/.tmp_versions/
 /xdata/build/
 /xdata/ar8030-xdata
+/test/ring_out_test
+/ringdump/build/
+/ringdump/ar8030-ringdump
