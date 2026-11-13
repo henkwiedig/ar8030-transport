@@ -166,6 +166,7 @@ struct tx_args {
     const char *pi_params[16];   /* -p key=value, applied after the PI defaults */
     int n_pi_params;
     int verbose;
+    const char *timing_dump; /* -T: one line per frame sent, for delay analysis */
 };
 
 static void usage(const char *argv0)
@@ -211,6 +212,10 @@ static void usage(const char *argv0)
             "                 (waybeam outgoing.audioPort) and send it on the video socket\n"
             "                 (default 0 = off)\n"
 
+            "  -T <path>      write one line per frame sent to <path> (put it in RAM): \"F seq pts\n"
+            "                 gdr_pos first_write_start last_write_start write_end write_us bytes\n"
+            "                 entries chunks_sent chunks\" -- pts is the capture time (32-bit us of\n"
+            "                 CLOCK_MONOTONIC), the times are 64-bit us of the same clock\n"
             "  -v             print periodic in/out stats to stderr (frames, chunks, bytes, "
             "failures, ring health)\n"
             "  -h             this help\n",
@@ -269,7 +274,7 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
     a->n_pi_params = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:D:B:R:Q:K:i:S:a:C:p:XNvh")) != -1) {
+    while ((opt = getopt(argc, argv, "r:d:s:o:c:t:w:P:m:n:x:F:D:B:R:Q:K:i:S:a:C:p:T:XNvh")) != -1) {
         switch (opt) {
         case 'S':
             a->sidecar_port = atoi(optarg);
@@ -357,6 +362,9 @@ static int parse_args(int argc, char **argv, struct tx_args *a)
             break;
         case 'v':
             a->verbose = 1;
+            break;
+        case 'T':
+            a->timing_dump = optarg;
             break;
         case 'h':
         default:
@@ -750,6 +758,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    FILE *tdump = NULL;
+    if (args.timing_dump) {
+        tdump = fopen(args.timing_dump, "w");
+        if (!tdump) {
+            fprintf(stderr, "tx: cannot write %s: %s\n", args.timing_dump, strerror(errno));
+            return 1;
+        }
+        setvbuf(tdump, NULL, _IOFBF, 16384);
+    }
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     /* ar8030d closing the connection must make bb_socket_write() fail, not kill
@@ -1010,6 +1028,8 @@ int main(int argc, char **argv)
         uint32_t sent;     /* chunks written */
         uint32_t entries;  /* ring entries (slices) so far */
         uint64_t write_us; /* time spent in its writes */
+        uint64_t first_write_start_us; /* -T */
+        uint32_t bytes;                /* -T */
     } sf = {0};
     /* Ring entries the last frame took, for counting backlog in frames. */
     uint32_t entries_per_frame = 1;
@@ -1221,6 +1241,7 @@ int main(int argc, char **argv)
                 sf.open = 1;
                 sf.pts = meta.pts;
                 sf.flags = frame_flags_from_meta(&meta);
+                sf.first_write_start_us = write_start_us;
                 stats.frames_in++;
                 stats.age_at_send_us_sum += (uint32_t)write_start_us - meta.pts;
                 send_ctx.last_write_ret = 0;
@@ -1238,6 +1259,7 @@ int main(int argc, char **argv)
                 sf.sent += (uint32_t)s;
             sf.next_idx += n;
             sf.entries++;
+            sf.bytes += frame_len;
             /* Time spent in the writes, not since the first one: between
              * slices tx waits on the encoder, which is no link delay. */
             sf.write_us += now_monotonic_us() - write_start_us;
@@ -1318,6 +1340,14 @@ int main(int argc, char **argv)
             stats.frames_complete++;
         else
             stats.frames_incomplete++;
+        if (tdump) {
+            const int sliced = entries_per_frame > 1 || partial;
+            fprintf(tdump, "F %u %u %u %llu %llu %llu %llu %u %u %d %u\n", frame_seq, meta.pts, meta.gdr_pos,
+                    (unsigned long long)(sliced ? sf.first_write_start_us : write_start_us),
+                    (unsigned long long)write_start_us, (unsigned long long)write_end_us,
+                    (unsigned long long)write_us, sliced ? sf.bytes : frame_len, entries_per_frame, sent,
+                    expected_chunks);
+        }
         frame_seq++;
 
         if (sent == 0 && send_ctx.last_write_ret < 0)
@@ -1353,6 +1383,8 @@ int main(int argc, char **argv)
     if (au_thread_ok)
         pthread_join(au_thread, NULL);
 
+    if (tdump)
+        fclose(tdump);
     free(send_ctx.combo);
     free(chunk_scratch);
     free(ring_buf);
