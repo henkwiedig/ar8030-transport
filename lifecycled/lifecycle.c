@@ -419,15 +419,14 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     } else if (!cfg->cfg_path[0] || lc_frame_change_load(cfg->cfg_path, &ctx->frame_change) != 0) {
         ctx->frame_change = cfg->frame_change;
     }
-    if (!cfg->cfg_path[0] || lc_power_load(cfg->cfg_path, &ctx->power) != 0 ||
-        !lc_power_valid(is_ap, cfg->max_power, ctx->power)) {
-        ctx->power = cfg->default_power == LC_POWER_ROLE_DEFAULT ? lc_power_default(is_ap, cfg->max_power)
-                                                                 : cfg->default_power;
+    const lc_power_table_t* levels = &cfg->power_levels;
+    if (!cfg->cfg_path[0] || lc_power_load(cfg->cfg_path, &ctx->power) != 0 || !lc_power_valid(levels, ctx->power)) {
+        ctx->power = cfg->default_power == LC_POWER_ROLE_DEFAULT ? lc_power_default(levels) : cfg->default_power;
     }
-    if (ctx->power != LC_POWER_NONE && !lc_power_valid(is_ap, cfg->max_power, ctx->power)) {
-        lc_log("lifecycle: power level %d is not valid for this role or above --max-power, using %d mW", ctx->power,
-               lc_power_default(is_ap, cfg->max_power));
-        ctx->power = lc_power_default(is_ap, cfg->max_power);
+    if (ctx->power != LC_POWER_NONE && !lc_power_valid(levels, ctx->power)) {
+        lc_log("lifecycle: power level %d is not one of this board's levels, using %d mW", ctx->power,
+               lc_power_default(levels));
+        ctx->power = lc_power_default(levels);
     }
     pthread_mutex_init(&ctx->status_lock, NULL);
     pthread_mutex_init(&ctx->cmd_lock, NULL);
@@ -857,7 +856,8 @@ static void lc_apply_power(lifecycle_ctx* ctx)
     if (ctx->power == LC_POWER_NONE) {
         return;
     }
-    lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, ctx->power, ctx->cfg.fem_ctrl);
+    lc_power_apply(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP, &ctx->cfg.power_levels, ctx->power,
+                   ctx->cfg.fem_ctrl);
 }
 
 /* Drains lifecycle_request_armed()'s mailbox, then enters or leaves the
@@ -1814,7 +1814,7 @@ int lifecycle_request_channel(lifecycle_ctx* ctx, int chan)
 
 int lifecycle_request_power(lifecycle_ctx* ctx, int level)
 {
-    if (!lc_power_valid(ctx->cfg.role == LC_ROLE_AP, ctx->cfg.max_power, level)) {
+    if (!lc_power_valid(&ctx->cfg.power_levels, level)) {
         return -1;
     }
     pthread_mutex_lock(&ctx->cmd_lock);

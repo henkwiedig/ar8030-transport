@@ -61,18 +61,18 @@ static void print_help(const char* argv0)
     printf("                            AP only: channel while none is persisted yet: a channel-table\n");
     printf("                            index, auto (chip's channel adaptation) or none (leave\n");
     printf("                            the chip's own startup channel alone) (default 25 = 5805 MHz)\n");
+    printf("  --power-levels <list>     the output power levels this board offers, in mW,\n");
+    printf("                            comma-separated, plus \"auto\" on the ground; each goes\n");
+    printf("                            to the chip as 10*log10(mW) dBm, rounded (9-39), e.g.\n");
+    printf("                            300,200,100,25 = 25/23/20/14 dBm\n");
+    printf("                            (default: air 400,200,100,25, ground auto,500,200,100,25)\n");
     printf("  --default-power <mw|auto|none>\n");
-    printf("                            output power while none is persisted yet: air 400/\n");
-    printf("                            200/100/25 mW, ground auto/500/200/100/25 mW, or none\n");
-    printf("                            (leave the chip's config-file power alone)\n");
-    printf("                            (default: air 400 mW = 26 dBm, ground 500 mW, or the\n");
-    printf("                            highest level within --max-power)\n");
-    printf("  --max-power <mW>          highest level this board may use: higher ones are\n");
-    printf("                            not offered (GET /api/v1/power), refused and not\n");
-    printf("                            taken from the persisted setting; ground auto counts\n");
-    printf("                            as 500 mW (BetaFPV P1 and VR04: 200, their stock\n");
-    printf("                            22 / 23 dBm)\n");
-    printf("                            (default: none)\n");
+    printf("                            output power while none is persisted yet: one of\n");
+    printf("                            --power-levels, or none (leave the chip's config-file\n");
+    printf("                            power alone)\n");
+    printf("                            (default: the top level)\n");
+    printf("  --max-power <mW>          old: drops the levels above it (and ground auto\n");
+    printf("                            below 500); use --power-levels\n");
     printf("  --bind-gpio <n>           watch this GPIO for the physical bind button\n");
     printf("                            (press: pair; hold 5 s: hooks.d/longpress)\n");
     printf("                            (default: none -- no physical button on this board)\n");
@@ -146,6 +146,7 @@ enum {
     OPT_DEFAULT_BANDWIDTH,
     OPT_DEFAULT_CHANNEL,
     OPT_DEFAULT_POWER,
+    OPT_POWER_LEVELS,
     OPT_MAX_POWER,
     OPT_BIND_GPIO,
     OPT_HTTP_PORT,
@@ -175,6 +176,8 @@ static void handle_sigterm(int sig)
 
 int main(int argc, char** argv)
 {
+    const char* power_levels_arg = NULL;
+    int         max_power        = 0;
     lc_config_t cfg = {
         .rpc_port          = BB_PORT_DEFAULT,
         .role              = LC_ROLE_AP,
@@ -187,7 +190,6 @@ int main(int argc, char** argv)
         .frame_change      = 1,
         .default_channel   = 25, /* 5805 MHz in ar8030.json's channel table */
         .default_power     = LC_POWER_ROLE_DEFAULT,
-        .max_power         = 0,
         .no_lifecycle      = 0,
         .bind_gpio         = -1,
         .http_bind         = "0.0.0.0",
@@ -217,6 +219,7 @@ int main(int argc, char** argv)
         {"default-bandwidth", required_argument, 0, OPT_DEFAULT_BANDWIDTH},
         {"default-channel",   required_argument, 0, OPT_DEFAULT_CHANNEL  },
         {"default-power",     required_argument, 0, OPT_DEFAULT_POWER    },
+        {"power-levels",      required_argument, 0, OPT_POWER_LEVELS     },
         {"max-power",         required_argument, 0, OPT_MAX_POWER        },
         {"bind-gpio",         required_argument, 0, OPT_BIND_GPIO        },
         {"http-port",         required_argument, 0, OPT_HTTP_PORT        },
@@ -285,10 +288,13 @@ int main(int argc, char** argv)
                 return 1;
             }
             break;
+        case OPT_POWER_LEVELS:
+            power_levels_arg = optarg;
+            break;
         case OPT_MAX_POWER: {
             char* end;
-            cfg.max_power = (int)strtol(optarg, &end, 10);
-            if (end == optarg || (*end && strcmp(end, "mw") != 0 && strcmp(end, "mW") != 0) || cfg.max_power <= 0) {
+            max_power = (int)strtol(optarg, &end, 10);
+            if (end == optarg || (*end && strcmp(end, "mw") != 0 && strcmp(end, "mW") != 0) || max_power <= 0) {
                 fprintf(stderr, "invalid --max-power '%s' (mW)\n", optarg);
                 return 1;
             }
@@ -396,8 +402,27 @@ int main(int argc, char** argv)
         }
     }
 
-    if (cfg.max_power > 0 && lc_power_default(cfg.role == LC_ROLE_AP, cfg.max_power) < 0) {
-        fprintf(stderr, "--max-power %d leaves no power level for this role (lowest: 25 mW)\n", cfg.max_power);
+    /* the levels need the role, which may come after them */
+    int is_ap = cfg.role == LC_ROLE_AP;
+    if (power_levels_arg) {
+        char err[96];
+        if (lc_power_table_parse(power_levels_arg, is_ap, &cfg.power_levels, err, sizeof(err)) != 0) {
+            fprintf(stderr, "invalid --power-levels '%s': %s\n", power_levels_arg, err);
+            return 1;
+        }
+    } else {
+        lc_power_table_default(is_ap, &cfg.power_levels);
+    }
+    if (max_power > 0) {
+        lc_power_table_cap(&cfg.power_levels, max_power);
+        if (cfg.power_levels.n == 0) {
+            fprintf(stderr, "--max-power %d leaves no power level\n", max_power);
+            return 1;
+        }
+    }
+    if (cfg.default_power != LC_POWER_ROLE_DEFAULT && cfg.default_power != LC_POWER_NONE &&
+        !lc_power_valid(&cfg.power_levels, cfg.default_power)) {
+        fprintf(stderr, "--default-power is not one of the board's levels\n");
         return 1;
     }
 

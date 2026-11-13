@@ -6,6 +6,7 @@ extern "C" {
 
 #include "ar8030.h"
 #include "bb_api.h"
+#include "lifecycle.h"
 #include <stddef.h>
 
 /*
@@ -157,52 +158,64 @@ int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan);
 
 /*
  * Output power, as a level in mW (the unit the settings UI offers) or
- * LC_POWER_AUTO (ground only: the chip's own power adaptation). Each
- * role has a fixed set of levels, mapped to the chip's dBm target the way
- * the stock streamers do it (Ghidra: ar_ldyhs_sky fpv_bb_set_local_power()
- * for the air side, ar_ldy_gnd do_bb_set_local_power() for the ground) --
- * the chip's dBm scale is not the antenna output: stock's own "500 mW" is
- * 26 on the Lite (air) and 24 on the ground. Needs the SDK's
- * BB_SET_POWER_AUTO size fix (ar8030 package patch
+ * LC_POWER_AUTO (ground only: the chip's own power adaptation). A board
+ * offers its own levels (lc_power_table_t, --power-levels), and a level
+ * goes to the chip as 10 * log10(mW) dBm, rounded (lc_power_dbm), so a
+ * label means the same chip dBm on every board. Stock's own labels do
+ * not (Ghidra: ar_ldyhs_sky fpv_bb_set_local_power() calls 22 dBm
+ * "200 mW" on the Lite; ar_ldy_gnd's ground levels already match). The
+ * chip's dBm scale is its calibration table's, not a measured antenna
+ * output. Needs the SDK's BB_SET_POWER_AUTO size fix (ar8030 package patch
  * bb_api-fix-BB_SET_POWER_AUTO-input-size, BB_HAVE_PWR_AUTO_BOUNDS); built
  * against an SDK without it, lc_power_apply() refuses rather than send the
  * old truncated 1-byte payload.
  */
 #define LC_POWER_AUTO         (-1)
 #define LC_POWER_NONE         (-2) /* don't touch the chip's power at all */
-#define LC_POWER_ROLE_DEFAULT (-3) /* --default-power not given: per role */
+#define LC_POWER_ROLE_DEFAULT (-3) /* --default-power not given: the top level */
 
 /* Parses "auto", "none" or a level in mW. Returns 0 and fills *out on
- * success, -1 otherwise. Whether the level exists for a role is
- * lc_power_valid()'s job. */
+ * success, -1 otherwise. Whether the board offers it is lc_power_valid()'s
+ * job. */
 int lc_power_parse(const char* s, int* out);
 
-/* max_mw below: the board's cap (lc_config_t.max_power), 0 for none. It
- * removes the levels above it; LC_POWER_AUTO counts as 500 mW (it starts at
- * that level's target and adapts up to 27 dBm). */
+/* A level's chip dBm: 10 * log10(mW), rounded (25 -> 14, 100 -> 20,
+ * 200 -> 23, 300 -> 25, 400 -> 26, 500 -> 27). */
+int lc_power_dbm(int mw);
 
-/* Non-zero if level is one of this role's levels within max_mw
- * (LC_POWER_AUTO: ground only). */
-int lc_power_valid(int is_ap, int max_mw, int level);
+/* The levels a role offers without --power-levels: air 400/200/100/25 mW,
+ * ground auto/500/200/100/25 mW. */
+void lc_power_table_default(int is_ap, lc_power_table_t* t);
 
-/* The role's default level: 400 mW (26 dBm) on the air side, 500 mW on
- * the ground, or the highest level within max_mw; -1 if max_mw leaves
- * none. */
-int lc_power_default(int is_ap, int max_mw);
+/* Parses --power-levels: levels in mW, comma-separated, any order, plus
+ * "auto" on the ground (adapting between the lowest and the top level's
+ * dBm). Each must be 9-39 dBm, the chip's range. Returns 0, or -1 with
+ * the reason in err. */
+int lc_power_table_parse(const char* s, int is_ap, lc_power_table_t* t, char* err, size_t err_sz);
 
-/* Writes this role's levels within max_mw, highest first, as a JSON array
- * body (e.g. `"auto",500,200,100,25`) into out. */
-void lc_power_levels_json(int is_ap, int max_mw, char* out, size_t out_sz);
+/* Old --max-power: drops the levels above max_mw, and auto below 500 mW. */
+void lc_power_table_cap(lc_power_table_t* t, int max_mw);
+
+/* Non-zero if level (mW or LC_POWER_AUTO) is one of the board's. */
+int lc_power_valid(const lc_power_table_t* t, int level);
+
+/* The board's top level in mW, -1 if it has none. */
+int lc_power_default(const lc_power_table_t* t);
+
+/* Writes the board's levels, highest first, as a JSON array body (e.g.
+ * `"auto",500,200,100,25`) into out. */
+void lc_power_levels_json(const lc_power_table_t* t, char* out, size_t out_sz);
 
 /* Sidecar "ar8030.power" next to cfg_path ("auto" or mW). Load returns 0
  * and fills *out, -1 if missing/unreadable; save returns 0 on success. */
 int lc_power_load(const char* cfg_path, int* out);
 int lc_power_save(const char* cfg_path, int level);
 
-/* Applies level (chip-wide, no link needed). fem_ctrl (AP only, Ascent
- * Lite): also stock's BB_SET_POWER_AUTO mode 3 and fem ctrl bit, see
- * common/ar8030_link_policy.h. Returns 0 if every ioctl succeeded. */
-int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level, int fem_ctrl);
+/* Applies level, one of t's (chip-wide, no link needed). fem_ctrl (AP
+ * only, Ascent Lite): also stock's BB_SET_POWER_AUTO mode 3 and fem ctrl
+ * bit, see common/ar8030_link_policy.h. Returns 0 if every ioctl
+ * succeeded. */
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, const lc_power_table_t* t, int level, int fem_ctrl);
 
 /* Air side only: stock's low-power (standby) mode, a fixed chip dBm target
  * with the power-auto mode 3 off and, with fem_ctrl, the fem ctrl bit off

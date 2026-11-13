@@ -6,6 +6,17 @@ extern "C" {
 
 #include <stdint.h>
 
+/* The output power levels a board offers (--power-levels), see
+ * lifecycle_tuning.h. */
+#define LC_POWER_MAX_LEVELS 8
+#define LC_POWER_MIN_DBM    9  /* what the chip's BB_SET_POWER takes */
+#define LC_POWER_MAX_DBM    39
+typedef struct {
+    int auto_ok;                 /* ground: "auto" offered */
+    int n;                       /* levels in mw[] */
+    int mw[LC_POWER_MAX_LEVELS]; /* highest first */
+} lc_power_table_t;
+
 /*
  * Lifecycle supervisor: owns the AR8030 chip's whole life (hardware reset,
  * pairing, reconnect-on-drop, tuning, hook-script notification, and
@@ -67,16 +78,13 @@ typedef struct {
      * with its own idle search. */
     int default_channel;
     /* Output power while none is persisted yet (no ar8030.power sidecar):
-     * a level in mW, LC_POWER_AUTO (ground only), LC_POWER_NONE (leave the
-     * chip's config-file power alone) or LC_POWER_ROLE_DEFAULT -- see
-     * lifecycle_tuning.h. */
+     * one of power_levels, LC_POWER_AUTO (ground only), LC_POWER_NONE (leave
+     * the chip's config-file power alone) or LC_POWER_ROLE_DEFAULT (the top
+     * level) -- see lifecycle_tuning.h. */
     int default_power;
-    /* Highest level in mW this board may use, or 0 (no cap): higher ones
-     * (ground "auto" counting as 500 mW) are not offered, refused and not
-     * taken from the sidecar. BetaFPV runs the P1's and the VR04's PA up to
-     * 22 / 23 dBm: 200 mW on either side, not 400 mW = 26 (air) or
-     * 500 mW = 27 (ground). */
-    int max_power;
+    /* The levels this board offers (--power-levels, else the role's
+     * built-in ones); a persisted level not among them is ignored. */
+    lc_power_table_t power_levels;
 
     int no_lifecycle; /* --no-lifecycle escape hatch: lifecycle_init() returns NULL */
 

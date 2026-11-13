@@ -2330,17 +2330,26 @@ design rationale):
   saved by the AP once the link had settled on the AP's channel. The DEV
   answers `409` while no link is up, since there is nothing to push to.
 - **`GET|POST /api/v1/power[?level=<mW|auto>]`** -- the *persisted*
-  output power. Levels per role: air (AP) `400`/`200`/`100`/`25` mW,
-  ground (DEV) `auto`/`500`/`200`/`100`/`25` mW; defaults 400 mW on air,
-  500 mW on ground (`--default-power <mW|auto|none>` overrides, `none`
-  leaves the chip's config-file power alone). `--max-power <mW>` caps a
-  board's levels: higher ones drop out of `power_levels`, a POST of one is
-  answered `400` with the allowed list, a persisted one is ignored for the
-  default, and the role default becomes the highest level left. Ground
-  `auto` counts as 500 mW: it starts at that level's target and adapts up
-  to 27 dBm. The BetaFPV P1 and VR04 run `--max-power 200`: BetaFPV runs
-  their PAs up to 22 / 23 dBm, the air's 400 mW is 26 and the ground's
-  500 mW 27. GET:
+  output power, one of the board's levels. `--power-levels <list>` sets
+  them per board (mW, comma-separated, plus `auto` on the ground); each
+  goes to the chip as 10·log10(mW) dBm, rounded, so a label means the same
+  chip dBm everywhere:
+
+  | level | 25 | 100 | 150 | 200 | 300 | 400 | 500 mW |
+  |---|---|---|---|---|---|---|---|
+  | chip dBm | 14 | 20 | 22 | 23 | 25 | 26 | 27 |
+
+  Without the option: air (AP) `400`/`200`/`100`/`25` mW (stock Caddx's
+  labels; stock sends 26/22/19/13 dBm for them), ground (DEV)
+  `auto`/`500`/`200`/`100`/`25` mW (stock's ground levels, which already
+  match). The boards: BetaFPV P1 `150,100,25` (BetaFPV's 22 dBm top),
+  SinYine F1 `300,200,100,25` on both sides (SinYine's 25 dBm top), VR04
+  and P1 VRX `200,100,25` (23 dBm), Caddx Ascent Lite and VRX Pro the
+  defaults. The default is the top level (`--default-power <mW|auto|none>`
+  overrides it, `none` leaves the chip's config-file power alone); a POST
+  of a level the board doesn't offer is answered `400` with the list, and
+  a persisted one is ignored. The old `--max-power <mW>` still drops the
+  levels above it (and ground `auto` below 500). GET:
   ```
   curl http://<host>:8899/api/v1/power
   {"ok":true,"power":400,"power_dbm":26,"power_levels":[400,200,100,25],"armed":true,"standby":null}
@@ -2348,26 +2357,17 @@ design rationale):
   `armed`/`standby`: see `/api/v1/armed` below.
   Saved to an `ar8030.power` sidecar next to `cfg_path`, applied at
   startup (before any link, so the power used while searching is right
-  too), on every connect and immediately on change. mW map to the chip's
-  dBm target the way the stock streamers do it (Ghidra: `ar_ldyhs_sky`
-  `fpv_bb_set_local_power()`, `ar_ldy_gnd` `do_bb_set_local_power()`) --
-  the chip's dBm is not antenna output, stock's own "500 mW" is 26 on the
-  Lite and 24 on the ground:
-
-  | level | air: chip dBm | ground: chip dBm |
-  |---|---|---|
-  | 400 / 500 mW | 26 | 24 (`BB_SET_POWER` 27) |
-  | 200 mW | 22 | 20 (23) |
-  | 100 mW | 19 | 17 (20) |
-  | 25 mW | 13 | 11 (14) |
-  | auto | -- | 24, adaptation within [14, 27] |
-
-  Air: `BB_SET_POWER_AUTO {2 (disconnected power), dBm, dBm}` then
-  `BB_SET_POWER` on the BR/CS user (8) -- setting user 0 was confirmed on
-  hardware to change only what `BB_GET_CUR_POWER` reports, not what the
-  ground receives. Ground: `BB_SET_POWER_AUTO {1, 27, 14}` (auto) or
+  too), on every connect and immediately on change. The chip's dBm is its
+  calibration table's, not a measured antenna output. The sequences are
+  stock's (Ghidra: `ar_ldyhs_sky` `fpv_bb_set_local_power()`, `ar_ldy_gnd`
+  `do_bb_set_local_power()`). Air: `BB_SET_POWER_AUTO {2 (disconnected
+  power), dBm, dBm}` then `BB_SET_POWER` on the BR/CS user (8) -- setting
+  user 0 was confirmed on hardware to change only what `BB_GET_CUR_POWER`
+  reports, not what the ground receives. Ground: `BB_SET_POWER_AUTO {1,
+  top, lowest}` of the board's levels (auto, starting at the top one) or
   `{0, 17, 14}`, then `{2, dBm, dBm}`, then `BB_SET_POWER` on user 0 at
-  dBm + 3 (stock's own offset when the air unit is a Lite).
+  dBm. Stock's ground keeps its disconnected power 3 dB below the target;
+  here both are the level's.
   **Needs the ar8030 package's `bb_api-fix-BB_SET_POWER_AUTO-input-size`
   patch** (the SDK sent `BB_SET_POWER_AUTO` with 1 byte; the chip takes
   3): built against an SDK without it (`BB_HAVE_PWR_AUTO_BOUNDS` unset)

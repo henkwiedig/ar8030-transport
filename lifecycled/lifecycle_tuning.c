@@ -2,6 +2,7 @@
 #include "lc_log.h"
 #include "../common/ar8030_link_policy.h"
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -518,57 +519,21 @@ int lc_channel_apply_linked(bb_dev_handle_t* handle, int slot, int chan)
     return ret;
 }
 
-/* mW level -> chip dBm target, per role, from the stock streamers' own
- * tables (Ghidra, see lifecycle_tuning.h): ar_ldyhs_sky's table for the
- * Lite's board type (25->13, 100->19, 150->21, 200->22, 500->26) and
- * ar_ldy_gnd's (25->11, 100->17, 200->20, 500->24). The air side's top
- * level is stock's own "500 mW" entry, offered as 400 mW (26 dBm). */
-typedef struct {
-    int mw;
-    int dbm;
-} lc_power_level_t;
+/* Output power levels: each board offers its own list of levels in mW
+ * (--power-levels), and a level's chip dBm target is 10 * log10(mW),
+ * rounded -- the same label means the same dBm on every board. Without the
+ * option a role gets the levels stock offers: air 400/200/100/25 mW (Caddx's
+ * labels), ground auto/500/200/100/25 mW. */
+static const int AP_DEFAULT_MW[]  = {400, 200, 100, 25};
+static const int DEV_DEFAULT_MW[] = {500, 200, 100, 25};
 
-static const lc_power_level_t AP_POWER_LEVELS[] = {{400, 26}, {200, 22}, {100, 19}, {25, 13}};
-static const lc_power_level_t DEV_POWER_LEVELS[] = {{500, 24}, {200, 20}, {100, 17}, {25, 11}};
+/* The ground's bounds outside auto, as stock sends them ({OFF, 17, 14}). */
+#define DEV_OFF_MAX_DBM 17
+#define DEV_OFF_MIN_DBM 14
 
-/* Ground "auto": stock's 501 mW (500 + auto bit): target 24, adaptation
- * bounded to [14, 27] -- 14 is ar_ldy_gnd's floor when the air unit is a
- * Lite (sky project type 4/7), 27 its auto ceiling for 501 mW. */
-#define DEV_AUTO_DBM     24
-#define DEV_AUTO_MIN_DBM 14
-#define DEV_AUTO_MAX_DBM 27
-/* The level "auto" counts as for --max-power: it starts at the 500 mW
- * level's target and adapts beyond it, so a lower cap drops it too. */
-#define DEV_AUTO_CAP_MW 500
-
-/* ar_ldy_gnd adds +3 to the ground's own BB_SET_POWER target when the air
- * unit is a type 4/6/7 board (the Lite is 4/7) -- +6 when a config flag we
- * haven't decoded is clear; the smaller of the two is used here. */
-#define DEV_TARGET_OFFSET_DBM 3
-
-static const lc_power_level_t* power_levels(int is_ap, size_t* n)
+int lc_power_dbm(int mw)
 {
-    if (is_ap) {
-        *n = sizeof(AP_POWER_LEVELS) / sizeof(AP_POWER_LEVELS[0]);
-        return AP_POWER_LEVELS;
-    }
-    *n = sizeof(DEV_POWER_LEVELS) / sizeof(DEV_POWER_LEVELS[0]);
-    return DEV_POWER_LEVELS;
-}
-
-static int power_level_dbm(int is_ap, int level)
-{
-    if (level == LC_POWER_AUTO) {
-        return is_ap ? -1 : DEV_AUTO_DBM;
-    }
-    size_t                  n;
-    const lc_power_level_t* t = power_levels(is_ap, &n);
-    for (size_t i = 0; i < n; i++) {
-        if (t[i].mw == level) {
-            return t[i].dbm;
-        }
-    }
-    return -1;
+    return (int)lround(10.0 * log10((double)mw));
 }
 
 int lc_power_parse(const char* s, int* out)
@@ -593,45 +558,120 @@ int lc_power_parse(const char* s, int* out)
     return 0;
 }
 
-static int power_within(int max_mw, int level)
+static int table_add(lc_power_table_t* t, int mw, char* err, size_t err_sz)
 {
-    return max_mw <= 0 || (level == LC_POWER_AUTO ? DEV_AUTO_CAP_MW : level) <= max_mw;
-}
-
-int lc_power_valid(int is_ap, int max_mw, int level)
-{
-    return power_level_dbm(is_ap, level) >= 0 && power_within(max_mw, level);
-}
-
-int lc_power_default(int is_ap, int max_mw)
-{
-    int def = is_ap ? 400 : 500;
-    if (power_within(max_mw, def)) {
-        return def;
+    int dbm = lc_power_dbm(mw);
+    if (dbm < LC_POWER_MIN_DBM || dbm > LC_POWER_MAX_DBM) {
+        snprintf(err, err_sz, "%d mW is %d dBm, outside the chip's %d-%d", mw, dbm, LC_POWER_MIN_DBM,
+                 LC_POWER_MAX_DBM);
+        return -1;
     }
-    size_t                  n;
-    const lc_power_level_t* t = power_levels(is_ap, &n);
-    for (size_t i = 0; i < n; i++) {
-        if (power_within(max_mw, t[i].mw)) {
-            return t[i].mw;
+    for (int i = 0; i < t->n; i++) {
+        if (t->mw[i] == mw) {
+            snprintf(err, err_sz, "%d mW is listed twice", mw);
+            return -1;
         }
     }
-    return -1;
+    if (t->n >= LC_POWER_MAX_LEVELS) {
+        snprintf(err, err_sz, "more than %d levels", LC_POWER_MAX_LEVELS);
+        return -1;
+    }
+    int i = t->n++; /* kept highest first */
+    while (i > 0 && t->mw[i - 1] < mw) {
+        t->mw[i] = t->mw[i - 1];
+        i--;
+    }
+    t->mw[i] = mw;
+    return 0;
 }
 
-void lc_power_levels_json(int is_ap, int max_mw, char* out, size_t out_sz)
+void lc_power_table_default(int is_ap, lc_power_table_t* t)
 {
-    size_t                  n;
-    const lc_power_level_t* t   = power_levels(is_ap, &n);
-    size_t                  len = 0;
-    out[0]                      = '\0';
-    if (!is_ap && power_within(max_mw, LC_POWER_AUTO)) {
+    char         err[64];
+    const int*   mw = is_ap ? AP_DEFAULT_MW : DEV_DEFAULT_MW;
+    const size_t n =
+        is_ap ? sizeof(AP_DEFAULT_MW) / sizeof(AP_DEFAULT_MW[0]) : sizeof(DEV_DEFAULT_MW) / sizeof(DEV_DEFAULT_MW[0]);
+    memset(t, 0, sizeof(*t));
+    t->auto_ok = !is_ap;
+    for (size_t i = 0; i < n; i++) {
+        table_add(t, mw[i], err, sizeof(err));
+    }
+}
+
+int lc_power_table_parse(const char* s, int is_ap, lc_power_table_t* t, char* err, size_t err_sz)
+{
+    char buf[128];
+    if (!s || !*s || strlen(s) >= sizeof(buf)) {
+        snprintf(err, err_sz, "empty or too long");
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%s", s);
+    memset(t, 0, sizeof(*t));
+    char* save = NULL;
+    for (char* tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        int level;
+        if (lc_power_parse(tok, &level) != 0 || level == LC_POWER_NONE) {
+            snprintf(err, err_sz, "'%s' is not a level in mW", tok);
+            return -1;
+        }
+        if (level == LC_POWER_AUTO) {
+            if (is_ap) {
+                snprintf(err, err_sz, "auto is a ground level only");
+                return -1;
+            }
+            t->auto_ok = 1;
+        } else if (table_add(t, level, err, err_sz) != 0) {
+            return -1;
+        }
+    }
+    if (t->n == 0) {
+        snprintf(err, err_sz, "no level in mW");
+        return -1;
+    }
+    return 0;
+}
+
+void lc_power_table_cap(lc_power_table_t* t, int max_mw)
+{
+    int n = 0;
+    for (int i = 0; i < t->n; i++) {
+        if (t->mw[i] <= max_mw) {
+            t->mw[n++] = t->mw[i];
+        }
+    }
+    t->n = n;
+    if (max_mw < DEV_DEFAULT_MW[0]) { /* as --max-power always did */
+        t->auto_ok = 0;
+    }
+}
+
+int lc_power_valid(const lc_power_table_t* t, int level)
+{
+    if (level == LC_POWER_AUTO) {
+        return t->auto_ok && t->n > 0;
+    }
+    for (int i = 0; i < t->n; i++) {
+        if (t->mw[i] == level) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int lc_power_default(const lc_power_table_t* t)
+{
+    return t->n > 0 ? t->mw[0] : -1;
+}
+
+void lc_power_levels_json(const lc_power_table_t* t, char* out, size_t out_sz)
+{
+    size_t len = 0;
+    out[0]     = '\0';
+    if (t->auto_ok) {
         len += (size_t)snprintf(out, out_sz, "\"auto\"");
     }
-    for (size_t i = 0; i < n && len < out_sz; i++) {
-        if (power_within(max_mw, t[i].mw)) {
-            len += (size_t)snprintf(out + len, out_sz - len, "%s%d", len ? "," : "", t[i].mw);
-        }
+    for (int i = 0; i < t->n && len < out_sz; i++) {
+        len += (size_t)snprintf(out + len, out_sz - len, "%s%d", len ? "," : "", t->mw[i]);
     }
 }
 
@@ -724,40 +764,42 @@ static int ap_power_apply_dbm(bb_dev_handle_t* handle, int dbm, int auto3, int f
 }
 #endif
 
-/* Stock's sequences (see lifecycle_tuning.h):
+/* Stock's sequences (see lifecycle_tuning.h), with the level's dBm:
  *  air:    {DISCONNECT, dbm, dbm}, then BB_SET_POWER(BR/CS user, dbm) --
  *          the AP's own power is set on the BR/CS user, not user 0
  *          (confirmed on hardware: BB_SET_POWER on user 0 moves what
  *          BB_GET_CUR_POWER reports, but not what the ground receives)
- *  ground: {ON, 27, 14} for auto / {OFF, 17, 14} otherwise, then
- *          {DISCONNECT, dbm, dbm}, then BB_SET_POWER(user 0, dbm + 3) */
-int lc_power_apply(bb_dev_handle_t* handle, int is_ap, int level, int fem_ctrl)
+ *  ground: {ON, top, lowest} of the board's levels for auto (starting at
+ *          the top one) / {OFF, 17, 14} otherwise, then {DISCONNECT, dbm,
+ *          dbm}, then BB_SET_POWER(user 0, dbm). Stock's disconnect power
+ *          is 3 dB below its target; here both are the level's. */
+int lc_power_apply(bb_dev_handle_t* handle, int is_ap, const lc_power_table_t* t, int level, int fem_ctrl)
 {
 #ifdef BB_HAVE_PWR_AUTO_BOUNDS
-    int dbm = power_level_dbm(is_ap, level);
-    if (dbm < 0) {
-        lc_log("lifecycle: tuning: power level %d is not valid for this role, not applying", level);
+    if (!lc_power_valid(t, level)) {
+        lc_log("lifecycle: tuning: power level %d is not one of this board's, not applying", level);
         return -1;
     }
+    int dbm = lc_power_dbm(level == LC_POWER_AUTO ? t->mw[0] : level);
     if (is_ap) {
         return ap_power_apply_dbm(handle, dbm, 1, fem_ctrl);
     }
     int ret = 0;
     if (level == LC_POWER_AUTO) {
-        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_ON, DEV_AUTO_MAX_DBM, DEV_AUTO_MIN_DBM);
+        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_ON, dbm, lc_power_dbm(t->mw[t->n - 1]));
     } else {
-        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_OFF, DEV_AUTO_MIN_DBM + 3, DEV_AUTO_MIN_DBM);
+        ret |= power_auto_ioctl(handle, BB_PWR_AUTO_OFF, DEV_OFF_MAX_DBM, DEV_OFF_MIN_DBM);
     }
     ret |= power_auto_ioctl(handle, BB_PWR_AUTO_DISCONNECT, dbm, dbm);
 
-    int             target = dbm + DEV_TARGET_OFFSET_DBM;
-    bb_set_pwr_in_t sp     = {.usr = BB_USER_0, .pwr = (uint8_t)target};
-    int             r      = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
-    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", BB_USER_0, target, r);
+    bb_set_pwr_in_t sp = {.usr = BB_USER_0, .pwr = (uint8_t)dbm};
+    int             r  = bb_ioctl(handle, BB_SET_POWER, &sp, NULL);
+    lc_log("lifecycle: tuning: BB_SET_POWER(usr=%d, pwr=%ddBm) ret=%d", BB_USER_0, dbm, r);
     return ret | r;
 #else
     (void)handle;
     (void)is_ap;
+    (void)t;
     (void)level;
     (void)fem_ctrl;
     lc_log("lifecycle: tuning: SDK lacks the BB_SET_POWER_AUTO size fix, not touching output power");
