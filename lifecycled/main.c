@@ -56,7 +56,11 @@ static void print_help(const char* argv0)
     printf("  --reset-gpio <list>       comma-separated GPIO numbers, gpio-sysfs method only\n");
     printf("  --hook-dir <path>         hook script root (default /etc/ar8030/hooks.d)\n");
     printf("  --cfg-path <path>         baseband JSON to persist pairing/tuning against\n");
-    printf("  --default-bandwidth <n>   fallback bandwidth if no tuning state yet (default 20)\n");
+    printf("  --default-bandwidth <n|none>\n");
+    printf("                            TX bandwidth (MHz) applied after every connect while none is\n");
+    printf("                            persisted yet (default 20); none (or 0): never set it, the\n");
+    printf("                            chip keeps its config file's, a saved one is ignored and\n");
+    printf("                            /api/v1/bandwidth only changes the live link\n");
     printf("  --default-channel <n|auto|none>\n");
     printf("                            AP only: channel while none is persisted yet: a channel-table\n");
     printf("                            index, auto (chip's channel adaptation) or none (leave\n");
@@ -274,7 +278,19 @@ int main(int argc, char** argv)
             strncpy(cfg.cfg_path, optarg, sizeof(cfg.cfg_path) - 1);
             break;
         case OPT_DEFAULT_BANDWIDTH:
-            cfg.default_bandwidth = (int)strtoul(optarg, NULL, 10);
+            if (strcmp(optarg, "none") == 0) {
+                cfg.default_bandwidth = 0;
+            } else if (strcmp(optarg, "2.5") == 0 || strcmp(optarg, "1.25") == 0) {
+                cfg.default_bandwidth = optarg[0] - '0';    /* the API's 2 / 1 */
+            } else {
+                char* end;
+                long  v = strtol(optarg, &end, 10);
+                if (*optarg == '\0' || *end != '\0' || (v != 0 && !lc_tuning_valid_mhz((int)v))) {
+                    fprintf(stderr, "invalid --default-bandwidth '%s' (1, 2, 5, 10, 20, 40 or none)\n", optarg);
+                    return 1;
+                }
+                cfg.default_bandwidth = (int)v;
+            }
             break;
         case OPT_DEFAULT_CHANNEL:
             if (lc_channel_parse(optarg, &cfg.default_channel) != 0) {

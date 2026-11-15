@@ -109,8 +109,11 @@
  * and how many pushes per connection (a re-tune through another channel
  * takes two). */
 #define LC_CHAN_CHECK_DELAY_S 3
-/* AP, frame change mode 2: longest wait for the uplink bandwidth switch after a connect (lc_frame_change_tick) */
-#define LC_FC_SETTLE_MAX_S 10
+/* AP, frame change mode 2: longest wait for the uplink bandwidth switch after a connect (lc_frame_change_tick).
+ * A DEV that switches its uplink does it from its own connect tuning, within ~2 s of ours; a DEV under
+ * --default-bandwidth none never does, so this is how long mode 2 waits there. A later switch is caught
+ * by the running check anyway (mode 0, then 2 again). */
+#define LC_FC_SETTLE_MAX_S 5
 #define LC_CHAN_PUSHES        4
 
 
@@ -165,8 +168,15 @@ struct lifecycle_ctx {
      * persisted -- -1 means "not known yet", not "no tuning wanted".
      * Compared against a fresh BB_GET_STATUS reading every fallback-poll
      * tick while connected so a live `ar8030-linkctl bandwidth` change
-     * gets captured without needing its own resident watcher. */
+     * gets captured without needing its own resident watcher. 0: none
+     * wanted (--default-bandwidth none). */
     int last_bandwidth;
+    /* The chip's own TX bandwidth (MHz) as last read while connected and
+     * no bandwidth is wanted (last_bandwidth 0): what the status reports
+     * then. -1 = not read yet. */
+    int chip_bandwidth;
+    /* "ignoring the saved bandwidth" logged once per process. */
+    int saved_bw_ignored_logged;
 
     /* Fires the "idle" hook (this unit has never been paired) once per
      * process instead of once per second -- the branch that wants it is
@@ -398,6 +408,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->state                = LC_STATE_INIT;
     ctx->connected_slot       = -1;
     ctx->last_bandwidth       = -1;
+    ctx->chip_bandwidth       = -1;
     ctx->pending_bandwidth_mhz = -1;
     ctx->chan_auto            = -1;
     ctx->work_chan            = -1;
@@ -487,18 +498,42 @@ static void lc_apply_link_policy_ap(lifecycle_ctx* ctx)
  * periodic re-check below has a baseline to compare fresh readings
  * against instead of re-persisting its own just-applied value back to
  * itself on the very next tick. Best-effort throughout: a tuning failure
- * is logged, never treated as a reason to tear the connection back down. */
+ * is logged, never treated as a reason to tear the connection back down.
+ *
+ * --default-bandwidth none (0): nothing is applied and a saved value is
+ * ignored, so the link stays at the bandwidth both chips' config files
+ * give it (the one they log in with). A chip moved off that bandwidth goes
+ * back to it by itself 10 s after the link is lost, but keeps the LDPC
+ * code length of the wider bandwidth when it already sits at its initial
+ * MCS -- which a DEV that lost its uplink does. Its logins then never
+ * decode at the AP and the link stays down until the chip is reset. For a
+ * DEV's uplink that is the reason to leave it alone. */
 static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
 {
-    int bandwidth = ctx->cfg.cfg_path[0] ? lc_tuning_load(ctx->cfg.cfg_path) : -1;
-    if (bandwidth < 0) {
-        bandwidth = ctx->cfg.default_bandwidth;
+    int bandwidth;
+    if (ctx->cfg.default_bandwidth == 0) {
+        int saved = ctx->cfg.cfg_path[0] ? lc_tuning_load(ctx->cfg.cfg_path) : -1;
+        if (saved > 0 && !ctx->saved_bw_ignored_logged) {
+            lc_log("lifecycle: tuning: ignoring the saved %d MHz (--default-bandwidth none), "
+                   "the chip keeps its configured bandwidth", saved);
+            ctx->saved_bw_ignored_logged = 1;
+        }
+        bandwidth = 0;
+    } else {
+        bandwidth = ctx->cfg.cfg_path[0] ? lc_tuning_load(ctx->cfg.cfg_path) : -1;
+        if (bandwidth < 0) {
+            bandwidth = ctx->cfg.default_bandwidth;
+        }
     }
+    int chip = -1;
     if (bandwidth > 0) {
         lc_tuning_apply(ctx->client.handle, slot, bandwidth);
+    } else {
+        chip = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
     }
     pthread_mutex_lock(&ctx->status_lock);
     ctx->last_bandwidth = bandwidth;
+    ctx->chip_bandwidth = chip;
     pthread_mutex_unlock(&ctx->status_lock);
 
     lc_apply_link_tuning(ctx);
@@ -565,7 +600,8 @@ static void lc_apply_link_tuning(lifecycle_ctx* ctx)
  * already uses), and additionally applies live via lc_tuning_apply() only
  * if actually connected right now -- applying blind against a slot with
  * no real peer would just be a wasted ioctl (see lc_tuning_apply()'s own
- * BB_SET_BANDWIDTH target). */
+ * BB_SET_BANDWIDTH target). Under --default-bandwidth none nothing is
+ * persisted: a request only applies to the live link, until it drops. */
 static void lc_drain_bandwidth_request(lifecycle_ctx* ctx)
 {
     int requested_mhz;
@@ -578,9 +614,14 @@ static void lc_drain_bandwidth_request(lifecycle_ctx* ctx)
         return;
     }
 
-    lc_log("lifecycle: http: bandwidth change requested: %d MHz", requested_mhz);
-    if (ctx->cfg.cfg_path[0]) {
-        lc_tuning_save(ctx->cfg.cfg_path, requested_mhz);
+    if (ctx->cfg.default_bandwidth == 0) {
+        lc_log("lifecycle: http: bandwidth change requested: %d MHz (--default-bandwidth none: %s)", requested_mhz,
+               ctx->state == LC_STATE_CONNECTED ? "this link only, not saved" : "not linked, ignored");
+    } else {
+        lc_log("lifecycle: http: bandwidth change requested: %d MHz", requested_mhz);
+        if (ctx->cfg.cfg_path[0]) {
+            lc_tuning_save(ctx->cfg.cfg_path, requested_mhz);
+        }
     }
     if (ctx->state == LC_STATE_CONNECTED) {
         lc_tuning_apply(ctx->client.handle, ctx->connected_slot, requested_mhz);
@@ -1640,6 +1681,7 @@ void* lifecycle_thread_main(void* arg)
                 ctx->state          = LC_STATE_IDLE;
                 ctx->connected_slot = -1;
                 ctx->last_bandwidth = -1;
+                ctx->chip_bandwidth = -1;
                 ctx->chan_auto      = -1;
                 ctx->work_chan      = -1;
                 pthread_mutex_unlock(&ctx->status_lock);
@@ -1686,6 +1728,12 @@ void* lifecycle_thread_main(void* arg)
                         lc_frame_change_set_pending(ctx, 1);
                     }
                 }
+            } else if (did_fallback_poll && ctx->last_bandwidth == 0) {
+                /* Nothing wanted: only follow what the chip runs, for the status. */
+                int cur = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
+                pthread_mutex_lock(&ctx->status_lock);
+                ctx->chip_bandwidth = cur;
+                pthread_mutex_unlock(&ctx->status_lock);
             }
             if (did_fallback_poll && ctx->frame_change_pending && !ctx->fc_wait) {
                 lc_frame_change_try(ctx);
@@ -1727,7 +1775,8 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     pthread_mutex_lock(&ctx->status_lock);
     out->state          = ctx->state;
     out->connected_slot = ctx->connected_slot;
-    out->bandwidth_mhz  = ctx->last_bandwidth;
+    out->bandwidth_mhz  = ctx->last_bandwidth > 0 ? ctx->last_bandwidth
+                        : ctx->last_bandwidth == 0 ? ctx->chip_bandwidth : -1;
     out->channel        = ctx->channel;
     out->chan_auto      = ctx->chan_auto;
     out->work_chan      = ctx->work_chan;

@@ -65,6 +65,9 @@ typedef struct {
     char hook_dir[256];
     char cfg_path[256];
 
+    /* MHz applied after every connect while none is persisted; 0 =
+     * --default-bandwidth none: never set, a persisted one is ignored
+     * (see lc_apply_tuning_on_connect()). */
     int default_bandwidth;
     /* AP: BB_SET_FRAME_CHANGE mode applied after every connect while none
      * is persisted yet (no ar8030.frame_change sidecar): 1 = exchanged

@@ -2279,6 +2279,15 @@ design rationale):
   the same reasoning rules out a second thread in *this* process making
   concurrent `bb_ioctl` calls on the same handle).
   `curl -X POST 'http://<host>:8899/api/v1/bandwidth?mhz=20'`.
+  Under `--default-bandwidth none` nothing is applied after a connect, a
+  persisted value is ignored and a request changes only the live link
+  until it drops. That is for a DEV's uplink: a chip moved off its
+  configured bandwidth goes back to it by itself 10 s after the link is
+  lost, but keeps the wider bandwidth's LDPC code length when it already
+  sits at its initial MCS, which a DEV that lost its uplink does. Its
+  logins then never decode at the AP and the link stays down until the
+  chip is reset. Left at the configured bandwidth, the chip has nothing
+  to go back to.
   A switch to or from 40 MHz makes the chip firmware drop the link on
   both sides on purpose. The link comes back after about 0.65 s, but in
   frame mode 0 and with the chip's power reset (ar8030-rtos
