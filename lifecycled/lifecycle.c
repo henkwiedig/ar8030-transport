@@ -240,13 +240,17 @@ struct lifecycle_ctx {
     int power;
     int power_dbm;
 
-    /* lifecycle_request_armed()'s mailbox, same cmd_lock; -1 = nothing
-     * queued. */
+    /* lifecycle_request_armed()'s and lifecycle_request_standby()'s
+     * mailboxes, same cmd_lock; -1 = nothing queued. */
     int pending_armed;
-    /* Last reported arm state and whether the low-power mode is applied
-     * (cfg.standby_dbm), status_lock. */
+    int pending_standby;
+    /* Last reported arm state, whether the low-power mode is applied
+     * (cfg.standby_dbm) and whether disarmed enters it (the persisted
+     * setting, else cfg.standby_disarmed; -1 without a low-power mode),
+     * status_lock. */
     int armed;
     int standby;
+    int standby_disarmed;
 
     /* SoC temperature (lc_poll_soc_temp()) and the video pause it drives
      * (lc_overheat_update()), status_lock. */
@@ -414,6 +418,7 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
     ctx->pending_armed        = -1;
+    ctx->pending_standby      = -1;
     ctx->pending_frame_change = -1;
     ctx->fc_uplink_applied    = -1;
     ctx->armed                = 1;
@@ -429,6 +434,11 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
         ctx->frame_change = -1;
     } else if (!cfg->cfg_path[0] || lc_frame_change_load(cfg->cfg_path, &ctx->frame_change) != 0) {
         ctx->frame_change = cfg->frame_change;
+    }
+    if (!is_ap || cfg->standby_dbm < 0) {
+        ctx->standby_disarmed = -1;
+    } else if (!cfg->cfg_path[0] || lc_standby_load(cfg->cfg_path, &ctx->standby_disarmed) != 0) {
+        ctx->standby_disarmed = cfg->standby_disarmed;
     }
     const lc_power_table_t* levels = &cfg->power_levels;
     if (!cfg->cfg_path[0] || lc_power_load(cfg->cfg_path, &ctx->power) != 0 || !lc_power_valid(levels, ctx->power)) {
@@ -901,16 +911,19 @@ static void lc_apply_power(lifecycle_ctx* ctx)
                    ctx->cfg.fem_ctrl);
 }
 
-/* Drains lifecycle_request_armed()'s mailbox, then enters or leaves the
- * low-power mode: entered while disarmed or paused for heat
- * (lc_overheat_update()) with a link up (stock waits for the link first),
- * left as soon as armed and not paused, link or not. A drop keeps it, so
- * the chip reconnects at standby power, as stock's does. */
+/* Drains lifecycle_request_armed()'s and lifecycle_request_standby()'s
+ * mailboxes, then enters or leaves the low-power mode: entered while
+ * paused for heat (lc_overheat_update()) or, with the disarmed setting on,
+ * disarmed -- only with a link up (stock waits for the link first); left
+ * as soon as neither holds, link or not. A drop keeps it, so the chip
+ * reconnects at standby power, as stock's does. */
 static void lc_standby_update(lifecycle_ctx* ctx)
 {
     pthread_mutex_lock(&ctx->cmd_lock);
-    int armed          = ctx->pending_armed;
-    ctx->pending_armed = -1;
+    int armed            = ctx->pending_armed;
+    int disarmed_on      = ctx->pending_standby;
+    ctx->pending_armed   = -1;
+    ctx->pending_standby = -1;
     pthread_mutex_unlock(&ctx->cmd_lock);
 
     if (armed >= 0 && armed != ctx->armed) {
@@ -922,9 +935,18 @@ static void lc_standby_update(lifecycle_ctx* ctx)
     if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.standby_dbm < 0) {
         return;
     }
+    if (disarmed_on >= 0) {
+        lc_log("lifecycle: http: low-power mode while disarmed %s", disarmed_on ? "on" : "off");
+        if (ctx->cfg.cfg_path[0]) {
+            lc_standby_save(ctx->cfg.cfg_path, disarmed_on);
+        }
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->standby_disarmed = disarmed_on;
+        pthread_mutex_unlock(&ctx->status_lock);
+    }
 
     int want = ctx->standby;
-    if (ctx->armed && !ctx->overheat) {
+    if (!ctx->overheat && (ctx->armed || !ctx->standby_disarmed)) {
         want = 0;
     } else if (ctx->state == LC_STATE_CONNECTED) {
         want = 1;
@@ -1786,6 +1808,7 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->frame_change_pending = ctx->frame_change_pending;
     out->armed          = ctx->armed;
     out->standby        = ctx->standby;
+    out->standby_disarmed = ctx->standby_disarmed;
     out->soc_temp_valid = ctx->soc_temp_valid;
     out->soc_temp_c10   = ctx->soc_temp_c10;
     out->overheat       = ctx->overheat;
@@ -1894,6 +1917,20 @@ int lifecycle_request_armed(lifecycle_ctx* ctx, int armed)
     }
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_armed = armed;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_standby(lifecycle_ctx* ctx, int on)
+{
+    if (ctx->cfg.role != LC_ROLE_AP || ctx->cfg.standby_dbm < 0) {
+        return -2;
+    }
+    if (on != 0 && on != 1) {
+        return -1;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_standby = on;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }

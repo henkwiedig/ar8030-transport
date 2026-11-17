@@ -109,9 +109,14 @@ static void print_help(const char* argv0)
     printf("  --fem-ctrl                air, Ascent Lite: stock's power extras -- power-auto\n");
     printf("                            mode 3 and the FEM bit at >= 24 dBm\n");
     printf("  --standby-dbm <dBm>       air: stock's low-power mode -- this chip dBm target\n");
-    printf("                            while the FC reports disarmed (POST /api/v1/armed)\n");
-    printf("                            or the video is paused for heat, entered with a link\n");
-    printf("                            up, left on arm (Ascent Lite stock: 10) (default: off)\n");
+    printf("                            while the FC reports disarmed (POST /api/v1/armed;\n");
+    printf("                            see --standby-default) or the video is paused for\n");
+    printf("                            heat, entered with a link up, left on arm (Ascent\n");
+    printf("                            Lite stock: 10) (default: off)\n");
+    printf("  --standby-default on|off  air, with --standby-dbm: whether disarmed enters the\n");
+    printf("                            low-power mode while none is persisted (ar8030.standby,\n");
+    printf("                            POST /api/v1/standby); off = only the overheat pause\n");
+    printf("                            (default: on)\n");
     printf("  --soc-temp-cmd <cmd>      air: command printing the SoC temperature in degC,\n");
     printf("                            run every 2 s (default: none)\n");
     printf("  --overheat-c <C>          air: pause the video at or above this SoC\n");
@@ -166,6 +171,7 @@ enum {
     OPT_BATT_FILE,
     OPT_RF_PATH_B_OFF,
     OPT_STANDBY_DBM,
+    OPT_STANDBY_DEFAULT,
     OPT_SOC_TEMP_CMD,
     OPT_OVERHEAT_C,
     OPT_OVERHEAT_RESUME_C,
@@ -206,6 +212,7 @@ int main(int argc, char** argv)
         .batt_file         = "",
         .link_policy       = -1,
         .standby_dbm       = -1,
+        .standby_disarmed  = 1,
         .soc_temp_cmd      = "",
         .overheat_c        = -1,
         .overheat_resume_c = -1,
@@ -239,6 +246,7 @@ int main(int argc, char** argv)
         {"link-policy",       required_argument, 0, OPT_LINK_POLICY      },
         {"fem-ctrl",          no_argument,       0, OPT_FEM_CTRL         },
         {"standby-dbm",       required_argument, 0, OPT_STANDBY_DBM      },
+        {"standby-default",   required_argument, 0, OPT_STANDBY_DEFAULT  },
         {"soc-temp-cmd",      required_argument, 0, OPT_SOC_TEMP_CMD     },
         {"overheat-c",        required_argument, 0, OPT_OVERHEAT_C       },
         {"overheat-resume-c", required_argument, 0, OPT_OVERHEAT_RESUME_C},
@@ -372,6 +380,16 @@ int main(int argc, char** argv)
             }
             break;
         }
+        case OPT_STANDBY_DEFAULT:
+            if (strcmp(optarg, "on") == 0) {
+                cfg.standby_disarmed = 1;
+            } else if (strcmp(optarg, "off") == 0) {
+                cfg.standby_disarmed = 0;
+            } else {
+                fprintf(stderr, "invalid --standby-default '%s' (on or off)\n", optarg);
+                return 1;
+            }
+            break;
         case OPT_SOC_TEMP_CMD:
             snprintf(cfg.soc_temp_cmd, sizeof(cfg.soc_temp_cmd), "%s", optarg);
             break;

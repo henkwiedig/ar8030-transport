@@ -314,6 +314,53 @@ int lc_frame_change_save(const char* cfg_path, int mode)
     return 0;
 }
 
+int lc_standby_load(const char* cfg_path, int* out)
+{
+    char path[512];
+    lc_sidecar_path(cfg_path, "ar8030.standby", path, sizeof(path));
+
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+    int on = -1;
+    int ok = fscanf(f, "%d", &on) == 1;
+    fclose(f);
+    if (!ok || (on != 0 && on != 1)) {
+        lc_log("lifecycle: tuning: %s is not 0 or 1, ignoring", path);
+        return -1;
+    }
+    *out = on;
+    return 0;
+}
+
+int lc_standby_save(const char* cfg_path, int on)
+{
+    if (on != 0 && on != 1) {
+        lc_log("lifecycle: tuning: refusing to persist invalid standby setting %d", on);
+        return -1;
+    }
+
+    char path[512];
+    lc_sidecar_path(cfg_path, "ar8030.standby", path, sizeof(path));
+    char tmp_path[520];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE* f = fopen(tmp_path, "w");
+    if (!f) {
+        lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
+        return -1;
+    }
+    fprintf(f, "%d\n", on);
+    fclose(f);
+
+    if (rename(tmp_path, path) != 0) {
+        lc_log("lifecycle: tuning: rename %s -> %s failed: %s", tmp_path, path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 int lc_channel_parse(const char* s, int* out)
 {
     if (!s || !*s) {

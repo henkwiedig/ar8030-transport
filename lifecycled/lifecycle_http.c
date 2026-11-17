@@ -823,10 +823,51 @@ static void handle_armed(lifecycle_http_ctx* http, int fd, const char* method, c
     }
     format_heat_fields(http, &st, heat, sizeof(heat));
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"armed\":%s,\"standby\":%s,\"standby_dbm\":%s,%s,\"overheat_c\":%s,"
-             "\"overheat_resume_c\":%s}",
-             st.armed ? "true" : "false", cfg->standby_dbm < 0 ? "null" : st.standby ? "true" : "false", dbm, heat,
-             overheat_c, resume_c);
+             "{\"ok\":true,\"armed\":%s,\"standby\":%s,\"standby_enabled\":%s,\"standby_dbm\":%s,%s,"
+             "\"overheat_c\":%s,\"overheat_resume_c\":%s}",
+             st.armed ? "true" : "false", cfg->standby_dbm < 0 ? "null" : st.standby ? "true" : "false",
+             st.standby_disarmed < 0 ? "null" : st.standby_disarmed ? "true" : "false", dbm, heat, overheat_c,
+             resume_c);
+    send_json(fd, 200, "OK", json);
+}
+
+/* GET /api/v1/standby -- whether the low-power mode follows the arm state
+ * ("enabled"; null without --standby-dbm or on the DEV), whether it is
+ * applied now ("standby") and its dBm. POST /api/v1/standby?enabled=<0|1>
+ * -- persisted, applied on the lifecycle thread's next tick; 409 without a
+ * low-power mode. The overheat pause lowers the power either way. */
+static void handle_standby(lifecycle_http_ctx* http, int fd, const char* method, const char* query)
+{
+    if (strcmp(method, "POST") == 0) {
+        int on;
+        int rc = query_param_int(query, "enabled", &on) != 0 ? -1 : lifecycle_request_standby(http->lc, on);
+        if (rc == -2) {
+            send_json(fd, 409, "Conflict",
+                      "{\"ok\":false,\"error\":\"no low-power mode here (air unit with --standby-dbm only)\"}");
+            return;
+        }
+        if (rc != 0) {
+            send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"'enabled' must be 0 or 1\"}");
+            return;
+        }
+        char json[48];
+        snprintf(json, sizeof(json), "{\"ok\":true,\"queued\":%d}", on);
+        send_json(fd, 202, "Accepted", json);
+        return;
+    }
+
+    lc_status_t st;
+    lifecycle_get_status(http->lc, &st);
+    const lc_config_t* cfg = lifecycle_get_config(http->lc);
+    char               dbm[16], json[160];
+    if (cfg->standby_dbm >= 0) {
+        snprintf(dbm, sizeof(dbm), "%d", cfg->standby_dbm);
+    } else {
+        snprintf(dbm, sizeof(dbm), "null");
+    }
+    snprintf(json, sizeof(json), "{\"ok\":true,\"enabled\":%s,\"standby\":%s,\"standby_dbm\":%s,\"armed\":%s}",
+             st.standby_disarmed < 0 ? "null" : st.standby_disarmed ? "true" : "false",
+             cfg->standby_dbm < 0 ? "null" : st.standby ? "true" : "false", dbm, st.armed ? "true" : "false");
     send_json(fd, 200, "OK", json);
 }
 
@@ -1210,6 +1251,8 @@ static void dispatch(lifecycle_http_ctx* http, int fd, const char* method, const
         handle_frame_change(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/armed") == 0) {
         handle_armed(http, fd, method, query);
+    } else if (strcmp(path, "/api/v1/standby") == 0) {
+        handle_standby(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/channel") == 0) {
         handle_channel(http, fd, method, query);
     } else if (strcmp(path, "/api/v1/link") == 0) {

@@ -154,6 +154,12 @@ typedef struct {
      * reports the arm state is up to the board: lifecycle_request_armed(),
      * POST /api/v1/armed. */
     int  standby_dbm;
+    /* AP with standby_dbm: whether the low-power mode follows the arm
+     * state while nothing is persisted (no ar8030.standby sidecar, see
+     * lifecycle_request_standby()): 1 = on (stock Ascent Lite), 0 = only
+     * the overheat pause lowers the power (stock SinYine F1 keeps full
+     * power disarmed). */
+    int  standby_disarmed;
     /* AP: SoC temperature source, a command printing degC (e.g. "109.9"),
      * run every LC_SOC_TEMP_POLL_S; "" = none. Board-specific, hence a
      * command (Ascent Lite: caddx-ascent-lite-temp). */
@@ -211,6 +217,7 @@ typedef struct {
     int        frame_change_pending; /* AP: not yet accepted on this link (or no link) */
     int        armed;         /* last reported arm state; 1 until told otherwise */
     int        standby;        /* low-power mode applied (cfg standby_dbm >= 0 only) */
+    int        standby_disarmed; /* AP with standby_dbm: low-power mode while disarmed on/off; -1 otherwise */
     int        soc_temp_valid; /* non-zero once soc_temp_cmd gave a reading */
     int        soc_temp_c10;   /* SoC temperature, 0.1 degC */
     int        overheat;       /* video paused for heat (cfg overheat_c >= 0 only) */
@@ -356,6 +363,14 @@ int lifecycle_request_frame_change(lifecycle_ctx* ctx, int mode);
  * leaves the air unit at standby power in flight. Returns 0 if queued, -1
  * for a value other than 0/1. */
 int lifecycle_request_armed(lifecycle_ctx* ctx, int armed);
+
+/* Same mailbox pattern, for whether the low-power mode follows the arm
+ * state (1) or only the overheat pause (0) -- lc_config_t.standby_disarmed
+ * is the default. AP with standby_dbm only. Persisted (ar8030.standby),
+ * applied on the lifecycle thread's next tick. Returns 0 if queued, -1
+ * for a value other than 0/1, -2 without a low-power mode (DEV, or no
+ * standby_dbm). */
+int lifecycle_request_standby(lifecycle_ctx* ctx, int on);
 
 /* Same mailbox pattern, for forgetting remembered air units on the DEV
  * (multi-bind, see lifecycle_pair.h): one by MAC (8 hex digits), or with

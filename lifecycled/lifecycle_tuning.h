@@ -282,6 +282,13 @@ int lc_frame_change_apply(bb_dev_handle_t* handle, int mode);
 int lc_frame_change_load(const char* cfg_path, int* out);
 int lc_frame_change_save(const char* cfg_path, int mode);
 
+/* Sidecar "ar8030.standby" next to cfg_path: 1 = the low-power mode
+ * follows the arm state, 0 = only the overheat pause lowers the power.
+ * Load returns 0 and fills *out, -1 if missing or invalid; save returns 0
+ * on success. */
+int lc_standby_load(const char* cfg_path, int* out);
+int lc_standby_save(const char* cfg_path, int on);
+
 int lc_retx_apply(bb_dev_handle_t* handle, int win, int busy, int idle, int conti_busy, int conti_idle);
 
 #ifdef __cplusplus

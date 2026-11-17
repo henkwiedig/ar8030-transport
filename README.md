@@ -2102,7 +2102,9 @@ physical bind button; nothing about the reconnect-following/tuning/hook
 machinery above depends on it.
 
 **Heat (air):** `--standby-dbm` is stock's low-power radio mode while the
-flight controller is disarmed (see `/api/v1/armed` below). The camera
+flight controller is disarmed (see `/api/v1/armed` below), unless that is
+switched off: `--standby-default off` starts it off, and
+`/api/v1/standby` (the goggles' menu) switches it, persisted. The camera
 stack heats the SoC far more than the radio, though -- on the Ascent Lite
 without airflow, starting the encoder took the die from 109 to 122 degC
 in about 13 s -- so `--soc-temp-cmd <cmd>` (a board command printing
@@ -2430,7 +2432,7 @@ design rationale):
   ```
   curl -X POST 'http://<host>:8899/api/v1/armed?state=0'
   curl http://<host>:8899/api/v1/armed
-  {"ok":true,"armed":false,"standby":true,"standby_dbm":10,"soc_temp_c":104.2,"overheat":false,"overheat_c":105,"overheat_resume_c":95}
+  {"ok":true,"armed":false,"standby":true,"standby_enabled":true,"standby_dbm":10,"soc_temp_c":104.2,"overheat":false,"overheat_c":105,"overheat_resume_c":95}
   ```
   Whatever reads the FC (msposd's MSP_STATUS) posts the state; nothing
   is persisted and every start assumes armed, so without a reporter the
@@ -2442,6 +2444,22 @@ design rationale):
   `null` without `--overheat-c`, also in `/api/v1/status`),
   `overheat_c` and `overheat_resume_c` -- the pause itself does not
   depend on the arm state.
+- **`GET|POST /api/v1/standby[?enabled=<0|1>]`** (air) -- whether
+  disarmed enters the low-power mode (`enabled`); the overheat pause
+  lowers the power either way. `--standby-default on|off` (default
+  `on`) sets it while nothing is persisted: on, as the Ascent Lite's
+  stock firmware runs it; off for an air unit whose stock firmware keeps
+  full power disarmed (SinYine F1). A POST is saved to an
+  `ar8030.standby` sidecar next to `cfg_path` and applied on the next
+  tick: switched off while disarmed, the power goes back to the wanted
+  level at once; switched on, it drops once a link is up. `409` without
+  `--standby-dbm` or on the DEV, where a GET answers `null`.
+  ```
+  curl -X POST 'http://<host>:8899/api/v1/standby?enabled=0'
+  curl http://<host>:8899/api/v1/standby
+  {"ok":true,"enabled":false,"standby":false,"standby_dbm":10,"armed":false}
+  ```
+  `/api/v1/armed` carries the same setting as `standby_enabled`.
 - **`POST /api/v1/retx-tuning?win=&busy=&idle=&conti_busy=&conti_idle=`**
   -- same mailbox/persist/apply pattern as `/api/v1/bandwidth` above, for
   the windowed retransmission controller's own tuning parameters
