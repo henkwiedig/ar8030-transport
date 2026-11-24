@@ -30,16 +30,50 @@ void lc_sidecar_path(const char* cfg_path, const char* name, char* out, size_t o
  * lc_tuning_apply()/lc_tuning_save(). */
 int lc_tuning_valid_mhz(int mhz);
 
-/* Reads the persisted bandwidth (MHz: 1/2/5/10/20/40) from the sidecar
- * file next to cfg_path (same directory, fixed name "ar8030.tuning").
- * Returns the bandwidth in MHz on success, -1 if no sidecar exists yet
- * or it's unreadable/invalid -- callers fall back to their own
- * configured default in that case. */
+/* The AP's bandwidth setting "auto": this side never sets the video
+ * bandwidth (no BB_SET_BANDWIDTH at connect, no re-apply), the ground's
+ * chip steps it with its MCS policy (its cfg mcs bw_auto, switched on with
+ * lc_bandwidth_mode_apply() on the DEV). The link starts at the
+ * bandwidth both chips' configs give it. As --default-bandwidth and in the
+ * ar8030.tuning sidecar ("auto"). */
+#define LC_BANDWIDTH_AUTO (-2)
+
+/* Lowest bw_auto range a ground may run: below 5 MHz the video downlink
+ * carried nothing on the bench (2.5 MHz, P1 + VR04, 11-24), at any rate. */
+#define LC_BW_AUTO_MIN_MHZ 5
+/* Top of our grounds' bw_auto range (their cfgs: 5-20): 40 MHz is left out,
+ * every switch to or from it drops the link. */
+#define LC_BW_AUTO_MAX_MHZ 20
+
+/* Reads the persisted bandwidth (MHz: 1/2/5/10/20/40, or "auto" =
+ * LC_BANDWIDTH_AUTO) from the sidecar file next to cfg_path (same
+ * directory, fixed name "ar8030.tuning"). Returns the bandwidth in MHz or
+ * LC_BANDWIDTH_AUTO on success, -1 if no sidecar exists yet or it's
+ * unreadable/invalid -- callers fall back to their own configured default
+ * in that case. */
 int lc_tuning_load(const char* cfg_path);
 
-/* Atomically persists bandwidth_mhz to the sidecar file next to
- * cfg_path. Returns 0 on success. */
+/* Atomically persists bandwidth_mhz (or LC_BANDWIDTH_AUTO) to the sidecar
+ * file next to cfg_path. Returns 0 on success. */
 int lc_tuning_save(const char* cfg_path, int bandwidth_mhz);
+
+/* DEV: switches the chip's bandwidth policy for the video it receives --
+ * BB_SET_BANDWIDTH_MODE {slot 0, on}, which the RTOS applies (1V1 only) to
+ * the PHY user that receives slot 0, on a DEV the BR. With it on, the
+ * MCS policy halves the bandwidth instead of stepping below the cfg's
+ * bw_auto threshold.low and doubles it instead of stepping above
+ * threshold.high, within bw_auto range; both come from the cfg, read at
+ * link set-up, which also resets the flag to the cfg's "enable" -- so
+ * this is re-applied after every connect and relink. Never on an AP:
+ * there slot 0's receiver is the uplink. Returns the ioctl's result, -1
+ * if this SDK build lacks the request. */
+int lc_bandwidth_mode_apply(bb_dev_handle_t* handle, int on);
+
+/* Non-zero if cfg_path's baseband.basic.dev.mcs.slot.bw_auto block can
+ * run: a range of LC_BW_AUTO_MIN_MHZ or more with low < high, and
+ * thresholds low < high. Else 0 and why (for a log line / 409). The
+ * check reads the file; the chip runs the copy it was started with. */
+int lc_bw_auto_cfg_usable(const char* cfg_path, char* why, size_t why_sz);
 
 /* Reads the AR8030's own currently-active TX bandwidth (MHz) via
  * BB_GET_STATUS: the DEV's user 0, the AP's BR/CS user (user 8 -- the
@@ -47,6 +81,16 @@ int lc_tuning_save(const char* cfg_path, int bandwidth_mhz);
  * out on user 8, same user lc_power_apply() sets). Returns -1 on ioctl
  * failure or an out-of-range reading. */
 int lc_tuning_read_current(bb_dev_handle_t* handle, int is_ap);
+
+/* Both links' bandwidth classes (bb_bandwidth_e) from one BB_GET_STATUS:
+ * the video downlink (BR user 8: the AP's TX, the DEV's RX) and the uplink
+ * (user 0: the DEV's TX, the AP's RX). -1 where unknown; returns 0 if the
+ * ioctl answered. */
+int lc_tuning_read_link_bw(bb_dev_handle_t* handle, int is_ap, int* video_bw, int* uplink_bw);
+
+/* A bandwidth class as the MHz the JSON shows ("1.25" ... "40"), NULL if
+ * out of range. */
+const char* lc_bw_class_mhz_str(int bw);
 
 /* AP: the uplink's receive bandwidth in MHz (slot user 0, BB_GET_STATUS rx), -1 on failure. The ground (DEV)
  * chooses it with its own BB_SET_BANDWIDTH, a few seconds after a fresh connect. */

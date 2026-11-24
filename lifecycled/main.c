@@ -56,11 +56,12 @@ static void print_help(const char* argv0)
     printf("  --reset-gpio <list>       comma-separated GPIO numbers, gpio-sysfs method only\n");
     printf("  --hook-dir <path>         hook script root (default /etc/ar8030/hooks.d)\n");
     printf("  --cfg-path <path>         baseband JSON to persist pairing/tuning against\n");
-    printf("  --default-bandwidth <n|none>\n");
+    printf("  --default-bandwidth <n|auto|none>\n");
     printf("                            TX bandwidth (MHz) applied after every connect while none is\n");
     printf("                            persisted yet (default 20); none (or 0): never set it, the\n");
     printf("                            chip keeps its config file's, a saved one is ignored and\n");
-    printf("                            /api/v1/bandwidth only changes the live link\n");
+    printf("                            /api/v1/bandwidth only changes the live link; auto (air\n");
+    printf("                            unit only): never set it, the ground's chip steps it\n");
     printf("  --default-channel <n|auto|none>\n");
     printf("                            AP only: channel while none is persisted yet: a channel-table\n");
     printf("                            index, auto (chip's channel adaptation) or none (leave\n");
@@ -288,13 +289,16 @@ int main(int argc, char** argv)
         case OPT_DEFAULT_BANDWIDTH:
             if (strcmp(optarg, "none") == 0) {
                 cfg.default_bandwidth = 0;
+            } else if (strcmp(optarg, "auto") == 0) {
+                cfg.default_bandwidth = LC_BANDWIDTH_AUTO;
             } else if (strcmp(optarg, "2.5") == 0 || strcmp(optarg, "1.25") == 0) {
                 cfg.default_bandwidth = optarg[0] - '0';    /* the API's 2 / 1 */
             } else {
                 char* end;
                 long  v = strtol(optarg, &end, 10);
                 if (*optarg == '\0' || *end != '\0' || (v != 0 && !lc_tuning_valid_mhz((int)v))) {
-                    fprintf(stderr, "invalid --default-bandwidth '%s' (1, 2, 5, 10, 20, 40 or none)\n", optarg);
+                    fprintf(stderr, "invalid --default-bandwidth '%s' (1, 2, 5, 10, 20, 40, auto or none)\n",
+                            optarg);
                     return 1;
                 }
                 cfg.default_bandwidth = (int)v;
@@ -438,6 +442,10 @@ int main(int argc, char** argv)
 
     /* the levels need the role, which may come after them */
     int is_ap = cfg.role == LC_ROLE_AP;
+    if (!is_ap && cfg.default_bandwidth == LC_BANDWIDTH_AUTO) {
+        fprintf(stderr, "--default-bandwidth auto is the air unit's (ap) setting: a ground follows it\n");
+        return 1;
+    }
     if (power_levels_arg) {
         char err[96];
         if (lc_power_table_parse(power_levels_arg, is_ap, &cfg.power_levels, err, sizeof(err)) != 0) {

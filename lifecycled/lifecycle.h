@@ -4,6 +4,7 @@
 extern "C" {
 #endif
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* The output power levels a board offers (--power-levels), see
@@ -67,7 +68,8 @@ typedef struct {
 
     /* MHz applied after every connect while none is persisted; 0 =
      * --default-bandwidth none: never set, a persisted one is ignored
-     * (see lc_apply_tuning_on_connect()). */
+     * (see lc_apply_tuning_on_connect()); LC_BANDWIDTH_AUTO (AP only):
+     * never set, the ground's chip steps it. */
     int default_bandwidth;
     /* AP: BB_SET_FRAME_CHANGE mode applied after every connect while none
      * is persisted yet (no ar8030.frame_change sidecar): 1 = exchanged
@@ -197,6 +199,7 @@ typedef struct {
     uint8_t  tx_mcs;       /* this side's TX MCS, raw (stock displays tx_mcs - 2) */
     uint8_t  tx_chan;
     uint8_t  tx_power;
+    int8_t   tx_bw;        /* this side's TX bandwidth class (bb_bandwidth_e, BB_GET_STATUS), -1 = unknown */
     uint32_t tx_freq_khz;
 } lc_link_side_t;
 
@@ -207,6 +210,7 @@ typedef struct {
     lc_state_e state;
     int        connected_slot; /* -1 if not connected */
     int        bandwidth_mhz;  /* -1 if not yet known/applied */
+    int        bandwidth_auto; /* AP: the setting is "auto"; DEV: the chip's bandwidth policy is wanted on */
     int        paired;         /* non-zero if lc_pair_has_been_paired() */
     int        channel;        /* wanted (AP): index, LC_CHANNEL_AUTO; LC_CHANNEL_NONE on the DEV */
     int        chan_auto;      /* chip-reported channel mode, -1 if not read yet */
@@ -323,9 +327,21 @@ const lc_config_t* lifecycle_get_config(const lifecycle_ctx* ctx);
  * regardless of current link state (so it sticks across the next
  * reconnect, exactly like a normal --cfg-path-driven startup would), and
  * additionally applies it live via lc_tuning_apply() if currently
- * connected. Returns 0 if mhz is a valid AR8030 bandwidth and the
+ * connected. LC_BANDWIDTH_AUTO (AP only): persisted as "auto", and from
+ * then on this side leaves the video bandwidth to the ground's chip.
+ * Returns 0 if mhz is a valid AR8030 bandwidth (or auto on an AP) and the
  * request was queued, -1 otherwise (nothing queued, nothing changed). */
 int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz);
+
+/* DEV only: wants the chip's bandwidth policy for the received video on
+ * or off (lc_bandwidth_mode_apply()) -- the ground half of the air unit's
+ * "auto" bandwidth, which the ground follows (the connected hook reads
+ * the air unit's status; the menu sets both). Applied now if connected
+ * and again after every connect and relink; not persisted, and kept
+ * across a link drop. Queued like lifecycle_request_bandwidth(). Returns
+ * 0 if queued, -1 on an AP, -2 if on can't run with the cfg
+ * (lc_bw_auto_cfg_usable(); why says what is missing). */
+int lifecycle_request_rx_bandwidth_auto(lifecycle_ctx* ctx, int on, char* why, size_t why_sz);
 
 /* Same mailbox pattern as lifecycle_request_bandwidth() above, for the
  * windowed retransmission controller's own tuning parameters (see

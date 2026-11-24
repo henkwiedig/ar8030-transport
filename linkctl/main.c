@@ -112,6 +112,14 @@ static void usage(const char *argv0)
             "      no automatic recovery, and the peer needs its own manual\n"
             "      channel change to match.\n"
             "\n"
+            "  bandwidth-mode auto|manual [-s slot]\n"
+            "      BB_SET_BANDWIDTH_MODE: on a ground (DEV), auto lets the chip's\n"
+            "      MCS policy step the bandwidth of the video it receives (the\n"
+            "      cfg's mcs bw_auto range and thresholds; the next link set-up\n"
+            "      resets it to the cfg's enable). On an AP it would switch the\n"
+            "      uplink's instead. ar8030-lifecycled does this for an air unit\n"
+            "      set to bandwidth auto.\n"
+            "\n"
             "  mcs-mode auto|manual [-s slot]\n"
             "      MCS control mode -- manual mode is required before 'mcs'\n"
             "      below has any effect.\n"
@@ -186,7 +194,7 @@ static void usage(const char *argv0)
             "      payload bytes. Stock init uses 0x8c <0|1> (rfo_kikp), 0x8a\n"
             "      <ch> <u32> (adc_meas), 0xcb 0 0 0x01 0x03 ... (rf_path_b).\n"
             "\n"
-            "  mcs-table <0|1|2> [mcs]\n"
+            "  mcs-table <0|1|2> [mcs] [-o dB]\n"
             "      Push a whole MCS policy table (7 entries covering mcs 1,2,5,\n"
             "      7,8,10,12) via BB_SET_MCS_ITEM, all on slot 0. Reverse-\n"
             "      engineered from stock's ar_ldy_gnd binary (Ghidra): its own\n"
@@ -202,6 +210,13 @@ static void usage(const char *argv0)
             "\n"
             "      With [mcs], pushes only that one entry instead of all 7 (to\n"
             "      retry/isolate a single failure from a full run).\n"
+            "\n"
+            "      -o <dB> (a test aid): every entry's SNR thresholds that many\n"
+            "      dB higher, so the receiver's MCS policy takes the link as\n"
+            "      that much weaker (negative: stronger) -- steps MCS, and the\n"
+            "      bandwidth with bw_auto, without an attenuator. lifecycled\n"
+            "      --link-policy pushes its plain table again at every connect\n"
+            "      and relink.\n"
             "\n"
             "      Confirmed live: all 7 entries succeed on ground every time.\n"
             "      On air, only mcs 1,2,5,8 succeed -- 7,10,12 consistently fail\n"
@@ -1345,6 +1360,33 @@ static int cmd_mcs_mode(int argc, char **argv)
     return ret ? 1 : 0;
 }
 
+static int cmd_bandwidth_mode(int argc, char **argv)
+{
+    int slot = 0, opt;
+    optind = 1;
+    permute_argv(argc, argv, "s:");
+    while ((opt = getopt(argc, argv, "s:")) != -1) {
+        if (opt == 's')
+            slot = atoi(optarg);
+        else
+            return 1;
+    }
+    if (optind >= argc || (strcmp(argv[optind], "auto") && strcmp(argv[optind], "manual"))) {
+        fprintf(stderr, "linkctl: bandwidth-mode needs 'auto' or 'manual'\n");
+        return 1;
+    }
+#ifdef BB_SET_BANDWIDTH_MODE
+    bb_set_bandwidth_mode_t m = { .slot = (uint8_t)slot, .mode = (uint8_t)!strcmp(argv[optind], "auto") };
+    int ret = bb_ioctl(g_hbb, BB_SET_BANDWIDTH_MODE, &m, NULL);
+    printf("BB_SET_BANDWIDTH_MODE(slot=%d, mode=%u) ret=%d\n", slot, m.mode, ret);
+    return ret ? 1 : 0;
+#else
+    (void)slot;
+    fprintf(stderr, "linkctl: this SDK build has no BB_SET_BANDWIDTH_MODE\n");
+    return 1;
+#endif
+}
+
 static int cmd_mcs(int argc, char **argv)
 {
     int slot = 0, wait_s = 0, opt;
@@ -1430,13 +1472,35 @@ static int push_mcs_items(const ar8030_mcs_item_t *t, int n, int only_mcs, const
     return fail;
 }
 
+/* An SNR threshold times k, within the item's 16 bits. */
+static uint16_t scale_snr(uint16_t v, double k)
+{
+    double s = v * k + 0.5;
+
+    if (s >= 65535.0) {
+        return 65535;
+    }
+    return s < 1.0 ? 1 : (uint16_t)s;
+}
+
 static int cmd_mcs_table(int argc, char **argv)
 {
-    if (argc < 2) {
+    const char *pos[2] = { NULL, NULL };
+    double offset_db = 0.0;
+    int npos = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) {
+            offset_db = atof(argv[++i]);
+        } else if (npos < 2) {
+            pos[npos++] = argv[i];
+        }
+    }
+    if (npos < 1) {
         fprintf(stderr, "linkctl: mcs-table needs a value (0, 1, or 2)\n");
         return 1;
     }
-    int variant = atoi(argv[1]);
+    int variant = atoi(pos[0]);
     if (variant < 0 || variant > 2) {
         fprintf(stderr, "linkctl: mcs-table must be 0, 1, or 2\n");
         return 1;
@@ -1444,8 +1508,22 @@ static int cmd_mcs_table(int argc, char **argv)
     /* Optional 3rd arg: push only the single entry matching this mcs
      * value, instead of all 7 -- for retrying/isolating one that failed
      * in a full run. */
-    int only_mcs = argc >= 3 ? atoi(argv[2]) : -1;
-    return push_mcs_items(ar8030_gnd_mcs_table(variant), AR8030_GND_MCS_ITEMS, only_mcs, "gnd");
+    int only_mcs = npos >= 2 ? atoi(pos[1]) : -1;
+    const ar8030_mcs_item_t *t = ar8030_gnd_mcs_table(variant);
+    if (offset_db == 0.0) {
+        return push_mcs_items(t, AR8030_GND_MCS_ITEMS, only_mcs, "gnd");
+    }
+    /* -o: the policy compares the receiver's SNR (linear) against these,
+     * so k times every threshold = the link offset_db dB weaker. */
+    ar8030_mcs_item_t scaled[AR8030_GND_MCS_ITEMS];
+    const double k = pow(10.0, offset_db / 10.0);
+    for (int i = 0; i < AR8030_GND_MCS_ITEMS; i++) {
+        scaled[i]        = t[i];
+        scaled[i].snr_up = scale_snr(t[i].snr_up, k);
+        scaled[i].snr_dw = scale_snr(t[i].snr_dw, k);
+    }
+    printf("SNR thresholds %+.1f dB\n", offset_db);
+    return push_mcs_items(scaled, AR8030_GND_MCS_ITEMS, only_mcs, "gnd");
 }
 
 static int cmd_mcs_table_air(void)
@@ -2029,6 +2107,8 @@ int main(int argc, char **argv)
         rc = cmd_channel_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "channel"))
         rc = cmd_channel(argc - 1, argv + 1);
+    else if (!strcmp(cmd, "bandwidth-mode"))
+        rc = cmd_bandwidth_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs-mode"))
         rc = cmd_mcs_mode(argc - 1, argv + 1);
     else if (!strcmp(cmd, "mcs"))

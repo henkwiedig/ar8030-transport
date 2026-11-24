@@ -1,6 +1,7 @@
 #include "lifecycle_tuning.h"
 #include "lc_log.h"
 #include "../common/ar8030_link_policy.h"
+#include <cjson/cJSON.h>
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -67,19 +68,24 @@ int lc_tuning_load(const char* cfg_path)
     if (!f) {
         return -1;
     }
-    int mhz = -1;
-    int ok  = fscanf(f, "%d", &mhz) == 1;
+    char word[16] = "";
+    int  ok       = fscanf(f, "%15s", word) == 1;
     fclose(f);
-    if (!ok || mhz_to_bw_enum(mhz) < 0) {
+    if (ok && strcmp(word, "auto") == 0) {
+        return LC_BANDWIDTH_AUTO;
+    }
+    char* end;
+    long  mhz = ok ? strtol(word, &end, 10) : -1;
+    if (!ok || *end != '\0' || mhz_to_bw_enum((int)mhz) < 0) {
         lc_log("lifecycle: tuning: %s has no valid bandwidth, ignoring", path);
         return -1;
     }
-    return mhz;
+    return (int)mhz;
 }
 
 int lc_tuning_save(const char* cfg_path, int bandwidth_mhz)
 {
-    if (mhz_to_bw_enum(bandwidth_mhz) < 0) {
+    if (bandwidth_mhz != LC_BANDWIDTH_AUTO && mhz_to_bw_enum(bandwidth_mhz) < 0) {
         lc_log("lifecycle: tuning: refusing to persist invalid bandwidth %d", bandwidth_mhz);
         return -1;
     }
@@ -94,7 +100,11 @@ int lc_tuning_save(const char* cfg_path, int bandwidth_mhz)
         lc_log("lifecycle: tuning: can't open %s for writing: %s", tmp_path, strerror(errno));
         return -1;
     }
-    fprintf(f, "%d\n", bandwidth_mhz);
+    if (bandwidth_mhz == LC_BANDWIDTH_AUTO) {
+        fprintf(f, "auto\n");
+    } else {
+        fprintf(f, "%d\n", bandwidth_mhz);
+    }
     fclose(f);
 
     if (rename(tmp_path, path) != 0) {
@@ -152,6 +162,115 @@ int lc_tuning_apply(bb_dev_handle_t* handle, int slot, int bandwidth_mhz)
     int ret = bb_ioctl(handle, BB_SET_BANDWIDTH, &sb, NULL);
     lc_log("lifecycle: tuning: BB_SET_BANDWIDTH(slot=%d, tx, %dMHz) ret=%d", slot, bandwidth_mhz, ret);
     return ret;
+}
+
+int lc_tuning_read_link_bw(bb_dev_handle_t* handle, int is_ap, int* video_bw, int* uplink_bw)
+{
+    bb_get_status_in_t  in = {0xffff};
+    bb_get_status_out_t out;
+    memset(&out, 0, sizeof(out));
+    *video_bw  = -1;
+    *uplink_bw = -1;
+    if (bb_ioctl(handle, BB_GET_STATUS, &in, &out) != 0) {
+        return -1;
+    }
+    /* Single-user mode only, as lc_tuning_read_current(). */
+    int v = is_ap ? out.user_status[BB_USER_BR_CS].tx_status.bandwidth
+                  : out.user_status[BB_USER_BR_CS].rx_status.bandwidth;
+    int u = is_ap ? out.user_status[BB_USER_0].rx_status.bandwidth : out.user_status[BB_USER_0].tx_status.bandwidth;
+    *video_bw  = v >= 0 && v < BB_BW_MAX ? v : -1;
+    *uplink_bw = u >= 0 && u < BB_BW_MAX ? u : -1;
+    return 0;
+}
+
+const char* lc_bw_class_mhz_str(int bw)
+{
+    static const char* const mhz[BB_BW_MAX] = {
+        [BB_BW_1_25M] = "1.25", [BB_BW_2_5M] = "2.5", [BB_BW_5M] = "5",
+        [BB_BW_10M] = "10",     [BB_BW_20M] = "20",   [BB_BW_40M] = "40",
+    };
+    return bw >= 0 && bw < BB_BW_MAX ? mhz[bw] : NULL;
+}
+
+int lc_bandwidth_mode_apply(bb_dev_handle_t* handle, int on)
+{
+#ifdef BB_SET_BANDWIDTH_MODE
+    bb_set_bandwidth_mode_t m = {.slot = BB_SLOT_0, .mode = (uint8_t)(on ? 1 : 0)};
+    int ret = bb_ioctl(handle, BB_SET_BANDWIDTH_MODE, &m, NULL);
+    lc_log("lifecycle: tuning: BB_SET_BANDWIDTH_MODE(slot 0, %s) ret=%d", on ? "auto" : "manual", ret);
+    return ret;
+#else
+    (void)handle;
+    lc_log("lifecycle: tuning: this SDK build has no BB_SET_BANDWIDTH_MODE, bandwidth stays %s",
+           on ? "manual" : "as it is");
+    return -1;
+#endif
+}
+
+/* "1.25" / "2.5" / "5" / ... (the cfg's own strings) or a plain number -> MHz, -1 if neither. */
+static double cfg_bandwidth_mhz(const cJSON* v)
+{
+    if (cJSON_IsNumber(v)) {
+        return v->valuedouble;
+    }
+    if (cJSON_IsString(v) && v->valuestring) {
+        char*  end;
+        double mhz = strtod(v->valuestring, &end);
+        if (end != v->valuestring && (*end == '\0' || *end == 'M' || *end == 'm')) {
+            return mhz;
+        }
+    }
+    return -1.0;
+}
+
+int lc_bw_auto_cfg_usable(const char* cfg_path, char* why, size_t why_sz)
+{
+    snprintf(why, why_sz, "%s", "");
+    FILE* f = fopen(cfg_path, "r");
+    if (!f) {
+        snprintf(why, why_sz, "can't read %s", cfg_path);
+        return 0;
+    }
+    char*  buf = NULL;
+    size_t len = 0;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long l = ftell(f);
+        if (l > 0 && fseek(f, 0, SEEK_SET) == 0 && (buf = (char*)malloc((size_t)l + 1)) != NULL) {
+            len = fread(buf, 1, (size_t)l, f);
+            buf[len] = '\0';
+        }
+    }
+    fclose(f);
+    cJSON* root = buf ? cJSON_Parse(buf) : NULL;
+    free(buf);
+    if (!root) {
+        snprintf(why, why_sz, "%s is not valid JSON", cfg_path);
+        return 0;
+    }
+    const cJSON* o = root;
+    static const char* const path[] = {"baseband", "basic", "dev", "mcs", "slot", "bw_auto"};
+    for (size_t i = 0; o && i < sizeof(path) / sizeof(path[0]); i++) {
+        o = cJSON_GetObjectItemCaseSensitive(o, path[i]);
+    }
+    const cJSON* range = o ? cJSON_GetObjectItemCaseSensitive(o, "range") : NULL;
+    const cJSON* thr   = o ? cJSON_GetObjectItemCaseSensitive(o, "threshold") : NULL;
+    double       lo    = range ? cfg_bandwidth_mhz(cJSON_GetObjectItemCaseSensitive(range, "low")) : -1.0;
+    double       hi    = range ? cfg_bandwidth_mhz(cJSON_GetObjectItemCaseSensitive(range, "high")) : -1.0;
+    const cJSON* tlo   = thr ? cJSON_GetObjectItemCaseSensitive(thr, "low") : NULL;
+    const cJSON* thi   = thr ? cJSON_GetObjectItemCaseSensitive(thr, "high") : NULL;
+    int          ok    = 0;
+    if (!o) {
+        snprintf(why, why_sz, "no baseband.basic.dev.mcs.slot.bw_auto in %s", cfg_path);
+    } else if (lo < LC_BW_AUTO_MIN_MHZ || hi <= lo) {
+        snprintf(why, why_sz, "bw_auto range in %s is not %d MHz or more, low < high", cfg_path,
+                 LC_BW_AUTO_MIN_MHZ);
+    } else if (!cJSON_IsNumber(tlo) || !cJSON_IsNumber(thi) || tlo->valueint >= thi->valueint) {
+        snprintf(why, why_sz, "bw_auto threshold in %s is not low < high", cfg_path);
+    } else {
+        ok = 1;
+    }
+    cJSON_Delete(root);
+    return ok;
 }
 
 int lc_tuning_resolve_connected_slot(bb_dev_handle_t* handle)

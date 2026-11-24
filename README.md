@@ -2153,7 +2153,7 @@ design rationale):
 - **`GET /api/v1/status`** -- this daemon's own view of the link:
   ```
   curl http://<host>:8899/api/v1/status
-  {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"channel":32,"chan_mode":"manual","work_chan":32,"paired":true}
+  {"ok":true,"role":"ap","state":"connected","connected_slot":0,"bandwidth_mhz":20,"bandwidth_auto":false,"channel":32,"chan_mode":"manual","work_chan":32,"paired":true}
   ```
   `rf_temp_c` (one decimal, `null` without a reading) and `batt_v`
   (supply voltage, two decimals, `null` without a reading) are included
@@ -2178,13 +2178,15 @@ design rationale):
   chip's `BB_GET_1V1_INFO` (read every tick; `null` without a link):
   ```
   "quality":{"signal_level":4,
-    "self":{"snr":7418,"snr_db":23.1,"ldpc_err":0,"gain":[33,35],"tx_mcs":9,"tx_chan":25,"tx_power":14,"tx_freq_khz":5805000},
-    "peer":{"snr":4164,"snr_db":20.6,"ldpc_err":0,"gain":[29,112],"tx_mcs":12,"tx_chan":25,"tx_power":13,"tx_freq_khz":5805000}}
+    "self":{"snr":7418,"snr_db":23.1,"ldpc_err":0,"gain":[33,35],"tx_mcs":9,"tx_chan":25,"tx_power":14,"tx_bandwidth_mhz":2.5,"tx_freq_khz":5805000},
+    "peer":{"snr":4164,"snr_db":20.6,"ldpc_err":0,"gain":[29,112],"tx_mcs":12,"tx_chan":25,"tx_power":13,"tx_bandwidth_mhz":20,"tx_freq_khz":5805000}}
   ```
   `self` is this radio, `peer` the other end as reported over the link:
   receiver SNR (`snr_db` = `10 * log10(snr / 36)`), LDPC frame-error ratio
   (x10000), AGC gain per antenna path (stock's "RSSI"), and the TX side's
-  MCS/channel/power/frequency. Only the ground (DEV) gets the peer's
+  MCS/channel/power/frequency and bandwidth (`tx_bandwidth_mhz`, from
+  `BB_GET_STATUS`: the air side's is the video's, which the ground's chip
+  steps under bandwidth `auto`; null if unknown). Only the ground (DEV) gets the peer's
   receiver figures -- on the air the peer's `snr`/`gain` read 0. Needs the
   ar8030 package's `bb_info_t` fix (`BB_HAVE_1V1_INFO_76`): the chip's
   blocks are 76 bytes, and with the SDK's original 72 every peer field
@@ -2298,6 +2300,45 @@ design rationale):
   relink re-applies the link tuning without running the hooks: retx,
   power, the frame change mode on the AP (see `/api/v1/frame-change`),
   the MCS table on the DEV.
+- **`POST /api/v1/bandwidth?mhz=auto`** (air unit) and
+  **`POST /api/v1/bandwidth?auto=<0|1>`** (ground) -- automatic
+  bandwidth. The video's receiver decides it: the ground chip's MCS
+  policy halves the bandwidth instead of stepping below the cfg's
+  `baseband.basic.dev.mcs.slot.bw_auto.threshold.low` and doubles it
+  instead of stepping above `threshold.high` (JSON MCS), within its
+  `range`, once `BB_SET_BANDWIDTH_MODE` switches that on.
+  `mhz=auto` on the air unit is persisted (`ar8030.tuning` holds `auto`;
+  also `--default-bandwidth auto`), and from then on that side never sets
+  the bandwidth: nothing after a connect, no re-apply when the chip runs
+  another one, the status follows the chip. The link starts at the
+  bandwidth the chips' configs give it (the P1's: 5 MHz, the robust one
+  for a reconnect) and the ground's chip widens it. The one bandwidth the
+  air unit still sets under auto: a link outside 5-20 MHz (our grounds'
+  range) goes to the nearest end -- after a connect, on the switch to auto
+  and at every check -- since the ground's chip only steps inside its range
+  and doesn't bring a narrower link back into it: it widens on an up
+  decision at the range's threshold MCS, and the SNR a 1.25 MHz link
+  reported on the bench stayed below that (13.8 dB against 14.7). `auto=1` on the
+  ground switches its chip's policy on, at once while linked and again
+  after every connect and relink (the chip resets it to the cfg's
+  `enable` whenever it sets the link up); it is kept across a drop, not
+  persisted, and refused (409) while the cfg's bw_auto block has no range
+  of 5 MHz or more (2.5 MHz carried no video on the bench) or no
+  thresholds low < high -- with the stock 0/0 the chip would narrow to
+  1.25 MHz. The ground follows the air unit: sbc-groundstations'
+  `hooks.d/connected/40-bw-auto.sh` reads the air unit's
+  `bandwidth_auto` after every connect, and its menu sets both sides.
+  `GET /api/v1/status` carries `"bandwidth_auto"` on both (air unit: the
+  setting; ground: the policy wanted on). Never send the ground's request
+  on an AP: there slot 0's receiver is the uplink. Bench (P1 + VR04,
+  11-24, a fade faked with `ar8030-linkctl mcs-table 2 -o <dB>`, which
+  raises the ground's MCS thresholds): 20 -> 5 MHz within ~1 s and held
+  through the fade, 5 -> 10 -> 20 MHz about 1 s per step after it, no
+  frame lost at either switch, the same after the air unit restarted.
+  With the air unit setting a bandwidth instead, the two sides fight: it
+  re-applies what it set, and once the link was back at 20 MHz at the
+  lowest MCS the chip never narrowed again (it never steps down from its
+  lowest table entry).
   Without the frame change the 40 MHz link reports 34.5 Mbit/s at MCS 12,
   less than 20 MHz with it (36.7); with it, 54.1. The host write path
   caps a bulk writer at about 40 Mbit/s anyway (blast), so 40 MHz buys
@@ -2487,7 +2528,8 @@ design rationale):
   -- a generic, allow-listed passthrough to the standalone
   `ar8030-linkctl` binary, covering every one of its own subcommands
   (`status`, `channel-mode`, `channel`, `mcs-mode`, `mcs`, `mcs-range`,
-  `mcs-table`, `power-mode`, `power`, `freq`, `force-close-socket`,
+  `mcs-table` (with `-o <dB>`: every SNR threshold that much higher, a
+  fade without an attenuator), `power-mode`, `power`, `freq`, `force-close-socket`,
   `force-close-all`, `rf-temp`, `batt`, and `bandwidth` for one-shot use) -- effectively
   `linkctl -h`'s whole command surface, reachable over HTTP the same way
   `curl` would invoke the CLI directly:

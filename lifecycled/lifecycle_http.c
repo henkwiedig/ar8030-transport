@@ -432,12 +432,14 @@ static void handle_status(lifecycle_http_ctx* http, int fd)
         snprintf(dist, sizeof(dist), "null");
     }
 
-    char json[9150];
+    char json[9216];
     snprintf(json, sizeof(json),
-             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,%s,%s,%s,%s,"
+             "{\"ok\":true,\"role\":\"%s\",\"state\":\"%s\",\"connected_slot\":%d,\"bandwidth_mhz\":%d,"
+              "\"bandwidth_auto\":%s,%s,%s,%s,%s,"
               "\"distance_m\":%s,\"paired\":%s,\"rf_temp_c\":%s,\"batt_v\":%s,\"linkctl_exit_code\":%d,"
               "\"linkctl_status\":\"%s\"}",
-             role_str, state_str, st.connected_slot, st.bandwidth_mhz, chan, power, heat, frame, dist,
+             role_str, state_str, st.connected_slot, st.bandwidth_mhz, st.bandwidth_auto ? "true" : "false", chan,
+             power, heat, frame, dist,
              st.paired ? "true" : "false", rf_temp, batt_v, rc, escaped);
     send_json(fd, 200, "OK", json);
 }
@@ -452,10 +454,12 @@ static void format_link_side(const lc_link_side_t* q, char* out, size_t out_sz)
     } else {
         snprintf(snr_db, sizeof(snr_db), "null");
     }
+    const char* bw = lc_bw_class_mhz_str(q->tx_bw);
     snprintf(out, out_sz,
              "{\"snr\":%u,\"snr_db\":%s,\"ldpc_err\":%u,\"gain\":[%u,%u],\"tx_mcs\":%u,\"tx_chan\":%u,"
-             "\"tx_power\":%u,\"tx_freq_khz\":%u}",
-             q->snr, snr_db, q->ldpc_err, q->gain_a, q->gain_b, q->tx_mcs, q->tx_chan, q->tx_power, q->tx_freq_khz);
+             "\"tx_power\":%u,\"tx_bandwidth_mhz\":%s,\"tx_freq_khz\":%u}",
+             q->snr, snr_db, q->ldpc_err, q->gain_a, q->gain_b, q->tx_mcs, q->tx_chan, q->tx_power,
+             bw ? bw : "null", q->tx_freq_khz);
 }
 
 /* GET /api/v1/link -- link state plus the chip's per-port byte counters,
@@ -622,19 +626,54 @@ static void handle_peers_forget(lifecycle_http_ctx* http, int fd, const char* qu
     }
 }
 
+/* POST /api/v1/bandwidth?mhz=<1|2|5|10|20|40|auto> (auto: the air unit's
+ * setting -- the ground's chip steps the video bandwidth) or, on a ground,
+ * ?auto=<0|1>: the chip's bandwidth policy for the video it receives,
+ * which follows the air unit's setting (lifecycle_request_rx_bandwidth_auto()). */
 static void handle_bandwidth(lifecycle_http_ctx* http, int fd, const char* query)
 {
+    int  on;
+    char json[640];
+    if (query_param_int(query, "auto", &on) == 0) {
+        char why[256] = "";
+        int  rc       = (on == 0 || on == 1) ? lifecycle_request_rx_bandwidth_auto(http->lc, on, why, sizeof(why)) : -3;
+        if (rc == 0) {
+            snprintf(json, sizeof(json), "{\"ok\":true,\"queued_auto\":%s}", on ? "true" : "false");
+            send_json(fd, 202, "Accepted", json);
+        } else if (rc == -3) {
+            send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"auto must be 0 or 1\"}");
+        } else if (rc == -1) {
+            send_json(fd, 400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"on the air unit use mhz=auto (or mhz=<n>); auto=0|1 is the "
+                      "ground's\"}");
+        } else {
+            char escaped[512];
+            json_escape(why, escaped, sizeof(escaped));
+            snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"%s\"}", escaped);
+            send_json(fd, 409, "Conflict", json);
+        }
+        return;
+    }
+    char val[16];
+    if (query_param(query, "mhz", val, sizeof(val)) == 0 && strcmp(val, "auto") == 0) {
+        if (lifecycle_request_bandwidth(http->lc, LC_BANDWIDTH_AUTO) != 0) {
+            send_json(fd, 400, "Bad Request",
+                      "{\"ok\":false,\"error\":\"auto is the air unit's setting; a ground takes auto=0|1\"}");
+            return;
+        }
+        send_json(fd, 202, "Accepted", "{\"ok\":true,\"queued\":\"auto\"}");
+        return;
+    }
     int mhz;
     if (query_param_int(query, "mhz", &mhz) != 0) {
-        send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"missing 'mhz' query parameter\"}");
+        send_json(fd, 400, "Bad Request", "{\"ok\":false,\"error\":\"missing 'mhz' (or, on a ground, 'auto') query parameter\"}");
         return;
     }
     if (lifecycle_request_bandwidth(http->lc, mhz) != 0) {
         send_json(fd, 400, "Bad Request",
-                  "{\"ok\":false,\"error\":\"invalid bandwidth, must be one of 1/2/5/10/20/40\"}");
+                  "{\"ok\":false,\"error\":\"invalid bandwidth, must be one of 1/2/5/10/20/40 (or auto)\"}");
         return;
     }
-    char json[96];
     snprintf(json, sizeof(json), "{\"ok\":true,\"queued_mhz\":%d}", mhz);
     send_json(fd, 202, "Accepted", json);
 }
@@ -941,6 +980,7 @@ static const char INDEX_HTML[] =
     "<h2>Bandwidth (persisted, survives reconnects)</h2>\n"
     "<div class='row'>\n"
     "<select id='bw'>\n"
+    "<option value='auto'>auto (air unit: the ground steps it)</option>\n"
     "<option value='1'>1.25 MHz</option><option value='2'>2.5 MHz</option><option value='5'>5 MHz</option>\n"
     "<option value='10'>10 MHz</option><option value='20' selected>20 MHz</option><option value='40'>40 MHz</option>\n"
     "</select>\n"
@@ -1055,7 +1095,7 @@ static const char INDEX_HTML[] =
     "function refresh(){\n"
     "  fetch('/api/v1/status').then(r=>r.json()).then(d=>{\n"
     "    var summary = 'role='+d.role+' state='+d.state+' connected_slot='+d.connected_slot+\n"
-    "      ' bandwidth_mhz='+d.bandwidth_mhz+' distance='+(d.distance_m === null ? '--' : d.distance_m+' m')+\n"
+    "      ' bandwidth_mhz='+d.bandwidth_mhz+(d.bandwidth_auto ? ' (auto)' : '')+' distance='+(d.distance_m === null ? '--' : d.distance_m+' m')+\n"
     "      ' channel='+d.channel+' (chip: '+d.chan_mode+' '+d.work_chan+')'+\n"
     "      ' paired='+d.paired+' (linkctl exit '+d.linkctl_exit_code+')';\n"
     "    document.getElementById('status').textContent = summary+'\\n\\n'+(d.linkctl_status||'');\n"
@@ -1082,7 +1122,7 @@ static const char INDEX_HTML[] =
     "function setBandwidth(){\n"
     "  var mhz = v('bw');\n"
     "  fetch('/api/v1/bandwidth?mhz='+encodeURIComponent(mhz), {method:'POST'}).then(r=>r.json()).then(d=>{\n"
-    "    msg(d.ok ? 'bandwidth queued: '+d.queued_mhz+' MHz' : 'failed: '+d.error, d.ok);\n"
+    "    msg(d.ok ? 'bandwidth queued: '+(d.queued ? d.queued : d.queued_mhz+' MHz') : 'failed: '+d.error, d.ok);\n"
     "  }).catch(e=>msg('error: '+e, false));\n"
     "}\n"
     "function loadPower(){\n"

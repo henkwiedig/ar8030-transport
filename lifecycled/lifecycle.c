@@ -177,6 +177,14 @@ struct lifecycle_ctx {
     int chip_bandwidth;
     /* "ignoring the saved bandwidth" logged once per process. */
     int saved_bw_ignored_logged;
+    /* AP: the bandwidth setting is "auto" (LC_BANDWIDTH_AUTO) -- nothing
+     * set or re-applied (last_bandwidth 0 while linked, the status follows
+     * the chip). For the status; under status_lock. */
+    int bandwidth_auto;
+    /* DEV: the chip's bandwidth policy for the received video is wanted on
+     * (lifecycle_request_rx_bandwidth_auto()). Kept across drops; under
+     * status_lock for the status. */
+    int rx_bw_auto;
 
     /* Fires the "idle" hook (this unit has never been paired) once per
      * process instead of once per second -- the branch that wants it is
@@ -200,6 +208,9 @@ struct lifecycle_ctx {
      * calling the HTTP endpoint twice in a row would already imply). */
     pthread_mutex_t cmd_lock;
     int             pending_bandwidth_mhz;
+    /* lifecycle_request_rx_bandwidth_auto()'s mailbox (DEV): 0/1, -1 =
+     * nothing queued. */
+    int pending_rx_bw_auto;
 
     /* Same one-slot-mailbox pattern, for lifecycle_request_retx() --
      * guarded by the same cmd_lock rather than a new one, since both
@@ -304,6 +315,7 @@ struct lifecycle_ctx {
 static void lc_apply_power(lifecycle_ctx* ctx);
 static void lc_poll_power(lifecycle_ctx* ctx);
 static void lc_apply_link_tuning(lifecycle_ctx* ctx);
+static void lc_bw_auto_into_range(lifecycle_ctx* ctx, int cur);
 static void lc_frame_change_set_pending(lifecycle_ctx* ctx, int pending);
 static void lc_frame_change_try(lifecycle_ctx* ctx);
 static void lc_frame_change_defer(lifecycle_ctx* ctx);
@@ -414,6 +426,12 @@ lifecycle_ctx* lifecycle_init(const lc_config_t* cfg)
     ctx->last_bandwidth       = -1;
     ctx->chip_bandwidth       = -1;
     ctx->pending_bandwidth_mhz = -1;
+    ctx->pending_rx_bw_auto   = -1;
+    if (ctx->cfg.role == LC_ROLE_AP && ctx->cfg.default_bandwidth != 0) {
+        /* What the status shows before the first connect. */
+        int saved           = ctx->cfg.cfg_path[0] ? lc_tuning_load(ctx->cfg.cfg_path) : -1;
+        ctx->bandwidth_auto = (saved != -1 ? saved : ctx->cfg.default_bandwidth) == LC_BANDWIDTH_AUTO;
+    }
     ctx->chan_auto            = -1;
     ctx->work_chan            = -1;
     ctx->power_dbm            = -1;
@@ -531,19 +549,37 @@ static void lc_apply_tuning_on_connect(lifecycle_ctx* ctx, int slot)
         bandwidth = 0;
     } else {
         bandwidth = ctx->cfg.cfg_path[0] ? lc_tuning_load(ctx->cfg.cfg_path) : -1;
-        if (bandwidth < 0) {
+        if (bandwidth == -1) {
             bandwidth = ctx->cfg.default_bandwidth;
         }
+    }
+    /* Auto (AP): set nothing, re-apply nothing -- the link starts at the
+     * bandwidth the chips' configs give it and the ground's chip steps it
+     * from there. On the bench, with 20 MHz set here at connect (and
+     * re-applied with the frame change), the link went back to 20 MHz
+     * 1.5 s after the ground's chip had narrowed it and stayed there at
+     * its lowest MCS, from where the chip never narrows; with nothing
+     * set, every narrowing held. */
+    int is_auto = bandwidth == LC_BANDWIDTH_AUTO;
+    if (is_auto) {
+        bandwidth = 0;
+        lc_log("lifecycle: tuning: bandwidth auto, none set: the ground's chip steps it");
     }
     int chip = -1;
     if (bandwidth > 0) {
         lc_tuning_apply(ctx->client.handle, slot, bandwidth);
     } else {
         chip = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
+        if (is_auto) {
+            lc_bw_auto_into_range(ctx, chip);
+        }
     }
     pthread_mutex_lock(&ctx->status_lock);
     ctx->last_bandwidth = bandwidth;
     ctx->chip_bandwidth = chip;
+    if (ctx->cfg.role == LC_ROLE_AP) {
+        ctx->bandwidth_auto = is_auto;
+    }
     pthread_mutex_unlock(&ctx->status_lock);
 
     lc_apply_link_tuning(ctx);
@@ -599,6 +635,13 @@ static void lc_apply_link_tuning(lifecycle_ctx* ctx)
     if (ctx->cfg.role == LC_ROLE_DEV && (ctx->cfg.link_policy == 1 || ctx->cfg.link_policy == 2)) {
         lc_push_mcs_items(ctx, ar8030_gnd_mcs_table(ctx->cfg.link_policy), AR8030_GND_MCS_ITEMS, "gnd");
     }
+
+    /* DEV: the received video's bandwidth policy, for an air unit set to
+     * "auto" -- the chip resets it to its cfg's "enable" at every link
+     * set-up. */
+    if (ctx->cfg.role == LC_ROLE_DEV && ctx->rx_bw_auto) {
+        lc_bandwidth_mode_apply(ctx->client.handle, 1);
+    }
 }
 
 /* Drains lifecycle_request_bandwidth()'s one-slot mailbox, if anything is
@@ -620,24 +663,92 @@ static void lc_drain_bandwidth_request(lifecycle_ctx* ctx)
     ctx->pending_bandwidth_mhz = -1;
     pthread_mutex_unlock(&ctx->cmd_lock);
 
-    if (requested_mhz <= 0) {
+    if (requested_mhz == -1) {
         return;
     }
 
+    /* Auto (AP only, see lifecycle_request_bandwidth()): from now on
+     * nothing is set or re-applied -- the bandwidth the link has stays
+     * until the ground's chip steps it. */
+    int  is_auto = requested_mhz == LC_BANDWIDTH_AUTO;
+    char what[16];
+    if (is_auto) {
+        snprintf(what, sizeof(what), "auto");
+    } else {
+        snprintf(what, sizeof(what), "%d MHz", requested_mhz);
+    }
     if (ctx->cfg.default_bandwidth == 0) {
-        lc_log("lifecycle: http: bandwidth change requested: %d MHz (--default-bandwidth none: %s)", requested_mhz,
+        lc_log("lifecycle: http: bandwidth change requested: %s (--default-bandwidth none: %s)", what,
                ctx->state == LC_STATE_CONNECTED ? "this link only, not saved" : "not linked, ignored");
     } else {
-        lc_log("lifecycle: http: bandwidth change requested: %d MHz", requested_mhz);
+        lc_log("lifecycle: http: bandwidth change requested: %s", what);
         if (ctx->cfg.cfg_path[0]) {
             lc_tuning_save(ctx->cfg.cfg_path, requested_mhz);
         }
     }
     if (ctx->state == LC_STATE_CONNECTED) {
-        lc_tuning_apply(ctx->client.handle, ctx->connected_slot, requested_mhz);
+        int chip = -1;
+        if (is_auto) {
+            chip = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
+            lc_bw_auto_into_range(ctx, chip);
+        } else {
+            lc_tuning_apply(ctx->client.handle, ctx->connected_slot, requested_mhz);
+        }
         pthread_mutex_lock(&ctx->status_lock);
-        ctx->last_bandwidth = requested_mhz;
+        ctx->last_bandwidth = is_auto ? 0 : requested_mhz;
+        ctx->chip_bandwidth = chip;
         pthread_mutex_unlock(&ctx->status_lock);
+    }
+    if (ctx->cfg.default_bandwidth != 0 || ctx->state == LC_STATE_CONNECTED) {
+        pthread_mutex_lock(&ctx->status_lock);
+        ctx->bandwidth_auto = is_auto;
+        pthread_mutex_unlock(&ctx->status_lock);
+    }
+}
+
+/* AP, bandwidth auto: the ground's chip steps the video bandwidth only
+ * inside its bw_auto range (our grounds: 5-20 MHz) and doesn't bring a link
+ * back into it from a narrower one -- it widens on an up decision at the
+ * range's threshold MCS, and on the bench the SNR a 1.25 MHz link reports
+ * stayed below that (13.8 dB against 14.7). So a link outside the range (a
+ * manual 1.25 MHz before auto, a cfg that starts elsewhere) is put at the
+ * nearest end, the one bandwidth this side still sets under auto. cur in
+ * the API's MHz (1 = 1.25, 2 = 2.5). */
+static void lc_bw_auto_into_range(lifecycle_ctx* ctx, int cur)
+{
+    if (ctx->cfg.role != LC_ROLE_AP || cur <= 0 || (cur >= LC_BW_AUTO_MIN_MHZ && cur <= LC_BW_AUTO_MAX_MHZ)) {
+        return;
+    }
+    int to = cur < LC_BW_AUTO_MIN_MHZ ? LC_BW_AUTO_MIN_MHZ : LC_BW_AUTO_MAX_MHZ;
+    lc_log("lifecycle: tuning: bandwidth auto: chip at %s MHz, outside %d-%d MHz: %d MHz, the ground's chip "
+           "steps it from there",
+           cur == 1 ? "1.25" : cur == 2 ? "2.5" : cur == 40 ? "40" : "?", LC_BW_AUTO_MIN_MHZ, LC_BW_AUTO_MAX_MHZ, to);
+    lc_tuning_apply(ctx->client.handle, ctx->connected_slot, to);
+}
+
+/* DEV: drains lifecycle_request_rx_bandwidth_auto()'s mailbox -- applies
+ * at once while linked; lc_apply_link_tuning() re-applies an "on" after
+ * every connect and relink, since the chip resets the flag to its cfg's
+ * "enable" whenever it sets the link up. */
+static void lc_drain_rx_bw_auto_request(lifecycle_ctx* ctx)
+{
+    pthread_mutex_lock(&ctx->cmd_lock);
+    int on                  = ctx->pending_rx_bw_auto;
+    ctx->pending_rx_bw_auto = -1;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    if (on < 0) {
+        return;
+    }
+    int was = ctx->rx_bw_auto;
+    pthread_mutex_lock(&ctx->status_lock);
+    ctx->rx_bw_auto = on;
+    pthread_mutex_unlock(&ctx->status_lock);
+    if (on != was) {
+        lc_log("lifecycle: http: video bandwidth %s (the chip's bandwidth policy %s)", on ? "auto" : "manual",
+               on ? "on" : "off");
+    }
+    if (ctx->state == LC_STATE_CONNECTED) {
+        lc_bandwidth_mode_apply(ctx->client.handle, on);
     }
 }
 
@@ -1113,6 +1224,7 @@ static void lc_side_from_info(lc_link_side_t* out, const bb_info_t* in)
     out->tx_mcs      = in->tx_mcs;
     out->tx_chan     = in->tx_chan;
     out->tx_power    = in->tx_power;
+    out->tx_bw       = -1; /* not in bb_info_t: lc_poll_quality() reads it */
     out->tx_freq_khz = in->tx_freq_khz;
 }
 
@@ -1152,6 +1264,15 @@ static void lc_poll_quality(lifecycle_ctx* ctx)
     lc_side_from_info(&self, &out.self);
     lc_side_from_info(&peer, &out.peer);
     int is_ap = ctx->cfg.role == LC_ROLE_AP;
+    /* Each side's TX bandwidth: the video's on the air side (with the air
+     * unit's bandwidth "auto" the ground's chip steps it), the uplink's on
+     * the ground side. */
+    int video_bw = -1, uplink_bw = -1;
+    if (ok) {
+        lc_tuning_read_link_bw(ctx->client.handle, is_ap, &video_bw, &uplink_bw);
+    }
+    self.tx_bw = (int8_t)(is_ap ? video_bw : uplink_bw);
+    peer.tx_bw = (int8_t)(is_ap ? uplink_bw : video_bw);
 
     pthread_mutex_lock(&ctx->status_lock);
     ctx->quality_valid = ok;
@@ -1611,6 +1732,7 @@ void* lifecycle_thread_main(void* arg)
         }
 
         lc_drain_bandwidth_request(ctx);
+        lc_drain_rx_bw_auto_request(ctx);
         lc_drain_retx_request(ctx);
         lc_drain_channel_request(ctx);
         lc_drain_power_request(ctx);
@@ -1751,11 +1873,15 @@ void* lifecycle_thread_main(void* arg)
                     }
                 }
             } else if (did_fallback_poll && ctx->last_bandwidth == 0) {
-                /* Nothing wanted: only follow what the chip runs, for the status. */
+                /* Nothing wanted: only follow what the chip runs, for the
+                 * status -- under auto, inside the ground's range. */
                 int cur = lc_tuning_read_current(ctx->client.handle, ctx->cfg.role == LC_ROLE_AP);
                 pthread_mutex_lock(&ctx->status_lock);
                 ctx->chip_bandwidth = cur;
                 pthread_mutex_unlock(&ctx->status_lock);
+                if (ctx->bandwidth_auto) {
+                    lc_bw_auto_into_range(ctx, cur);
+                }
             }
             if (did_fallback_poll && ctx->frame_change_pending && !ctx->fc_wait) {
                 lc_frame_change_try(ctx);
@@ -1799,6 +1925,7 @@ void lifecycle_get_status(lifecycle_ctx* ctx, lc_status_t* out)
     out->connected_slot = ctx->connected_slot;
     out->bandwidth_mhz  = ctx->last_bandwidth > 0 ? ctx->last_bandwidth
                         : ctx->last_bandwidth == 0 ? ctx->chip_bandwidth : -1;
+    out->bandwidth_auto = ctx->cfg.role == LC_ROLE_AP ? ctx->bandwidth_auto : ctx->rx_bw_auto;
     out->channel        = ctx->channel;
     out->chan_auto      = ctx->chan_auto;
     out->work_chan      = ctx->work_chan;
@@ -1839,11 +1966,30 @@ const lc_config_t* lifecycle_get_config(const lifecycle_ctx* ctx)
 
 int lifecycle_request_bandwidth(lifecycle_ctx* ctx, int mhz)
 {
-    if (!lc_tuning_valid_mhz(mhz)) {
+    if (mhz == LC_BANDWIDTH_AUTO ? ctx->cfg.role != LC_ROLE_AP : !lc_tuning_valid_mhz(mhz)) {
         return -1;
     }
     pthread_mutex_lock(&ctx->cmd_lock);
     ctx->pending_bandwidth_mhz = mhz;
+    pthread_mutex_unlock(&ctx->cmd_lock);
+    return 0;
+}
+
+int lifecycle_request_rx_bandwidth_auto(lifecycle_ctx* ctx, int on, char* why, size_t why_sz)
+{
+    if (ctx->cfg.role != LC_ROLE_DEV) {
+        snprintf(why, why_sz, "%s", "the ground (dev) runs the bandwidth policy for the video it receives");
+        return -1;
+    }
+    if (on && !ctx->cfg.cfg_path[0]) {
+        snprintf(why, why_sz, "%s", "no --cfg-path to find the bw_auto range and thresholds in");
+        return -2;
+    }
+    if (on && !lc_bw_auto_cfg_usable(ctx->cfg.cfg_path, why, why_sz)) {
+        return -2;
+    }
+    pthread_mutex_lock(&ctx->cmd_lock);
+    ctx->pending_rx_bw_auto = on ? 1 : 0;
     pthread_mutex_unlock(&ctx->cmd_lock);
     return 0;
 }
