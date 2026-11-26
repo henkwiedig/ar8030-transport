@@ -46,7 +46,7 @@ static void usage(const char *argv0)
             "usage: %s <command> [args]\n"
             "\n"
             "  status [-s slot]\n"
-            "      Dump BB_GET_STATUS (per-user tx/rx mcs+bandwidth+freq, link\n"
+            "      Dump BB_GET_STATUS (per-user tx/rx mcs+bandwidth+freq+mode, link\n"
             "      state), BB_GET_MCS, BB_GET_1V1_INFO, BB_GET_USER_QUALITY/\n"
             "      BB_GET_PEER_QUALITY (per-user/peer snr + LDPC block-error\n"
             "      ratio + antenna gain -- the closest available proxy to how\n"
@@ -479,6 +479,40 @@ static const char *bandwidth_name(uint8_t bw)
     }
 }
 
+/* bb_phy_status_t.rf_mode: bb_tx_mode_e on the tx side, bb_rx_mode_e on the
+ * rx side. The chip reads it back from the user's live PHY parameters, so on
+ * a ground user 0's tx mode is the uplink mode the air unit's slot rx_mode
+ * asked for (1TX, or 2TX_STBC: both PAs send). */
+static const char *tx_mode_name(uint8_t m)
+{
+    switch (m) {
+    case BB_TX_1TX:
+        return "1TX";
+    case BB_TX_2TX_STBC:
+        return "2TX_STBC";
+    case BB_TX_2TX_MIMO:
+        return "2TX_MIMO";
+    default:
+        return "?";
+    }
+}
+
+static const char *rx_mode_name(uint8_t m)
+{
+    switch (m) {
+    case BB_RX_1T1R:
+        return "1T1R";
+    case BB_RX_1T2R:
+        return "1T2R";
+    case BB_RX_2T2R_STBC:
+        return "2T2R_STBC";
+    case BB_RX_2T2R_MIMO:
+        return "2T2R_MIMO";
+    default:
+        return "?";
+    }
+}
+
 static const char *link_state_name(uint8_t state)
 {
     switch (state) {
@@ -818,8 +852,9 @@ static int cmd_status(int argc, char **argv)
          * whose tx.mcs/tx.bandwidth actually track real link changes
          * (compare against BB_GET_MCS below); the rest repeat one fixed
          * "default" reading (mcs=1, bw=2.5M) that never moves. */
-        printf("user %d: tx{mcs=%u bandwidth=%s freq=%u kHz} rx{mcs=%u bandwidth=%s freq=%u kHz}\n", u, tx->mcs,
-               bandwidth_name(tx->bandwidth), tx->freq_khz, rx->mcs, bandwidth_name(rx->bandwidth), rx->freq_khz);
+        printf("user %d: tx{mcs=%u bandwidth=%s freq=%u kHz mode=%s} rx{mcs=%u bandwidth=%s freq=%u kHz mode=%s}\n", u,
+               tx->mcs, bandwidth_name(tx->bandwidth), tx->freq_khz, tx_mode_name(tx->rf_mode), rx->mcs,
+               bandwidth_name(rx->bandwidth), rx->freq_khz, rx_mode_name(rx->rf_mode));
     }
 
     bb_get_mcs_in_t mcs_in = { .dir = BB_DIR_TX, .slot = (uint8_t)slot };

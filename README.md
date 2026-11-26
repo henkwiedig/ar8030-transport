@@ -472,6 +472,14 @@ full investigation); every other index reads zero.
 (plus `BB_GET_PEER_QUALITY` for the connected peer's own slot) for
 visibility outside the control loop.
 
+Each `user N:` line of `ar8030-linkctl status` also names the user's TX and
+RX mode (`BB_GET_STATUS` `rf_mode`: `mode=1TX`/`2TX_STBC`/`2TX_MIMO` and
+`mode=1T1R`/`1T2R`/`2T2R_STBC`/`2T2R_MIMO`), which the chip reads back from
+the user's live PHY parameters. On a ground, user 0's tx mode is the uplink
+mode the air unit's slot `rx_mode` asks for: 2TX_STBC sends on both PAs. The
+chip switches it at LOCK, before CONNECT, so a `connected` hook can act on it
+(sbc-groundstations' `vr04-fem` switches the VR04's second PA with it).
+
 ## Keyframe requests: PixelPilot -> waybeam over the video socket
 
 PixelPilot asks for an IDR (on an RTP gap, a decoder problem, or a
